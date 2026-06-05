@@ -1,0 +1,41 @@
+# --- Secrets (never commit) -------------------------------------------------
+.env
+*.key
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environment ----------------------------------------------------
+.venv/
+venv/
+env/
+
+# --- Runtime memory (personal data, grows unboundedly) ----------------------
+# facts.json and skills.json can be committed if you want versioned memory;
+# remove them from this list to do so.
+memory/episodic.jsonl
+memory/audit.log
+memory/affect.json
+memory/facts.json
+memory/skills.json
+memory/semantic.md
+memory/vectorstore/
+
+# --- Sandbox workspace ------------------------------------------------------
+workspace/
+
+# --- OS / editor ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/

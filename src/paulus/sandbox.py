@@ -10,13 +10,15 @@ File reads/writes operate on the shared workspace directory in every backend
 (for Docker it's the mounted volume); only command *execution* changes per
 backend, which is where isolation matters most. Select via config.SANDBOX_BACKEND.
 """
-import subprocess
 import shlex
-import config
+import subprocess
+
+from . import config
 
 
 class Sandbox:
     def safe_path(self, rel):
+        config.ensure_dirs()
         target = (config.WORKSPACE_DIR / rel).resolve()
         root = str(config.WORKSPACE_DIR.resolve())
         if not str(target).startswith(root):
@@ -42,6 +44,7 @@ class LocalSandbox(Sandbox):
     Docker/SSH for anything that touches untrusted input."""
 
     def run(self, command):
+        config.ensure_dirs()
         proc = subprocess.run(
             command, shell=True, cwd=str(config.WORKSPACE_DIR),
             capture_output=True, text=True, timeout=config.CMD_TIMEOUT,
@@ -54,6 +57,7 @@ class DockerSandbox(Sandbox):
     workspace mounted at /work. Requires Docker installed and config.DOCKER_IMAGE."""
 
     def run(self, command):
+        config.ensure_dirs()
         docker_cmd = [
             "docker", "run", "--rm", "--network", "none",
             "--cpus", "1", "--memory", "512m",

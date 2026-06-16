@@ -1,0 +1,42 @@
+# systemd unit for the PaulusAI Telegram gateway.
+#
+# Install (as the dedicated `paulus` user created in the README):
+#   sudo cp deploy/paulus-gateway.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now paulus-gateway
+#
+# Logs:   journalctl -u paulus-gateway -f
+# Status: systemctl status paulus-gateway
+
+[Unit]
+Description=PaulusAI Telegram gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=paulus
+Group=paulus
+
+# Secrets and configuration. The file must contain ANTHROPIC_API_KEY (or the
+# key for your chosen provider) and TELEGRAM_BOT_TOKEN. Keep it 0600.
+EnvironmentFile=/etc/paulus/paulus.env
+
+# Where runtime memory / audit log / vector index / workspace are written.
+Environment=DP_DATA_DIR=/var/lib/paulus
+# No interactive console here, so high-impact tools fail safe (deny) by default.
+Environment=DP_UNATTENDED_POLICY=deny
+
+ExecStart=/opt/paulus/venv/bin/paulus-gateway
+Restart=on-failure
+RestartSec=5
+
+# --- Hardening --------------------------------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/paulus
+
+[Install]
+WantedBy=multi-user.target

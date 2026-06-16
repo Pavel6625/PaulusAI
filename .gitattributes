@@ -1,0 +1,9 @@
+# Normalize line endings to LF so Linux artifacts (systemd unit, shell
+# snippets) and Python sources are never committed with CRLF.
+* text=auto eol=lf
+
+# Treat as binary (never touch line endings)
+*.png binary
+*.jpg binary
+*.gz binary
+*.zip binary

@@ -1,7 +1,7 @@
 """Run the digital person as a simple terminal chat.
 
-  export ANTHROPIC_API_KEY=sk-...
-  python main.py
+  paulus            # after `pip install`
+  python -m paulus  # equivalent
 
 Commands:
   /sleep    run consolidation (distil facts, propose skills, decay memory)
@@ -10,16 +10,13 @@ Commands:
   /skills   list learned skills
   /quit     consolidate and exit
 """
-import affect
-import agent
-import config
-import skills
-import vectorstore
+from . import affect, agent, config, skills, vectorstore
 
 
 def main():
+    config.ensure_dirs()
     vectorstore.init()  # bring up embeddings, or fall back to keyword search
-    print("Digital Person MVP. Type a message, or /quit to exit.\n")
+    print("PaulusAI. Type a message, or /quit to exit.\n")
     while True:
         try:
             text = input("you> ").strip()
@@ -33,9 +30,11 @@ def main():
             print("goodbye.")
             break
         if text == "/sleep":
-            print(agent.sleep()); continue
+            print(agent.sleep())
+            continue
         if text == "/mood":
-            print("mood:", affect.describe()); continue
+            print("mood:", affect.describe())
+            continue
         if text == "/memory":
             print(config.SEMANTIC_MD.read_text(encoding="utf-8")
                   if config.SEMANTIC_MD.exists() else "(no semantic memory yet)")

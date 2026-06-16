@@ -4,11 +4,7 @@ File and command execution route through a pluggable Sandbox (sandbox.py), so
 isolation is a config choice (local / Docker / SSH), not baked in. High-impact
 tools are declared in security.HIGH_IMPACT_TOOLS and gated by the agent loop.
 """
-import config
-import memory
-import security
-import skills
-import sandbox
+from . import config, memory, sandbox, security, skills
 
 _sbx = sandbox.get_sandbox()
 
@@ -85,7 +81,7 @@ TOOL_SPECS = [
     },
     {
         "name": "send_message",
-        "description": "Send a message on the owner's behalf. HIGH-IMPACT: requires owner confirmation. (MVP: simulated.)",
+        "description": "Send a message on the owner's behalf. HIGH-IMPACT: requires owner confirmation.",
         "input_schema": {
             "type": "object",
             "properties": {"to": {"type": "string"}, "body": {"type": "string"}},
@@ -142,7 +138,13 @@ def execute(name, tool_input):
 
         if name == "send_message":
             security.audit("send_message", f"to={tool_input['to']}")
-            return f"[simulated] message sent to {tool_input['to']}.", False
+            from .gateway.runner import get_runner
+            runner = get_runner()
+            if runner is not None:
+                result = runner.dispatch_outbound(tool_input["to"], tool_input["body"])
+            else:
+                result = f"[simulated] message sent to {tool_input['to']}."
+            return result, False
 
         return f"Unknown tool: {name}", True
     except Exception as e:

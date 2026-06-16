@@ -8,7 +8,7 @@ facts.json remains the canonical, inspectable store — this is only the index.
 If Chroma isn't installed, AVAILABLE stays False and memory.py falls back to
 keyword retrieval so the agent still runs.
 """
-import config
+from . import config
 
 AVAILABLE = False
 _collection = None
@@ -35,6 +35,7 @@ def init():
     """Try to bring the index up; on any failure, stay in fallback mode."""
     global AVAILABLE
     try:
+        config.ensure_dirs()
         _get_collection()
     except Exception as e:
         AVAILABLE = False

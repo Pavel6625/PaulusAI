@@ -1,0 +1,164 @@
+"""The single boundary between the agent and the language model.
+
+Uses LiteLLM for dynamic provider switching. Set DP_CORE_MODEL to any
+LiteLLM model string:
+
+  anthropic/claude-sonnet-4-6   (default)
+  openai/gpt-4o
+  gemini/gemini-1.5-pro
+  ollama_chat/llama3             (no key needed)
+  openrouter/openai/gpt-4o
+
+The corresponding API key env var must be set (ANTHROPIC_API_KEY,
+OPENAI_API_KEY, GEMINI_API_KEY, etc.). Ollama needs no key.
+
+agent.py is unaware of the provider — it always sees Anthropic-shaped
+response objects. All format conversion lives here.
+"""
+import json
+from dataclasses import dataclass, field
+
+import litellm
+
+from . import config
+
+litellm.suppress_debug_info = True
+
+
+# ---------------------------------------------------------------------------
+# Normalized response types (Anthropic-shaped, provider-agnostic)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _TextBlock:
+    type: str = "text"
+    text: str = ""
+
+
+@dataclass
+class _ToolUseBlock:
+    type: str = "tool_use"
+    id: str = ""
+    name: str = ""
+    input: dict = field(default_factory=dict)
+
+
+@dataclass
+class _Response:
+    stop_reason: str = "end_turn"
+    content: list = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Format conversion: Anthropic -> OpenAI (LiteLLM's universal wire format)
+# ---------------------------------------------------------------------------
+
+def _to_litellm_tools(tool_specs):
+    """Anthropic tool spec -> OpenAI function-calling format."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t["input_schema"],
+            },
+        }
+        for t in tool_specs
+    ]
+
+
+def _to_openai_messages(messages):
+    """Convert Anthropic-style message history to OpenAI-style.
+
+    Handles three content shapes agent.py produces:
+      - plain string  (from _history_to_messages)
+      - list of text/tool_use dicts  (assistant turn after tool use)
+      - list of tool_result dicts    (user turn returning tool output)
+    """
+    out = []
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+
+        if isinstance(content, str):
+            out.append({"role": role, "content": content})
+            continue
+
+        if role == "assistant":
+            texts = [b["text"] for b in content if b.get("type") == "text"]
+            tool_calls = [
+                {
+                    "id": b["id"],
+                    "type": "function",
+                    "function": {
+                        "name": b["name"],
+                        "arguments": json.dumps(b["input"]),
+                    },
+                }
+                for b in content if b.get("type") == "tool_use"
+            ]
+            entry = {"role": "assistant", "content": " ".join(texts) or None}
+            if tool_calls:
+                entry["tool_calls"] = tool_calls
+            out.append(entry)
+
+        elif role == "user":
+            tool_results = [b for b in content if b.get("type") == "tool_result"]
+            regular = [b for b in content if b.get("type") != "tool_result"]
+
+            for tr in tool_results:
+                out.append({
+                    "role": "tool",
+                    "tool_call_id": tr["tool_use_id"],
+                    "content": str(tr.get("content", "")),
+                })
+
+            if regular:
+                text = " ".join(b.get("text", "") for b in regular)
+                if text:
+                    out.append({"role": "user", "content": text})
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Format conversion: LiteLLM response -> Anthropic-shaped _Response
+# ---------------------------------------------------------------------------
+
+def _normalize(response):
+    choice = response.choices[0]
+    msg = choice.message
+    finish = choice.finish_reason
+
+    stop_reason = "tool_use" if finish == "tool_calls" else "end_turn"
+    content = []
+
+    if msg.content:
+        content.append(_TextBlock(text=msg.content))
+
+    for tc in getattr(msg, "tool_calls", None) or []:
+        content.append(_ToolUseBlock(
+            id=tc.id,
+            name=tc.function.name,
+            input=json.loads(tc.function.arguments),
+        ))
+
+    return _Response(stop_reason=stop_reason, content=content)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def complete(system, messages, tools=None):
+    """One non-streaming turn. Returns an Anthropic-shaped _Response."""
+    oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
+    return _normalize(litellm.completion(
+        model=config.CORE_MODEL,
+        max_tokens=config.MAX_TOKENS,
+        messages=oai_messages,
+        tools=_to_litellm_tools(tools) if tools else None,
+        api_base=config.API_BASE or None,
+        api_key=config.API_KEY or None,
+    ))

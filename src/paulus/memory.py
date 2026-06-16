@@ -9,18 +9,19 @@ Stores:
 The vector index is derived; facts.json stays the source of truth, so memory
 remains inspectable and the index can always be rebuilt from it.
 """
-import json
 import datetime
+import json
 import re
 import uuid
-import config
-import vectorstore
+
+from . import config, vectorstore
 
 # --------------------------------------------------------------------------- #
 # Episodic                                                                     #
 # --------------------------------------------------------------------------- #
 
 def log_episode(role, text, trust="trusted"):
+    config.ensure_dirs()
     rec = {
         "ts": datetime.datetime.now().isoformat(timespec="seconds"),
         "role": role, "trust": trust, "text": text,
@@ -34,7 +35,7 @@ def recent_episodes(n=None):
     if not config.EPISODIC_LOG.exists():
         return []
     lines = config.EPISODIC_LOG.read_text(encoding="utf-8").splitlines()
-    return [json.loads(l) for l in lines[-n:]]
+    return [json.loads(line) for line in lines[-n:]]
 
 
 # --------------------------------------------------------------------------- #
@@ -48,6 +49,7 @@ def _load_facts():
 
 
 def _save_facts(facts):
+    config.ensure_dirs()
     config.FACTS_FILE.write_text(json.dumps(facts, indent=2), encoding="utf-8")
     _render_semantic_md(facts)
 

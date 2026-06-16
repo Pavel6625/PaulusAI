@@ -46,7 +46,10 @@ class GatewayRunner:
         async with self._agent_lock:
             from .. import agent as _agent
             loop = asyncio.get_running_loop()
-            reply = await loop.run_in_executor(None, _agent.respond, tagged)
+            user_id = str(source.user_id)
+            reply = await loop.run_in_executor(
+                None, lambda: _agent.respond(tagged, user_id=user_id)
+            )
 
         if any(token in reply for token in SILENCE_TOKENS):
             return

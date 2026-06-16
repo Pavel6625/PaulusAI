@@ -34,14 +34,14 @@ Possibly relevant skills:
 """
 
 
-def _context_query():
-    eps = memory.recent_episodes(4)
+def _context_query(user_id=None):
+    eps = memory.recent_episodes(4, user_id=user_id)
     return " ".join(e["text"] for e in eps) if eps else ""
 
 
-def _build_system():
-    q = _context_query()
-    facts = memory.search_facts(q) if q else []
+def _build_system(user_id=None):
+    q = _context_query(user_id)
+    facts = memory.search_facts(q, user_id=user_id) if q else []
     recalled = "\n".join(f"- {f['fact']}" for f in facts) or "(nothing retrieved yet)"
     found = skills.find_skills(q) if q else []
     skill_list = "\n".join(f"- [{s['status']}] {s['name']}: {s['when_to_use']}"
@@ -50,9 +50,9 @@ def _build_system():
                                   skill_list=skill_list)
 
 
-def _history_to_messages():
+def _history_to_messages(user_id=None):
     msgs = []
-    for e in memory.recent_episodes():
+    for e in memory.recent_episodes(user_id=user_id):
         role = "user" if e["role"] == "owner" else "assistant"
         msgs.append({"role": role, "content": e["text"]})
     return msgs
@@ -68,8 +68,8 @@ def _blocks_to_dicts(content):
     return out
 
 
-def respond(owner_text):
-    memory.log_episode("owner", owner_text, trust="trusted")
+def respond(owner_text, user_id=None):
+    memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
 
     low = owner_text.lower()
     if any(w in low for w in ("thank", "thanks", "great", "love it")):
@@ -77,8 +77,8 @@ def respond(owner_text):
     elif any(w in low for w in ("wrong", "no,", "frustrat", "annoy", "bad")):
         affect.feel("owner_frustrated")
 
-    system = _build_system()
-    messages = _history_to_messages()
+    system = _build_system(user_id)
+    messages = _history_to_messages(user_id)
 
     final_text = ""
     while True:
@@ -109,7 +109,7 @@ def respond(owner_text):
                     })
                     continue
 
-            result, is_error = tools.execute(b.name, b.input)
+            result, is_error = tools.execute(b.name, b.input, user_id=user_id)
             affect.feel("task_error" if is_error else "task_success")
             if b.name in ("remember", "save_skill") and not is_error:
                 affect.feel("new_learning")
@@ -120,16 +120,16 @@ def respond(owner_text):
 
         messages.append({"role": "user", "content": tool_results})
 
-    memory.log_episode("agent", final_text, trust="trusted")
+    memory.log_episode("agent", final_text, trust="trusted", user_id=user_id)
     affect.decay()
     return final_text
 
 
-def sleep():
+def sleep(user_id=None):
     """Consolidation / 'subconscious' loop: distil durable facts AND propose
     reusable skills from recent episodes, then decay. Proposed skills are stored
     as 'unverified' (reflection-review gate)."""
-    episodes = memory.recent_episodes(20)
+    episodes = memory.recent_episodes(20, user_id=user_id)
     if not episodes:
         return "Nothing to consolidate yet."
     transcript = "\n".join(f"{e['role']}: {e['text']}" for e in episodes)
@@ -146,7 +146,8 @@ def sleep():
     try:
         data = json.loads(text)
         for f in data.get("facts", []):
-            memory.add_fact(f, confidence=0.6, provenance=["consolidation"])
+            memory.add_fact(f, confidence=0.6, provenance=["consolidation"],
+                            user_id=user_id)
             facts_n += 1
         for s in data.get("skills", []):
             skills.add_skill(s["name"], s["when_to_use"], s["steps"],
@@ -154,5 +155,5 @@ def sleep():
             skills_n += 1
     except Exception:
         pass
-    memory.decay()
+    memory.decay(user_id=user_id)
     return f"Consolidated {facts_n} fact(s), proposed {skills_n} skill(s); memory decayed."

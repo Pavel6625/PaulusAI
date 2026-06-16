@@ -9,7 +9,9 @@ The three controls that matter most in this MVP:
   3. Every action is written to an append-only audit log.
 """
 import datetime
-import config
+import sys
+
+from . import config
 
 # Tools whose effects are irreversible or reach outside the machine.
 # These ALWAYS require per-action owner confirmation. Never generalise a yes.
@@ -32,17 +34,41 @@ def wrap_untrusted(source, content):
     )
 
 
+def _interactive() -> bool:
+    """True only when there is a real terminal we can prompt the owner on."""
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 def confirm(tool_name, tool_input):
-    """Human-in-the-loop gate. Returns True only on an explicit 'y'."""
+    """Human-in-the-loop gate. Returns True only on explicit approval.
+
+    When there is no interactive console — e.g. running under systemd or behind
+    the chat gateway — the owner cannot be prompted, so we fall back to the
+    configured ``DP_UNATTENDED_POLICY`` ("deny" by default = fail safe). Every
+    decision is audited either way.
+    """
+    if not _interactive():
+        approved = config.UNATTENDED_POLICY == "approve"
+        audit("unattended_" + ("approve" if approved else "deny"),
+              f"{tool_name} {tool_input}")
+        return approved
+
     print("\n" + "=" * 60)
     print(f"  CONFIRMATION REQUIRED — high-impact action: {tool_name}")
     print(f"  details: {tool_input}")
     print("=" * 60)
-    answer = input("  Approve this single action? [y/N] ").strip().lower()
+    try:
+        answer = input("  Approve this single action? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
     return answer == "y"
 
 
 def audit(event, detail):
+    config.ensure_dirs()
     ts = datetime.datetime.now().isoformat(timespec="seconds")
     line = f"{ts}\t{event}\t{detail}\n"
     with open(config.AUDIT_LOG, "a", encoding="utf-8") as f:

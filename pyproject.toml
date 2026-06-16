@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paulusai"
+version = "0.1.0"
+description = "A long-running, autonomous digital companion with persistent memory, a functional affective system, continuous learning, and tool use."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Pavel" }]
+keywords = ["agent", "llm", "memory", "companion", "litellm"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: Console",
+]
+
+# Core runtime. Kept lean: semantic-memory and Telegram support are optional
+# extras (the agent degrades gracefully without them — keyword search instead
+# of embeddings, terminal-only instead of the chat gateway).
+dependencies = [
+    "litellm>=1.40,<2",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+vectors = ["chromadb>=0.5,<2"]
+telegram = ["python-telegram-bot>=21.0,<23"]
+all = [
+    "chromadb>=0.5,<2",
+    "python-telegram-bot>=21.0,<23",
+]
+dev = [
+    "pytest>=8,<9",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+paulus = "paulus.cli:main"
+paulus-gateway = "paulus.gateway_main:run"
+
+[project.urls]
+Homepage = "https://github.com/Pavel6625/PaulusAI"
+Wiki = "https://github.com/Pavel6625/PaulusAI/wiki"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

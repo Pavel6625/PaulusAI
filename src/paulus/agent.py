@@ -3,12 +3,8 @@
 between the model's decision and any real-world effect.
 """
 import json
-import llm
-import memory
-import affect
-import skills
-import tools
-import security
+
+from . import affect, llm, memory, security, skills, tools
 
 SYSTEM_TEMPLATE = """You are a persistent digital companion for a single owner.
 You have long-term memory, learned skills, and a current mood. Be warm, concise,
@@ -105,7 +101,11 @@ def respond(owner_text):
                     affect.feel("action_declined")
                     tool_results.append({
                         "type": "tool_result", "tool_use_id": b.id,
-                        "content": "Owner DECLINED this action. Do not retry it.",
+                        "content": ("This high-impact action was NOT approved (the "
+                                    "owner declined, or no interactive approval was "
+                                    "available). Do not retry it; instead, tell the "
+                                    "owner what you wanted to do and let them run or "
+                                    "approve it directly."),
                     })
                     continue
 

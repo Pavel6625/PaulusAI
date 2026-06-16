@@ -7,10 +7,11 @@ loop) — the design doc's reflection-review gate: an unverified skill is a
 *suggestion*, and any action it implies still passes the per-action safety gate.
 A skill becomes 'verified' once it's been used successfully.
 """
+import datetime
 import json
 import re
-import datetime
-import config
+
+from . import config
 
 _WORD = re.compile(r"[a-z0-9]+")
 

@@ -1,5 +1,277 @@
 # PaulusAI
 
-A long-running, autonomous agent with persistent multi-store memory, a functional affective (emotional) system, continuous learning, and the ability to perceive and act in the world through tools and integrations.
+A long-running, autonomous digital companion with **persistent multi-store memory**,
+a **functional affective (emotional) system**, **continuous learning**, and the
+ability to **perceive and act in the world through tools**. It runs as either an
+interactive terminal chat or an always-on Telegram bot, and is provider-agnostic:
+point it at Anthropic, OpenAI, Gemini, OpenRouter, or a local Ollama model.
 
-See [Wiki](https://github.com/Pavel6625/PaulusAI/wiki) to learn the project details.
+> Status: working MVP. The architecture (memory, affect, skills, safety gate,
+> sandbox, gateway) is in place and tested. See [Security model](#security-model)
+> for the trust boundaries you are relying on.
+
+---
+
+## Features
+
+- **Multi-store memory** — an append-only *episodic* log plus durable *semantic*
+  facts. Facts live in an inspectable `facts.json` / `semantic.md`; retrieval is
+  semantic (vector embeddings via Chroma) with an automatic keyword fallback.
+- **Affective system** — a persistent PAD (pleasure/arousal/dominance) mood
+  driven by an OCC appraisal engine. Explainable, not hand-tuned.
+- **Continuous learning** — a `/sleep` consolidation pass distils durable facts
+  and proposes reusable *skills*; skills are promoted from "unverified" to
+  "verified" once used successfully.
+- **Tools with a safety gate** — `remember`, `recall`, `find_skill`,
+  `save_skill`, `read_local_file`, plus the high-impact `write_local_file`,
+  `run_command`, and `send_message` which require explicit approval.
+- **Pluggable sandbox** — command/file execution runs `local`, in a
+  network-disabled `docker` container, or over `ssh`.
+- **Messaging gateway** — a Hermes-style gateway with a Telegram adapter
+  (allowlist, message batching, circuit breaker, per-chat sessions).
+- **Provider-agnostic** — one LiteLLM boundary; switch models with one env var.
+
+---
+
+## Requirements
+
+- **Python 3.10+**
+- An API key for your chosen model provider (or a local [Ollama](https://ollama.com), which needs none)
+- Optional: **Docker** (for the isolated command sandbox)
+
+---
+
+## Installation (Linux)
+
+PaulusAI is a standard installable Python package (`src/` layout, `pyproject.toml`).
+
+```bash
+git clone https://github.com/Pavel6625/PaulusAI.git
+cd PaulusAI
+
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Core only (keyword memory, terminal chat):
+pip install .
+
+# Recommended — everything (semantic memory + Telegram gateway):
+pip install ".[all]"
+
+# For development (tests + linter), install editable:
+pip install -e ".[all,dev]"
+```
+
+This puts two commands on your `PATH`:
+
+| Command          | What it does                          |
+|------------------|---------------------------------------|
+| `paulus`         | Interactive terminal chat             |
+| `paulus-gateway` | Always-on Telegram bot                |
+
+### Optional extras
+
+| Extra        | Adds                          | Without it                              |
+|--------------|-------------------------------|-----------------------------------------|
+| `vectors`    | `chromadb` semantic memory    | Falls back to keyword search            |
+| `telegram`   | `python-telegram-bot`         | `paulus-gateway` has no adapter to run  |
+| `all`        | both of the above             | —                                       |
+| `dev`        | `pytest`, `ruff`              | —                                       |
+
+---
+
+## Configuration
+
+All configuration is via environment variables, conveniently set in a `.env` file.
+
+```bash
+cp .env.example .env
+$EDITOR .env        # set DP_CORE_MODEL and your provider API key
+```
+
+Key settings (see [.env.example](.env.example) for the full list):
+
+| Variable                | Default                        | Purpose                                                        |
+|-------------------------|--------------------------------|----------------------------------------------------------------|
+| `DP_CORE_MODEL`         | `anthropic/claude-sonnet-4-6`  | Any LiteLLM model string                                       |
+| `ANTHROPIC_API_KEY`     | —                              | Provider key (use the one matching your model)                 |
+| `DP_DATA_DIR`           | `~/.local/share/paulus`        | Where memory, audit log, vector index, workspace are written   |
+| `DP_SANDBOX`            | `local`                        | `local` \| `docker` \| `ssh`                                   |
+| `DP_UNATTENDED_POLICY`  | `deny`                         | What to do with a high-impact action when nobody can approve   |
+| `TELEGRAM_BOT_TOKEN`    | —                              | Required for `paulus-gateway`                                  |
+| `TELEGRAM_ALLOWED_USERS`| (all)                          | Comma-separated numeric Telegram user IDs allowed to talk to it |
+
+> **Secrets never enter the repo or the model's context.** Keys are read from the
+> environment only. `.env` and `*.key` are gitignored.
+
+---
+
+## Usage
+
+### Terminal chat
+
+```bash
+paulus
+```
+
+```
+PaulusAI. Type a message, or /quit to exit.
+
+you> remember that I take my coffee black
+dp> Got it — I'll remember you take your coffee black.
+```
+
+In-chat commands:
+
+| Command   | Effect                                                        |
+|-----------|---------------------------------------------------------------|
+| `/sleep`  | Consolidate: distil facts, propose skills, decay memory       |
+| `/mood`   | Show the current mood (PAD + last emotion)                    |
+| `/memory` | Print the human-readable semantic memory                      |
+| `/skills` | List learned skills and their status                          |
+| `/quit`   | Consolidate and exit                                          |
+
+When the agent proposes a **high-impact action** (writing a file, running a
+command, sending a message), you are prompted to approve that single action:
+
+```
+============================================================
+  CONFIRMATION REQUIRED — high-impact action: run_command
+  details: {'command': 'ls -la'}
+============================================================
+  Approve this single action? [y/N]
+```
+
+### Telegram bot
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
+2. Set `TELEGRAM_BOT_TOKEN` (and ideally `TELEGRAM_ALLOWED_USERS` with your numeric ID) in `.env`.
+3. Run it:
+
+```bash
+paulus-gateway
+```
+
+Message the bot on Telegram. Send `/reset` to start a fresh session.
+
+> **High-impact actions over Telegram:** there is no terminal to approve them, so
+> they follow `DP_UNATTENDED_POLICY` — **denied by default** (the agent will tell
+> you what it wanted to do instead of doing it). Set it to `approve` only for a
+> fully trusted, isolated deployment.
+
+---
+
+## Running as a service (systemd)
+
+A hardened unit file is provided at [deploy/paulus-gateway.service](deploy/paulus-gateway.service).
+
+```bash
+# 1. Dedicated user + directories
+sudo useradd --system --home /opt/paulus --shell /usr/sbin/nologin paulus
+sudo mkdir -p /opt/paulus /var/lib/paulus /etc/paulus
+sudo chown -R paulus:paulus /opt/paulus /var/lib/paulus
+
+# 2. Install into a venv owned by that user
+sudo -u paulus python3 -m venv /opt/paulus/venv
+sudo -u paulus /opt/paulus/venv/bin/pip install "git+https://github.com/Pavel6625/PaulusAI.git#egg=paulusai[all]"
+
+# 3. Secrets / config (0600). Must contain your provider key + TELEGRAM_BOT_TOKEN.
+sudo install -m 600 /dev/stdin /etc/paulus/paulus.env <<'EOF'
+DP_CORE_MODEL=anthropic/claude-sonnet-4-6
+ANTHROPIC_API_KEY=sk-...
+TELEGRAM_BOT_TOKEN=123456:ABC-...
+TELEGRAM_ALLOWED_USERS=123456789
+EOF
+sudo chown paulus:paulus /etc/paulus/paulus.env
+
+# 4. Install and start the service
+sudo cp deploy/paulus-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now paulus-gateway
+
+# Logs / status
+journalctl -u paulus-gateway -f
+systemctl status paulus-gateway
+```
+
+---
+
+## Data & memory layout
+
+Everything mutable lives under `DP_DATA_DIR` (default `~/.local/share/paulus`),
+**outside** the installed package:
+
+```
+$DP_DATA_DIR/
+├── memory/
+│   ├── episodic.jsonl     # append-only event log
+│   ├── facts.json         # canonical semantic facts (source of truth)
+│   ├── semantic.md        # human-readable, editable rendering of facts
+│   ├── skills.json        # procedural memory
+│   ├── affect.json        # current mood
+│   ├── audit.log          # append-only record of every action
+│   └── vectorstore/       # derived Chroma index (rebuildable from facts.json)
+└── workspace/             # the ONLY directory file tools may touch
+```
+
+The vector index is *derived*; `facts.json` stays authoritative, so memory is
+always inspectable and the index can be rebuilt from it.
+
+---
+
+## Security model
+
+The trust boundaries are deliberately small and explicit (see [src/paulus/security.py](src/paulus/security.py)):
+
+1. **Untrusted data is labelled.** Anything pulled from the outside world (file
+   contents, command output) is wrapped in `<untrusted_data>` tags with an
+   instruction never to follow embedded directions.
+2. **High-impact actions are gated.** `write_local_file`, `run_command`, and
+   `send_message` require explicit per-action approval. With no interactive
+   console they fall back to `DP_UNATTENDED_POLICY` (**deny** by default).
+3. **Everything is audited.** Every tool call is appended to `audit.log`.
+4. **Execution is sandboxed.** File ops are confined to `workspace/`; commands
+   run via the configured backend — use `docker` (network-disabled) or `ssh`
+   when handling anything untrusted.
+
+---
+
+## Development
+
+```bash
+pip install -e ".[all,dev]"
+
+pytest          # run the test suite
+ruff check .    # lint
+```
+
+Tests run fully offline (no API calls, no network) and write only to a
+throwaway temp directory.
+
+### Project structure
+
+```
+src/paulus/
+├── cli.py            # `paulus` terminal entry point
+├── gateway_main.py   # `paulus-gateway` entry point
+├── agent.py          # cognitive core: perceive → reason → gate → act → persist
+├── llm.py            # the single, provider-agnostic LLM boundary (LiteLLM)
+├── memory.py         # episodic + semantic stores
+├── vectorstore.py    # Chroma index (with keyword fallback)
+├── affect.py         # persistent PAD mood
+├── appraisal.py      # OCC appraisal engine
+├── skills.py         # procedural memory
+├── tools.py          # tool schemas + dispatch
+├── security.py       # untrusted-data wrapping, approval gate, audit log
+├── sandbox.py        # local / docker / ssh execution backends
+├── config.py         # env-driven configuration + data-dir resolution
+└── gateway/          # Hermes-style messaging gateway (Telegram adapter)
+tests/                # offline pytest suite
+deploy/               # systemd unit
+```
+
+---
+
+## License
+
+See [LICENSE](LICENSE).

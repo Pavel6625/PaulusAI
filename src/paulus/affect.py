@@ -10,8 +10,8 @@ emotion felt, and feel() returns the emotions so the caller can log *why*.
 This is expressive, explainable emotional behaviour — not a claim of feeling.
 """
 import json
-import config
-import appraisal
+
+from . import appraisal, config
 
 # Stable traits (Big Five subset). 0..1.
 PERSONALITY = {

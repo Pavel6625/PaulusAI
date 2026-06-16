@@ -91,18 +91,19 @@ TOOL_SPECS = [
 ]
 
 
-def execute(name, tool_input):
+def execute(name, tool_input, user_id=None):
     """Run a tool. Returns (result_text, is_error). Any required confirmation
     for high-impact tools is obtained by the caller BEFORE this runs."""
     try:
         if name == "remember":
             res = memory.add_fact(tool_input["fact"],
-                                  confidence=float(tool_input.get("confidence", 0.7)))
+                                  confidence=float(tool_input.get("confidence", 0.7)),
+                                  user_id=user_id)
             security.audit("remember", tool_input["fact"])
             return res, False
 
         if name == "recall":
-            hits = memory.search_facts(tool_input["query"])
+            hits = memory.search_facts(tool_input["query"], user_id=user_id)
             if not hits:
                 return "No relevant facts found.", False
             return "\n".join(f"- {h['fact']} (salience {h['salience']:.2f})" for h in hits), False

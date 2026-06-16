@@ -7,11 +7,21 @@ an API-based embedder by passing embedding_function to get_or_create_collection.
 facts.json remains the canonical, inspectable store — this is only the index.
 If Chroma isn't installed, AVAILABLE stays False and memory.py falls back to
 keyword retrieval so the agent still runs.
+
+User isolation: every document is tagged with a ``user_id`` metadata field.
+All reads are filtered to the requesting user so one user can never retrieve
+another user's facts. CLI (single-user) mode uses the sentinel "__local__".
 """
 from . import config
 
 AVAILABLE = False
 _collection = None
+
+_LOCAL_USER = "__local__"
+
+
+def _uid(user_id):
+    return user_id if user_id is not None else _LOCAL_USER
 
 
 def _get_collection():
@@ -43,25 +53,41 @@ def init():
     return AVAILABLE
 
 
-def upsert(fact_id, text):
+def upsert(fact_id, text, user_id=None):
+    """Index a fact under the given user. IDs are namespaced to prevent collisions."""
     col = _get_collection()
-    col.upsert(ids=[fact_id], documents=[text])
+    uid = _uid(user_id)
+    col.upsert(
+        ids=[f"{uid}:{fact_id}"],
+        documents=[text],
+        metadatas=[{"user_id": uid}],
+    )
 
 
-def query(text, k):
+def query(text, k, user_id=None):
+    """Return fact IDs semantically closest to *text*, scoped to *user_id*."""
     col = _get_collection()
-    if col.count() == 0:
+    uid = _uid(user_id)
+    where = {"user_id": uid}
+    user_doc_ids = col.get(where=where, include=[]).get("ids", [])
+    if not user_doc_ids:
         return []
-    res = col.query(query_texts=[text], n_results=min(k, col.count()))
-    return res.get("ids", [[]])[0]
+    n = min(k, len(user_doc_ids))
+    res = col.query(query_texts=[text], n_results=n, where=where)
+    raw_ids = res.get("ids", [[]])[0]
+    prefix = f"{uid}:"
+    return [rid[len(prefix):] if rid.startswith(prefix) else rid for rid in raw_ids]
 
 
-def count():
-    return _get_collection().count()
-
-
-def reset():
+def count(user_id=None):
+    uid = _uid(user_id)
     col = _get_collection()
-    existing = col.get(include=[]).get("ids", [])
+    return len(col.get(where={"user_id": uid}, include=[]).get("ids", []))
+
+
+def reset(user_id=None):
+    uid = _uid(user_id)
+    col = _get_collection()
+    existing = col.get(where={"user_id": uid}, include=[]).get("ids", [])
     if existing:
         col.delete(ids=existing)

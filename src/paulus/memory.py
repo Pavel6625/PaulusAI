@@ -24,6 +24,7 @@ from pathlib import Path
 
 from . import config, llm, vectorstore
 
+
 def _safe_uid(user_id: str) -> str:
     return config.safe_uid(user_id)
 

@@ -85,6 +85,16 @@ def count(user_id=None):
     return len(col.get(where={"user_id": uid}, include=[]).get("ids", []))
 
 
+def delete(ids, user_id=None):
+    """Remove specific facts from the index for *user_id*. IDs are the bare
+    fact ids; they are namespaced here the same way upsert stores them."""
+    if not ids:
+        return
+    uid = _uid(user_id)
+    col = _get_collection()
+    col.delete(ids=[f"{uid}:{fact_id}" for fact_id in ids])
+
+
 def reset(user_id=None):
     uid = _uid(user_id)
     col = _get_collection()

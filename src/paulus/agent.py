@@ -68,26 +68,15 @@ def _blocks_to_dicts(content):
     return out
 
 
-def respond(owner_text, user_id=None):
-    memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
-
-    low = owner_text.lower()
-    if any(w in low for w in ("thank", "thanks", "great", "love it")):
-        affect.feel("owner_thanks")
-    elif any(w in low for w in ("wrong", "no,", "frustrat", "annoy", "bad")):
-        affect.feel("owner_frustrated")
-
-    system = _build_system(user_id)
-    messages = _history_to_messages(user_id)
-
-    final_text = ""
+def _run_tool_loop(system, messages, user_id=None):
+    """Drive the model<->tool exchange, with the safety gate between the
+    model's decision and any real-world effect. Returns the final text."""
     while True:
         resp = llm.complete(system, messages, tools=tools.TOOL_SPECS)
         messages.append({"role": "assistant", "content": _blocks_to_dicts(resp.content)})
 
         if resp.stop_reason != "tool_use":
-            final_text = "".join(b.text for b in resp.content if b.type == "text")
-            break
+            return "".join(b.text for b in resp.content if b.type == "text")
 
         tool_results = []
         for b in resp.content:
@@ -120,9 +109,55 @@ def respond(owner_text, user_id=None):
 
         messages.append({"role": "user", "content": tool_results})
 
+
+def respond(owner_text, user_id=None):
+    memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
+
+    low = owner_text.lower()
+    if any(w in low for w in ("thank", "thanks", "great", "love it")):
+        affect.feel("owner_thanks")
+    elif any(w in low for w in ("wrong", "no,", "frustrat", "annoy", "bad")):
+        affect.feel("owner_frustrated")
+
+    system = _build_system(user_id)
+    messages = _history_to_messages(user_id)
+    final_text = _run_tool_loop(system, messages, user_id)
+
     memory.log_episode("agent", final_text, trust="trusted", user_id=user_id)
     affect.decay()
     return final_text
+
+
+# Sentinels the gateway swallows without delivering. Kept in sync with
+# gateway.base.SILENCE_TOKENS, but defined here so the agent has no import
+# dependency on the gateway layer.
+_SILENCE_TOKENS = ("[SILENT]", "NO_REPLY")
+
+PROACTIVE_NUDGE = (
+    "The owner has been quiet for a while; this is an internal idle check, not "
+    "a message from them. Review your recent memory and current mood. ONLY if "
+    "there is something genuinely worth raising unprompted — a follow-up you "
+    "promised, a timely reminder, a check-in that fits the relationship — write "
+    "one short, warm message. If nothing rises to that bar, reply with exactly "
+    "[SILENT] and nothing else. Do not invent a reason to talk."
+)
+
+
+def proactive_check(user_id=None):
+    """Idle-triggered turn: let the model decide whether to reach out. Returns a
+    message to deliver, or a silence sentinel the caller swallows. The seed
+    prompt is never persisted; only a real outgoing message is logged."""
+    system = _build_system(user_id)
+    messages = _history_to_messages(user_id)
+    messages.append({"role": "user", "content": PROACTIVE_NUDGE})
+
+    text = _run_tool_loop(system, messages, user_id)
+
+    if any(tok in text for tok in _SILENCE_TOKENS):
+        return text                      # swallowed upstream; nothing persisted
+    memory.log_episode("agent", text, trust="trusted", user_id=user_id)
+    affect.decay()
+    return text
 
 
 def sleep(user_id=None):

@@ -56,6 +56,7 @@ FACTS_FILE = MEMORY_DIR / "facts.json"        # canonical structured facts
 SEMANTIC_MD = MEMORY_DIR / "semantic.md"      # human-readable, inspectable view
 AFFECT_FILE = MEMORY_DIR / "affect.json"
 SKILLS_FILE = MEMORY_DIR / "skills.json"      # procedural memory
+PRESENCE_FILE = MEMORY_DIR / "presence.json"  # per-user idle/nudge state
 
 # --- Memory tuning ----------------------------------------------------------
 RECENT_EPISODES = 8
@@ -79,6 +80,34 @@ API_KEY = (os.environ.get("DP_API_KEY")
 IDLE_CHECK_INTERVAL = int(os.environ.get("DP_IDLE_CHECK", "300"))
 MIN_IDLE_MINUTES = float(os.environ.get("DP_MIN_IDLE", "30"))
 MAX_IDLE_MSG_SESSION = int(os.environ.get("DP_MAX_IDLE_MSG", "3"))
+
+
+def _parse_quiet(spec):
+    """Parse "START-END" (24h hours, local time) into (start, end) ints.
+    Returns (None, None) when unset or malformed (i.e. no quiet window)."""
+    if not spec or "-" not in spec:
+        return None, None
+    try:
+        start, end = (int(x) % 24 for x in spec.split("-", 1))
+    except ValueError:
+        return None, None
+    return start, end
+
+
+# Local-time window during which the agent stays silent (no proactive nudges).
+# e.g. DP_QUIET_HOURS=23-7 mutes 23:00 up to (not including) 07:00. Empty = off.
+QUIET_START, QUIET_END = _parse_quiet(os.environ.get("DP_QUIET_HOURS", ""))
+
+
+def in_quiet_hours(now=None):
+    """True if local time falls inside the configured quiet window."""
+    if QUIET_START is None or QUIET_END is None or QUIET_START == QUIET_END:
+        return False
+    from datetime import datetime
+    hour = (now or datetime.now()).hour
+    if QUIET_START < QUIET_END:
+        return QUIET_START <= hour < QUIET_END
+    return hour >= QUIET_START or hour < QUIET_END   # window wraps midnight
 
 # --- Sandbox ----------------------------------------------------------------
 # Where tool/command execution runs: "local" | "docker" | "ssh".

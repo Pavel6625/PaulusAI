@@ -24,11 +24,8 @@ from pathlib import Path
 
 from . import config, llm, vectorstore
 
-_SAFE_UID_RE = re.compile(r"[^a-zA-Z0-9_-]")
-
-
 def _safe_uid(user_id: str) -> str:
-    return _SAFE_UID_RE.sub("_", str(user_id))
+    return config.safe_uid(user_id)
 
 
 def _user_dir(user_id) -> Path | None:

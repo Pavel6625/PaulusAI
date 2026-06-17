@@ -13,6 +13,7 @@ location is resolved in this order:
   3. ``~/.local/share/paulus``                (fallback)
 """
 import os
+import re
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -57,6 +58,26 @@ SEMANTIC_MD = MEMORY_DIR / "semantic.md"      # human-readable, inspectable view
 AFFECT_FILE = MEMORY_DIR / "affect.json"
 SKILLS_FILE = MEMORY_DIR / "skills.json"      # procedural memory
 PRESENCE_FILE = MEMORY_DIR / "presence.json"  # per-user idle/nudge state
+
+# --- Per-user isolation -----------------------------------------------------
+# A user_id arrives from the chat gateway and is used as a filesystem path
+# component (for both memory and the sandbox workspace), so it MUST be
+# sanitised — a value like "../other" would otherwise escape the user's dir.
+_SAFE_UID_RE = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def safe_uid(user_id) -> str:
+    """Sanitise a user_id into a single safe path component."""
+    return _SAFE_UID_RE.sub("_", str(user_id))
+
+
+def user_workspace(user_id=None) -> Path:
+    """The workspace root for *user_id*. ``None`` (CLI / single-user mode)
+    falls back to the shared WORKSPACE_DIR so existing setups are unaffected;
+    a concrete id is isolated under ``WORKSPACE_DIR/users/<safe_uid>/``."""
+    if user_id is None:
+        return WORKSPACE_DIR
+    return WORKSPACE_DIR / "users" / safe_uid(user_id)
 
 # --- Memory tuning ----------------------------------------------------------
 RECENT_EPISODES = 8

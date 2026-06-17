@@ -123,17 +123,17 @@ def execute(name, tool_input, user_id=None):
             return res, False
 
         if name == "read_local_file":
-            content = _sbx.read_file(tool_input["path"])
+            content = _sbx.read_file(tool_input["path"], user_id=user_id)
             security.audit("read_local_file", tool_input["path"])
             return security.wrap_untrusted(f"file:{tool_input['path']}", content), False
 
         if name == "write_local_file":
-            res = _sbx.write_file(tool_input["path"], tool_input["content"])
+            res = _sbx.write_file(tool_input["path"], tool_input["content"], user_id=user_id)
             security.audit("write_local_file", tool_input["path"])
             return res, False
 
         if name == "run_command":
-            out = _sbx.run(tool_input["command"])
+            out = _sbx.run(tool_input["command"], user_id=user_id)
             security.audit("run_command", f"[{config.SANDBOX_BACKEND}] {tool_input['command']}")
             return security.wrap_untrusted("command_output", out), False
 

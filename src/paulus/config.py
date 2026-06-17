@@ -61,6 +61,12 @@ SKILLS_FILE = MEMORY_DIR / "skills.json"      # procedural memory
 RECENT_EPISODES = 8
 TOP_FACTS = 6
 DECAY_PER_SLEEP = 0.9
+# Facts whose salience decays below this are forgotten (dropped from facts.json
+# and the vector index) on the next consolidation. Set to 0 to never evict.
+SALIENCE_FLOOR = float(os.environ.get("DP_SALIENCE_FLOOR", "0.05"))
+# Hard cap on the episodic log so it can't grow without bound. The log is
+# trimmed to the most recent MAX_EPISODES entries; set to 0 to disable.
+MAX_EPISODES = int(os.environ.get("DP_MAX_EPISODES", "2000"))
 
 # --- Provider overrides (optional) -----------------------------------------
 # Set these when using a non-default API endpoint (e.g. Ollama Cloud).

@@ -14,14 +14,18 @@ point it at Anthropic, OpenAI, Gemini, OpenRouter, or a local Ollama model.
 
 ## Features
 
-- **Multi-store memory** — an append-only *episodic* log plus durable *semantic*
+- **Multi-store memory** — a bounded *episodic* log (capped at the most recent
+  `DP_MAX_EPISODES` entries) plus durable *semantic*
   facts. Facts live in an inspectable `facts.json` / `semantic.md`; retrieval is
   semantic (vector embeddings via Chroma) with an automatic keyword fallback.
+  New facts are reconciled against similar ones — paraphrases reinforce the
+  existing entry and contradictions are superseded (newer info wins).
 - **Affective system** — a persistent PAD (pleasure/arousal/dominance) mood
   driven by an OCC appraisal engine. Explainable, not hand-tuned.
 - **Continuous learning** — a `/sleep` consolidation pass distils durable facts
   and proposes reusable *skills*; skills are promoted from "unverified" to
-  "verified" once used successfully.
+  "verified" once used successfully. Salience decays each pass and facts that
+  fade below `DP_SALIENCE_FLOOR` are forgotten, keeping memory bounded.
 - **Tools with a safety gate** — `remember`, `recall`, `find_skill`,
   `save_skill`, `read_local_file`, plus the high-impact `write_local_file`,
   `run_command`, and `send_message` which require explicit approval.
@@ -204,7 +208,7 @@ Everything mutable lives under `DP_DATA_DIR` (default `~/.local/share/paulus`),
 ```
 $DP_DATA_DIR/
 ├── memory/
-│   ├── episodic.jsonl     # append-only event log
+│   ├── episodic.jsonl     # event log, trimmed to the most recent DP_MAX_EPISODES
 │   ├── facts.json         # canonical semantic facts (source of truth)
 │   ├── semantic.md        # human-readable, editable rendering of facts
 │   ├── skills.json        # procedural memory

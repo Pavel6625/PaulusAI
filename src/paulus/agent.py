@@ -155,5 +155,6 @@ def sleep(user_id=None):
             skills_n += 1
     except Exception:
         pass
-    memory.decay(user_id=user_id)
-    return f"Consolidated {facts_n} fact(s), proposed {skills_n} skill(s); memory decayed."
+    forgotten = memory.decay(user_id=user_id)
+    return (f"Consolidated {facts_n} fact(s), proposed {skills_n} skill(s); "
+            f"memory decayed ({forgotten} forgotten).")

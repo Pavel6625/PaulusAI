@@ -130,14 +130,18 @@ def _normalize(response):
     choice = response.choices[0]
     msg = choice.message
     finish = choice.finish_reason
+    tool_calls = getattr(msg, "tool_calls", None) or []
 
-    stop_reason = "tool_use" if finish == "tool_calls" else "end_turn"
+    # Treat the turn as tool-use whenever the model emitted tool calls, not only
+    # when finish_reason says so: some providers report "stop" alongside tool
+    # calls, which would otherwise make the caller's loop drop the call.
+    stop_reason = "tool_use" if (finish == "tool_calls" or tool_calls) else "end_turn"
     content = []
 
     if msg.content:
         content.append(_TextBlock(text=msg.content))
 
-    for tc in getattr(msg, "tool_calls", None) or []:
+    for tc in tool_calls:
         content.append(_ToolUseBlock(
             id=tc.id,
             name=tc.function.name,
@@ -207,7 +211,9 @@ def stream(system, messages, tools=None, on_delta=None):
                 if fn.arguments:
                     slot["args"] += fn.arguments
 
-    stop_reason = "tool_use" if finish == "tool_calls" else "end_turn"
+    # See _normalize: a provider may stream tool-call deltas while reporting a
+    # "stop" finish_reason, so trust the accumulated tool calls themselves.
+    stop_reason = "tool_use" if (finish == "tool_calls" or tool_calls) else "end_turn"
     content: list = []
     text = "".join(text_parts)
     if text:

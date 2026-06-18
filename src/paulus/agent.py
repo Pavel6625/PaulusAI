@@ -92,7 +92,7 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None):
 
             # --- SAFETY GATE -------------------------------------------------
             if security.is_high_impact(b.name):
-                if not security.confirm(b.name, b.input):
+                if not security.confirm(b.name, b.input, user_id=user_id):
                     security.audit("declined", f"{b.name} {b.input}")
                     affect.feel("action_declined")
                     tool_results.append({

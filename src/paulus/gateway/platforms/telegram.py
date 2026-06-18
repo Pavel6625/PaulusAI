@@ -5,10 +5,11 @@ import asyncio
 import os
 import time
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -41,6 +42,7 @@ class TelegramAdapter(BasePlatformAdapter):
     Rapid messages from the same chat are batched with a 300 ms debounce.
     """
     supports_typing_indicator = True
+    supports_approvals = True   # high-impact actions can be approved via buttons
 
     def __init__(self, runner) -> None:
         super().__init__(runner)
@@ -48,12 +50,19 @@ class TelegramAdapter(BasePlatformAdapter):
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
         self._token = token
-        self._allowed: set[str] = {
-            u.strip()
-            for u in os.environ.get("TELEGRAM_ALLOWED_USERS", "").split(",")
-            if u.strip()
-        }
+        self._allowed: set[str] = _parse_ids(os.environ.get("TELEGRAM_ALLOWED_USERS", ""))
+        # Who may approve high-impact actions. Distinct from _allowed so chat can
+        # be open to everyone (empty allowlist) while approvals stay restricted.
+        # Unset -> defaults to the chat allowlist (the common single-owner case);
+        # set but empty -> nobody can approve (high-impact falls back to policy).
+        trusted_env = os.environ.get("TELEGRAM_TRUSTED_USERS")
+        self._trusted: set[str] = (
+            _parse_ids(trusted_env) if trusted_env is not None else set(self._allowed)
+        )
         self._app: Application | None = None
+        # Live approval prompts keyed by approval_id -> (chat_id, message_id),
+        # so the inline buttons can be cleared once the action is settled.
+        self._approval_msgs: dict[str, tuple[str, int]] = {}
         # Pending batched messages keyed by SessionSource.key()
         self._pending: dict[str, list[str]] = {}
         self._batch_delay = 0.3  # seconds
@@ -76,6 +85,7 @@ class TelegramAdapter(BasePlatformAdapter):
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message)
         )
         self._app.add_handler(CommandHandler("reset", self._on_reset))
+        self._app.add_handler(CallbackQueryHandler(self._on_callback))
         await self._app.initialize()
         await self._app.start()
         await self._app.updater.start_polling(drop_pending_updates=True)
@@ -133,6 +143,77 @@ class TelegramAdapter(BasePlatformAdapter):
         self._runner._sessions.reset(source.key())
         await update.message.reply_text("Session reset.")
         security.audit("gateway_session_reset", source.key())
+
+    # ------------------------------------------------------------------
+    # Approvals (high-impact action gate)
+    # ------------------------------------------------------------------
+
+    def can_approve(self, user_id) -> bool:
+        """Whether this user is trusted to approve high-impact actions."""
+        return str(user_id) in self._trusted
+
+    async def request_approval(self, source: SessionSource, approval_id: str,
+                               prompt: str) -> None:
+        """Send an Approve/Deny prompt for a high-impact action. Runs on the
+        gateway loop; the agent thread is blocked waiting for the answer."""
+        if not self._app:
+            return
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Approve", callback_data=f"dpok:{approval_id}"),
+            InlineKeyboardButton("🚫 Deny", callback_data=f"dpno:{approval_id}"),
+        ]])
+        kwargs: dict = {}
+        if source.thread_id:
+            kwargs["message_thread_id"] = int(source.thread_id)
+        msg = await self._app.bot.send_message(
+            chat_id=source.chat_id, text=prompt, reply_markup=keyboard, **kwargs
+        )
+        self._approval_msgs[approval_id] = (source.chat_id, msg.message_id)
+
+    async def expire_approval(self, source: SessionSource, approval_id: str) -> None:
+        """Replace a timed-out prompt's buttons with a terminal notice."""
+        entry = self._approval_msgs.pop(approval_id, None)
+        if not entry or not self._app:
+            return
+        chat_id, message_id = entry
+        try:
+            await self._app.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text="⏲️ Approval request timed out — action denied.",
+            )
+        except BadRequest:
+            pass
+
+    async def _on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if query is None or not query.data or ":" not in query.data:
+            return
+        action, approval_id = query.data.split(":", 1)
+        if action not in ("dpok", "dpno"):
+            return
+
+        # Only a trusted user may approve, even if they can press the button.
+        user = update.effective_user
+        if user is None or not self.can_approve(user.id):
+            await query.answer("Unauthorized.", show_alert=True)
+            security.audit("approval_unauthorized",
+                           f"{user.id if user else '?'} {approval_id}")
+            return
+        await query.answer()
+
+        approved = action == "dpok"
+        settled = self._runner.resolve_approval(approval_id, approved)
+        self._approval_msgs.pop(approval_id, None)
+
+        if not settled:
+            verdict = "⏲️ This request already expired."
+        else:
+            verdict = "✅ Approved." if approved else "🚫 Denied."
+        base = query.message.text if query.message else ""
+        try:
+            await query.edit_message_text(f"{base}\n\n— {verdict}".strip())
+        except BadRequest:
+            pass
 
     # ------------------------------------------------------------------
     # Outbound
@@ -327,6 +408,11 @@ class _StreamSink:
                     )
                 except Exception:
                     pass
+
+
+def _parse_ids(spec: str) -> set[str]:
+    """Parse a comma-separated list of user ids into a set, dropping blanks."""
+    return {u.strip() for u in spec.split(",") if u.strip()}
 
 
 def _clip(text: str, limit: int = _TELEGRAM_MSG_LIMIT) -> str:

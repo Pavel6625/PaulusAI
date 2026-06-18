@@ -70,6 +70,11 @@ class BasePlatformAdapter(ABC):
         """Show a typing indicator. Optional hook; no-op by default."""
         return
 
+    def can_approve(self, user_id) -> bool:
+        """Whether this user is trusted to approve high-impact actions.
+        Default: no. Adapters that set ``supports_approvals`` should override."""
+        return False
+
     def pause(self) -> None:
         if self._state == AdapterState.RUNNING:
             self._state = AdapterState.PAUSED

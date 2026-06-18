@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import time
 
 from .. import config, security
@@ -14,6 +15,29 @@ _instance: GatewayRunner | None = None
 
 def get_runner() -> GatewayRunner | None:
     return _instance
+
+
+def _approval_prompt(tool_name: str, tool_input) -> str:
+    """A concise, human-readable description of the action awaiting approval."""
+    if isinstance(tool_input, dict):
+        if tool_name == "run_command":
+            detail = tool_input.get("command", "")
+        elif tool_name == "write_local_file":
+            detail = f"write to {tool_input.get('path', '?')}"
+        elif tool_name == "send_message":
+            body = str(tool_input.get("body", ""))
+            preview = body if len(body) <= 200 else body[:200] + "…"
+            detail = f"to {tool_input.get('to', '?')}: {preview}"
+        else:
+            detail = str(tool_input)
+    else:
+        detail = str(tool_input)
+    return (
+        "⚠️ Approval needed for a high-impact action.\n"
+        f"Action: {tool_name}\n"
+        f"Details: {detail}\n\n"
+        "Approve this single action?"
+    )
 
 
 class GatewayRunner:
@@ -29,6 +53,13 @@ class GatewayRunner:
         # Serialize agent calls: PaulusAI's memory modules are not thread-safe.
         self._agent_lock = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
+        # The gateway event loop, captured once it is running, so the agent's
+        # worker thread can marshal interactive-approval prompts back onto it.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        # Pending high-impact approvals awaiting a user's Approve/Deny, keyed by
+        # a short id carried in the prompt's callback.
+        self._pending_approvals: dict[str, concurrent.futures.Future] = {}
+        self._approval_seq = 0
         _instance = self
 
     def register(self, name: str, adapter: BasePlatformAdapter) -> None:
@@ -120,7 +151,64 @@ class GatewayRunner:
                 return name
         return None
 
+    # ------------------------------------------------------------------
+    # Interactive approval of high-impact actions
+    # ------------------------------------------------------------------
+
+    def request_approval(self, user_id: str, tool_name: str, tool_input) -> bool | None:
+        """Ask a reachable user to approve a single high-impact action.
+
+        Called synchronously from the agent's worker thread (the gate blocks
+        there). Returns True (approved), False (denied or timed out), or None
+        when the user has no interactive channel — so the caller falls back to
+        the unattended policy. The Approve/Deny answer arrives out-of-band (e.g.
+        a Telegram button), bypassing the agent lock, and resolves the future.
+        """
+        if self._loop is None:
+            return None
+        presence = self._presence._users.get(str(user_id))
+        if presence is None:
+            return None
+        source = presence.last_source
+        adapter = self._adapters.get(source.platform)
+        if (adapter is None or adapter.state != AdapterState.RUNNING
+                or not getattr(adapter, "supports_approvals", False)
+                or not adapter.can_approve(user_id)):
+            return None
+
+        self._approval_seq += 1
+        approval_id = f"{int(time.time())}-{self._approval_seq}"
+        fut: concurrent.futures.Future = concurrent.futures.Future()
+        self._pending_approvals[approval_id] = fut
+
+        prompt = _approval_prompt(tool_name, tool_input)
+        security.audit("approval_request", f"{user_id} {tool_name} {tool_input}")
+        asyncio.run_coroutine_threadsafe(
+            adapter.request_approval(source, approval_id, prompt), self._loop
+        )
+        try:
+            return fut.result(timeout=config.APPROVAL_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            security.audit("approval_timeout", f"{user_id} {tool_name}")
+            asyncio.run_coroutine_threadsafe(
+                adapter.expire_approval(source, approval_id), self._loop
+            )
+            return False
+        finally:
+            self._pending_approvals.pop(approval_id, None)
+
+    def resolve_approval(self, approval_id: str, approved: bool) -> bool:
+        """Settle a pending approval. Called on the gateway loop by an adapter
+        when the user answers. Returns False if the id is unknown or already
+        settled (e.g. it had timed out)."""
+        fut = self._pending_approvals.get(approval_id)
+        if fut is None or fut.done():
+            return False
+        fut.set_result(approved)
+        return True
+
     async def start_all(self) -> None:
+        self._loop = asyncio.get_running_loop()
         security.audit(
             "gateway_boot",
             f"data_dir={config.DATA_DIR} idle_check={config.IDLE_CHECK_INTERVAL}s "

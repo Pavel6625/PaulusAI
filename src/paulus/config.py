@@ -145,6 +145,17 @@ SSH_REMOTE_DIR = os.environ.get("DP_SSH_REMOTE_DIR", "~/dp-workspace")
 #   "approve" -> auto-approve (UNATTENDED; only for fully trusted setups)
 UNATTENDED_POLICY = os.environ.get("DP_UNATTENDED_POLICY", "deny").lower()
 
+# Let a reachable, trusted gateway user approve a high-impact action interactively
+# (e.g. inline Approve/Deny buttons on Telegram) instead of falling straight
+# through to UNATTENDED_POLICY. The unattended policy still applies whenever the
+# user can't be reached. On by default; set DP_GATEWAY_APPROVALS=0 to disable.
+GATEWAY_APPROVALS = (
+    os.environ.get("DP_GATEWAY_APPROVALS", "1").strip().lower()
+    not in ("", "0", "off", "false", "no")
+)
+# How long to wait for that interactive answer before failing safe (DENY).
+APPROVAL_TIMEOUT = int(os.environ.get("DP_APPROVAL_TIMEOUT", "300"))
+
 # --- Gateway (Hermes) -------------------------------------------------------
 # TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USERS are read by the adapter itself.
 GATEWAY_IDLE_TIMEOUT = int(os.environ.get("DP_GATEWAY_IDLE_TIMEOUT", "3600"))

@@ -599,6 +599,34 @@ def test_streaming_silent_reply_shows_nothing(monkeypatch):
     assert events == []               # no placeholder, nothing to delete
 
 
+def test_streaming_empty_reply_sends_nothing(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    # Model streams nothing and returns empty text (e.g. a denied high-impact
+    # action with no follow-up). Must not try to send an empty Telegram message.
+    monkeypatch.setattr(agent, "respond", lambda text, user_id=None, on_delta=None: "")
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    assert events == []        # nothing sent, no "Message text is empty" crash
+
+
+def test_streaming_keeps_preamble_when_final_text_empty(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    def fake_respond(text, user_id=None, on_delta=None):
+        on_delta("Working on it…")   # visible preamble streamed
+        return ""                    # but the final turn returns no text
+    monkeypatch.setattr(agent, "respond", fake_respond)
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    # The streamed text is preserved (not discarded as if silent), never deleted.
+    assert any(kind == "send" for kind, _, _ in events)
+    assert all(kind != "delete" for kind, _, _ in events)
+    assert events[-1][1] == "Working on it…"
+
+
 def test_streaming_finalizes_with_markdown(monkeypatch):
     pytest.importorskip("telegramify_markdown")
     import paulus.agent as agent

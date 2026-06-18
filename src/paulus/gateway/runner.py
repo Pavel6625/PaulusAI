@@ -164,18 +164,15 @@ class GatewayRunner:
         the unattended policy. The Approve/Deny answer arrives out-of-band (e.g.
         a Telegram button), bypassing the agent lock, and resolves the future.
         """
-        if self._loop is None:
-            return None
-        presence = self._presence._users.get(str(user_id))
-        if presence is None:
-            return None
-        source = presence.last_source
-        adapter = self._adapters.get(source.platform)
-        if (adapter is None or adapter.state != AdapterState.RUNNING
-                or not getattr(adapter, "supports_approvals", False)
-                or not adapter.can_approve(user_id)):
+        reason = self._approval_unavailable_reason(user_id)
+        if reason is not None:
+            # Audit WHY no buttons were shown so a misconfiguration (e.g. the user
+            # not being in TELEGRAM_TRUSTED_USERS) is diagnosable, then fall back.
+            security.audit("approval_skip", f"{user_id} {tool_name}: {reason}")
             return None
 
+        source = self._presence._users[str(user_id)].last_source
+        adapter = self._adapters[source.platform]
         self._approval_seq += 1
         approval_id = f"{int(time.time())}-{self._approval_seq}"
         fut: concurrent.futures.Future = concurrent.futures.Future()
@@ -183,9 +180,12 @@ class GatewayRunner:
 
         prompt = _approval_prompt(tool_name, tool_input)
         security.audit("approval_request", f"{user_id} {tool_name} {tool_input}")
-        asyncio.run_coroutine_threadsafe(
+        cf = asyncio.run_coroutine_threadsafe(
             adapter.request_approval(source, approval_id, prompt), self._loop
         )
+        # If sending the prompt itself fails, surface it and deny immediately
+        # rather than leaving the agent blocked until the timeout.
+        cf.add_done_callback(lambda f: self._on_prompt_sent(approval_id, f))
         try:
             return fut.result(timeout=config.APPROVAL_TIMEOUT)
         except concurrent.futures.TimeoutError:
@@ -196,6 +196,28 @@ class GatewayRunner:
             return False
         finally:
             self._pending_approvals.pop(approval_id, None)
+
+    def _approval_unavailable_reason(self, user_id: str) -> str | None:
+        """Why an interactive approval can't be sought, or None if it can."""
+        if self._loop is None:
+            return "gateway loop not running"
+        presence = self._presence._users.get(str(user_id))
+        if presence is None:
+            return "user not reachable (no presence record)"
+        adapter = self._adapters.get(presence.last_source.platform)
+        if adapter is None or adapter.state != AdapterState.RUNNING:
+            return f"adapter {presence.last_source.platform} unavailable"
+        if not getattr(adapter, "supports_approvals", False):
+            return f"adapter {presence.last_source.platform} has no approval UI"
+        if not adapter.can_approve(user_id):
+            return "user not trusted to approve (TELEGRAM_TRUSTED_USERS)"
+        return None
+
+    def _on_prompt_sent(self, approval_id: str, cf: concurrent.futures.Future) -> None:
+        exc = cf.exception()
+        if exc is not None:
+            security.audit("approval_send_error", f"{approval_id}: {exc}")
+            self.resolve_approval(approval_id, False)
 
     def resolve_approval(self, approval_id: str, approved: bool) -> bool:
         """Settle a pending approval. Called on the gateway loop by an adapter

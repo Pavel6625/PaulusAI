@@ -220,8 +220,8 @@ class TelegramAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def send(self, source: SessionSource, text: str) -> None:
-        if not self._app:
-            return
+        if not self._app or not text.strip():
+            return                          # nothing to say; Telegram rejects empty
         kwargs: dict = {}
         if source.thread_id:
             kwargs["message_thread_id"] = int(source.thread_id)
@@ -284,6 +284,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """Replace the streamed placeholder with the final, Markdown-rendered
         reply. Long replies are split: the first chunk edits the placeholder,
         the rest are sent as fresh messages (a message can't exceed 4096)."""
+        if not text.strip():
+            return                          # nothing to commit; never send empty
         chunks = _split(text)
         if not chunks:
             return
@@ -394,20 +396,29 @@ class _StreamSink:
         async with self._lock:
             self._done = True
             text = self._buf if self._buf.strip() else reply
+            if not text.strip():
+                # The model produced no visible text at all. Drop any placeholder
+                # rather than committing an empty message Telegram would reject.
+                await self._delete_message()
+                return
             await self._adapter._stream_finalize(self._source, self._message, text)
 
     async def discard(self) -> None:
         """Drop the in-progress message (e.g. the reply turned out silent)."""
         async with self._lock:
             self._done = True
-            if self._message is not None and self._adapter._app:
-                try:
-                    await self._adapter._app.bot.delete_message(
-                        chat_id=self._source.chat_id,
-                        message_id=self._message.message_id,
-                    )
-                except Exception:
-                    pass
+            await self._delete_message()
+
+    async def _delete_message(self) -> None:
+        """Best-effort removal of the placeholder, if one was created."""
+        if self._message is not None and self._adapter._app:
+            try:
+                await self._adapter._app.bot.delete_message(
+                    chat_id=self._source.chat_id,
+                    message_id=self._message.message_id,
+                )
+            except Exception:
+                pass
 
 
 def _parse_ids(spec: str) -> set[str]:

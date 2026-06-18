@@ -135,11 +135,15 @@ _SILENCE_TOKENS = ("[SILENT]", "NO_REPLY")
 
 PROACTIVE_NUDGE = (
     "The owner has been quiet for a while; this is an internal idle check, not "
-    "a message from them. Review your recent memory and current mood. ONLY if "
-    "there is something genuinely worth raising unprompted — a follow-up you "
-    "promised, a timely reminder, a check-in that fits the relationship — write "
-    "one short, warm message. If nothing rises to that bar, reply with exactly "
-    "[SILENT] and nothing else. Do not invent a reason to talk."
+    "a message from them. You are a companion who stays in touch, so reaching "
+    "out when it feels natural is welcome — a follow-up on something they "
+    "mentioned, a timely reminder, or simply a warm, low-pressure check-in. "
+    "Draw on your recent memory and current mood so it feels personal rather "
+    "than generic. Write ONE short, friendly message. Reply with exactly "
+    "[SILENT] (and nothing else) only when reaching out now would be intrusive "
+    "or repetitive — for instance if you have already checked in recently "
+    "without a reply. When it is simply an occasional check-in and you are "
+    "unsure, lean toward a brief, genuine hello rather than silence."
 )
 
 

@@ -26,6 +26,9 @@ EnvironmentFile=/etc/paulus/paulus.env
 Environment=DP_DATA_DIR=/var/lib/paulus
 # No interactive console here, so high-impact tools fail safe (deny) by default.
 Environment=DP_UNATTENDED_POLICY=deny
+# Unbuffer stdout/stderr so the startup banner and prints reach journald
+# immediately (otherwise Python block-buffers when stdout is a pipe, not a tty).
+Environment=PYTHONUNBUFFERED=1
 
 ExecStart=/opt/paulus/venv/bin/paulus-gateway
 Restart=on-failure

@@ -103,6 +103,12 @@ class GatewayRunner:
         return None
 
     async def start_all(self) -> None:
+        security.audit(
+            "gateway_boot",
+            f"data_dir={config.DATA_DIR} idle_check={config.IDLE_CHECK_INTERVAL}s "
+            f"min_idle={config.MIN_IDLE_MINUTES}m max_msg={config.MAX_IDLE_MSG_SESSION} "
+            f"quiet={config.QUIET_START}-{config.QUIET_END}",
+        )
         for name, adapter in self._adapters.items():
             try:
                 await adapter.start()
@@ -112,6 +118,9 @@ class GatewayRunner:
 
         if config.IDLE_CHECK_INTERVAL > 0 and self._idle_task is None:
             self._idle_task = asyncio.create_task(self._idle_loop())
+            security.audit("idle_loop_start", f"every {config.IDLE_CHECK_INTERVAL}s")
+        elif config.IDLE_CHECK_INTERVAL <= 0:
+            security.audit("idle_loop_disabled", "DP_IDLE_CHECK<=0")
 
     async def stop_all(self) -> None:
         if self._idle_task is not None:

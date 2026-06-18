@@ -43,6 +43,7 @@ class BasePlatformAdapter(ABC):
     supports_images: bool = False
     supports_typing_indicator: bool = False
     supports_threads: bool = False
+    supports_streaming: bool = False
 
     def __init__(self, runner) -> None:
         self._runner = runner
@@ -68,6 +69,11 @@ class BasePlatformAdapter(ABC):
     async def send_typing(self, source: SessionSource) -> None:  # noqa: B027
         """Show a typing indicator. Optional hook; no-op by default."""
         return
+
+    def can_approve(self, user_id) -> bool:
+        """Whether this user is trusted to approve high-impact actions.
+        Default: no. Adapters that set ``supports_approvals`` should override."""
+        return False
 
     def pause(self) -> None:
         if self._state == AdapterState.RUNNING:

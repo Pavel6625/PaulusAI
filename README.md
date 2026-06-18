@@ -101,10 +101,14 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `ANTHROPIC_API_KEY`     | —                              | Provider key (use the one matching your model)                 |
 | `DP_DATA_DIR`           | `~/.local/share/paulus`        | Where memory, audit log, vector index, workspace are written   |
 | `DP_SANDBOX`            | `local`                        | `local` \| `docker` \| `ssh`                                   |
-| `DP_UNATTENDED_POLICY`  | `deny`                         | What to do with a high-impact action when nobody can approve   |
+| `DP_UNATTENDED_POLICY`  | `deny`                         | High-impact action when nobody is reachable to approve         |
+| `DP_GATEWAY_APPROVALS`  | `1`                            | Ask reachable users to approve high-impact actions in chat     |
+| `DP_APPROVAL_TIMEOUT`   | `300`                          | Seconds to wait for an in-chat approval before failing to deny  |
 | `TELEGRAM_BOT_TOKEN`    | —                              | Required for `paulus-gateway`                                  |
-| `TELEGRAM_ALLOWED_USERS`| (all)                          | Comma-separated numeric Telegram user IDs allowed to talk to it |
+| `TELEGRAM_ALLOWED_USERS`| (all)                          | Numeric Telegram user IDs allowed to **chat**; empty = everyone |
+| `TELEGRAM_TRUSTED_USERS`| (= allowed)                    | IDs allowed to **approve** high-impact actions; empty = nobody  |
 | `TELEGRAM_PARSE_MODE`   | `MarkdownV2`                   | Render replies as Markdown; `plain`/`none`/`off` for raw text   |
+| `TELEGRAM_STREAMING`    | `1`                            | Live-edit the reply as it streams; `0`/`off` for one-shot send  |
 
 > **Secrets never enter the repo or the model's context.** Keys are read from the
 > environment only. `.env` and `*.key` are gitignored.
@@ -164,10 +168,21 @@ model's CommonMark is converted to Telegram's MarkdownV2 dialect, falling back
 to plain text if a message can't be formatted. Set `TELEGRAM_PARSE_MODE=plain`
 to disable formatting.
 
-> **High-impact actions over Telegram:** there is no terminal to approve them, so
-> they follow `DP_UNATTENDED_POLICY` — **denied by default** (the agent will tell
-> you what it wanted to do instead of doing it). Set it to `approve` only for a
-> fully trusted, isolated deployment.
+Replies also **stream**: a placeholder message appears as soon as the model
+starts writing and is live-edited as text arrives (throttled to respect
+Telegram's edit-rate limit), then Markdown-rendered once complete. Set
+`TELEGRAM_STREAMING=0` for one-shot delivery instead.
+
+> **High-impact actions over Telegram:** when the agent wants to write a file,
+> run a command, or send a message, it asks in chat with inline **✅ Approve /
+> 🚫 Deny** buttons and waits for a tap before doing anything. Only **trusted**
+> users may approve (`TELEGRAM_TRUSTED_USERS`, which defaults to
+> `TELEGRAM_ALLOWED_USERS`), and an unanswered prompt times out to a safe
+> **deny** after `DP_APPROVAL_TIMEOUT` seconds. This lets you open the chat to
+> everyone (empty `TELEGRAM_ALLOWED_USERS`) while keeping high-impact actions to
+> a trusted few: an untrusted user's high-impact request gets no approver, so it
+> falls back to `DP_UNATTENDED_POLICY` (**denied by default**) and the agent
+> tells them it can't. Disable the buttons entirely with `DP_GATEWAY_APPROVALS=0`.
 
 ---
 
@@ -237,8 +252,11 @@ The trust boundaries are deliberately small and explicit (see [src/paulus/securi
    contents, command output) is wrapped in `<untrusted_data>` tags with an
    instruction never to follow embedded directions.
 2. **High-impact actions are gated.** `write_local_file`, `run_command`, and
-   `send_message` require explicit per-action approval. With no interactive
-   console they fall back to `DP_UNATTENDED_POLICY` (**deny** by default).
+   `send_message` require explicit per-action approval — from a terminal at the
+   CLI, or from inline Approve/Deny buttons in chat when running behind the
+   gateway (only allow-listed users can approve; unanswered prompts time out to
+   a deny). When no one is reachable to approve, they fall back to
+   `DP_UNATTENDED_POLICY` (**deny** by default).
 3. **Everything is audited.** Every tool call is appended to `audit.log`.
 4. **Execution is sandboxed.** File ops are confined to `workspace/`; commands
    run via the configured backend — use `docker` (network-disabled) or `ssh`

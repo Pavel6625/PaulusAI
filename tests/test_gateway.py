@@ -207,6 +207,84 @@ def test_idle_pass_silence_is_not_delivered(monkeypatch):
     assert sent == []  # silence sentinel swallowed, nothing delivered
 
 
+def test_request_approval_returns_none_without_interactive_channel():
+    runner = GatewayRunner()
+    runner._loop = object()  # pretend the loop is up; the guards below should still fire
+
+    # No presence record for this user -> not reachable.
+    assert runner.request_approval("u", "run_command", {"command": "ls"}) is None
+
+    # Reachable, but the adapter can't host an approval prompt.
+    class NoApprovals(BasePlatformAdapter):
+        supports_approvals = False
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, source, text): ...
+
+    adapter = NoApprovals(runner)
+    adapter._state = AdapterState.RUNNING
+    runner.register("telegram", adapter)
+    runner._presence.touch(SessionSource("telegram", "c", "u"))
+    assert runner.request_approval("u", "run_command", {"command": "ls"}) is None
+
+
+def test_request_approval_denied_for_untrusted_user():
+    runner = GatewayRunner()
+    runner._loop = object()
+
+    class TrustedOnly(BasePlatformAdapter):
+        supports_approvals = True
+        def can_approve(self, user_id): return str(user_id) == "owner"
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, source, text): ...
+
+    adapter = TrustedOnly(runner)
+    adapter._state = AdapterState.RUNNING
+    runner.register("telegram", adapter)
+    # An untrusted user can chat, but their high-impact action gets no approval
+    # channel -> falls back to the unattended policy (caller treats None as such).
+    runner._presence.touch(SessionSource("telegram", "c", "guest"))
+    assert runner.request_approval("guest", "run_command", {"command": "ls"}) is None
+
+
+def test_request_approval_roundtrip_approve_and_deny():
+    runner = GatewayRunner()
+    answer = {"value": True}
+
+    class Approver(BasePlatformAdapter):
+        supports_approvals = True
+        def can_approve(self, user_id): return True
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, source, text): ...
+        async def request_approval(self, source, approval_id, prompt):
+            # Simulate the user tapping a button as soon as the prompt is sent.
+            runner.resolve_approval(approval_id, answer["value"])
+        async def expire_approval(self, source, approval_id): ...
+
+    adapter = Approver(runner)
+    adapter._state = AdapterState.RUNNING
+    runner.register("telegram", adapter)
+    runner._presence.touch(SessionSource("telegram", "c", "u"))
+
+    async def ask():
+        runner._loop = asyncio.get_running_loop()
+        # request_approval blocks on a future, so it must run off the loop thread.
+        return await runner._loop.run_in_executor(
+            None, lambda: runner.request_approval("u", "run_command", {"command": "ls"})
+        )
+
+    assert asyncio.run(ask()) is True
+    answer["value"] = False
+    assert asyncio.run(ask()) is False
+
+
+def test_resolve_unknown_approval_is_noop():
+    runner = GatewayRunner()
+    assert runner.resolve_approval("nope", True) is False
+
+
 def test_circuit_breaker_opens_then_resumes():
     runner = GatewayRunner()
 
@@ -303,3 +381,236 @@ def test_send_plain_mode_skips_markdown(monkeypatch):
     asyncio.run(adapter.send(SessionSource("telegram", "c", "u"), "raw **text**"))
 
     assert calls == [("raw **text**", None)]      # one plain send, untouched
+
+
+# --- Streaming --------------------------------------------------------------
+
+def test_llm_stream_accumulates_text_and_fires_deltas(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    import paulus.llm as llm
+
+    def chunk(content=None, tool=None, finish=None):
+        return NS(choices=[NS(delta=NS(content=content, tool_calls=tool), finish_reason=finish)])
+
+    fake = [chunk(content="Hel"), chunk(content="lo"), chunk(finish="stop")]
+    monkeypatch.setattr(llm.litellm, "completion", lambda **kw: iter(fake))
+
+    seen: list[str] = []
+    resp = llm.stream("sys", [{"role": "user", "content": "hi"}], on_delta=seen.append)
+
+    assert "".join(seen) == "Hello"
+    assert resp.stop_reason == "end_turn"
+    assert resp.content[0].text == "Hello"
+
+
+def test_llm_stream_reassembles_tool_calls(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    import paulus.llm as llm
+
+    def chunk(tool=None, finish=None):
+        return NS(choices=[NS(delta=NS(content=None, tool_calls=tool), finish_reason=finish)])
+
+    # A tool call whose name + arguments are split across two chunks.
+    part1 = NS(index=0, id="call_1", function=NS(name="recall", arguments='{"q":'))
+    part2 = NS(index=0, id=None, function=NS(name=None, arguments='"x"}'))
+    fake = [chunk(tool=[part1]), chunk(tool=[part2]), chunk(finish="tool_calls")]
+    monkeypatch.setattr(llm.litellm, "completion", lambda **kw: iter(fake))
+
+    resp = llm.stream("sys", [{"role": "user", "content": "hi"}])
+
+    assert resp.stop_reason == "tool_use"
+    (block,) = resp.content
+    assert block.type == "tool_use"
+    assert block.name == "recall" and block.input == {"q": "x"}
+
+
+def _approval_adapter(monkeypatch, allowed="", trusted="7"):
+    tg = _telegram_module()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", allowed)
+    monkeypatch.setenv("TELEGRAM_TRUSTED_USERS", trusted)
+    runner = GatewayRunner()
+    adapter = tg.TelegramAdapter(runner)
+    adapter._state = AdapterState.RUNNING
+    runner.register("telegram", adapter)
+
+    sent: list[dict] = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append({"text": text, **kw})
+            return type("Msg", (), {"message_id": 555})()
+
+    adapter._app = type("App", (), {"bot": FakeBot()})()
+    return tg, runner, adapter, sent
+
+
+class _FakeQuery:
+    def __init__(self, data, text="prompt"):
+        self.data = data
+        self.message = type("M", (), {"text": text})()
+        self.answered: list = []
+        self.edited: list[str] = []
+
+    async def answer(self, text=None, show_alert=False):
+        self.answered.append((text, show_alert))
+
+    async def edit_message_text(self, text):
+        self.edited.append(text)
+
+
+def _callback_update(query, user_id="7"):
+    return type("U", (), {
+        "callback_query": query,
+        "effective_user": type("Usr", (), {"id": user_id})(),
+    })()
+
+
+def test_request_approval_sends_buttons_and_callback_settles(monkeypatch):
+    tg, runner, adapter, sent = _approval_adapter(monkeypatch)
+    src = SessionSource("telegram", "c", "7")
+
+    asyncio.run(adapter.request_approval(src, "abc", "do the thing?"))
+    assert sent and sent[0]["text"] == "do the thing?"
+    assert sent[0]["reply_markup"] is not None
+    assert adapter._approval_msgs["abc"] == ("c", 555)
+
+    resolved: list = []
+    monkeypatch.setattr(runner, "resolve_approval",
+                        lambda aid, ok: resolved.append((aid, ok)) or True)
+
+    query = _FakeQuery("dpok:abc")
+    asyncio.run(adapter._on_callback(_callback_update(query), None))
+
+    assert resolved == [("abc", True)]
+    assert "abc" not in adapter._approval_msgs        # prompt cleared
+    assert any("Approved" in e for e in query.edited)  # verdict shown
+
+
+def test_trusted_list_independent_of_chat_allowlist(monkeypatch):
+    tg = _telegram_module()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+
+    # Open chat (no allowlist) + an explicit trusted approver.
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "")
+    monkeypatch.setenv("TELEGRAM_TRUSTED_USERS", "owner")
+    a = tg.TelegramAdapter(runner=None)
+    assert a._allowed == set()              # everyone may chat
+    assert a.can_approve("owner") and not a.can_approve("guest")
+
+    # Trusted unset -> defaults to the chat allowlist (single-owner shorthand).
+    monkeypatch.delenv("TELEGRAM_TRUSTED_USERS", raising=False)
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "owner")
+    b = tg.TelegramAdapter(runner=None)
+    assert b.can_approve("owner") and not b.can_approve("guest")
+
+    # Trusted set but empty -> nobody can approve (fail safe).
+    monkeypatch.setenv("TELEGRAM_TRUSTED_USERS", "")
+    c = tg.TelegramAdapter(runner=None)
+    assert not c.can_approve("owner")
+
+
+def test_callback_from_unlisted_user_is_rejected(monkeypatch):
+    tg, runner, adapter, sent = _approval_adapter(monkeypatch, allowed="7")
+    calls: list = []
+    monkeypatch.setattr(runner, "resolve_approval",
+                        lambda aid, ok: calls.append((aid, ok)) or True)
+
+    query = _FakeQuery("dpok:abc")
+    asyncio.run(adapter._on_callback(_callback_update(query, user_id="999"), None))
+
+    assert calls == []                                 # never settled
+    assert query.answered and query.answered[0][1]     # show_alert "Unauthorized"
+
+
+def test_revealable_gates_silence_sentinels():
+    tg = _telegram_module()
+    for hidden in ("", "[", "[SIL", "[SILENT]", "NO_REPLY"):
+        assert not tg._revealable(hidden)
+    for shown in ("Hello", "[note] hi"):
+        assert tg._revealable(shown)
+
+
+class _FakeMsg:
+    message_id = 99
+
+
+def _streaming_runner(monkeypatch, parse_mode="plain"):
+    tg = _telegram_module()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    monkeypatch.setenv("TELEGRAM_PARSE_MODE", parse_mode)
+    monkeypatch.setenv("TELEGRAM_STREAMING", "1")
+
+    runner = GatewayRunner()
+    adapter = tg.TelegramAdapter(runner)
+    adapter._state = AdapterState.RUNNING
+    runner.register("telegram", adapter)
+
+    events: list[tuple[str, str, dict]] = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kw):
+            events.append(("send", text, kw))
+            return _FakeMsg()
+
+        async def edit_message_text(self, chat_id, message_id, text, **kw):
+            events.append(("edit", text, kw))
+
+        async def delete_message(self, chat_id, message_id):
+            events.append(("delete", "", {}))
+
+        async def send_chat_action(self, **kw):
+            pass
+
+    adapter._app = type("App", (), {"bot": FakeBot()})()
+    return tg, runner, adapter, events
+
+
+def test_streaming_inbound_creates_and_finalizes(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    def fake_respond(text, user_id=None, on_delta=None):
+        for piece in ("Hello ", "world"):
+            on_delta(piece)
+        return "Hello world"
+
+    monkeypatch.setattr(agent, "respond", fake_respond)
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    # A message is created and the final visible text is the full reply.
+    assert any(kind == "send" for kind, _, _ in events)
+    assert events[-1][1] == "Hello world"
+
+
+def test_streaming_silent_reply_shows_nothing(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    def fake_respond(text, user_id=None, on_delta=None):
+        on_delta("[SILENT]")          # sentinel never gets revealed
+        return "[SILENT]"
+
+    monkeypatch.setattr(agent, "respond", fake_respond)
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    assert events == []               # no placeholder, nothing to delete
+
+
+def test_streaming_finalizes_with_markdown(monkeypatch):
+    pytest.importorskip("telegramify_markdown")
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch, parse_mode="MarkdownV2")
+
+    def fake_respond(text, user_id=None, on_delta=None):
+        on_delta("**done**")
+        return "**done**"
+
+    monkeypatch.setattr(agent, "respond", fake_respond)
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    final_kind, final_text, final_kw = events[-1]
+    assert final_kw.get("parse_mode") == "MarkdownV2"
+    assert "*done*" in final_text      # CommonMark bold -> MarkdownV2

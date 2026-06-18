@@ -48,18 +48,36 @@ class GatewayRunner:
 
         tagged = f"[via {source.platform}] {text}"
 
+        adapter = self._adapters.get(source.platform)
+        # Stream (live-edit the reply as it's generated) when the adapter opts
+        # in; otherwise deliver the reply in one shot once it's complete.
+        sink = None
+        if (adapter and adapter.state == AdapterState.RUNNING
+                and getattr(adapter, "supports_streaming", False)):
+            sink = adapter.stream_sink(source, asyncio.get_running_loop())
+
         async with self._agent_lock:
             from .. import agent as _agent
             loop = asyncio.get_running_loop()
             user_id = str(source.user_id)
+            on_delta = sink.feed if sink else None
             reply = await loop.run_in_executor(
-                None, lambda: _agent.respond(tagged, user_id=user_id)
+                None, lambda: _agent.respond(tagged, user_id=user_id, on_delta=on_delta)
             )
 
-        if any(token in reply for token in SILENCE_TOKENS):
+        silent = any(token in reply for token in SILENCE_TOKENS)
+
+        if sink is not None:
+            try:
+                await (sink.discard() if silent else sink.finalize(reply))
+                adapter._on_success()
+            except Exception as exc:
+                security.audit("gateway_send_error", str(exc))
+                adapter._on_failure()
             return
 
-        adapter = self._adapters.get(source.platform)
+        if silent:
+            return
         if adapter and adapter.state == AdapterState.RUNNING:
             try:
                 await adapter.send(source, reply)

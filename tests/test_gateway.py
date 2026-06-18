@@ -303,3 +303,137 @@ def test_send_plain_mode_skips_markdown(monkeypatch):
     asyncio.run(adapter.send(SessionSource("telegram", "c", "u"), "raw **text**"))
 
     assert calls == [("raw **text**", None)]      # one plain send, untouched
+
+
+# --- Streaming --------------------------------------------------------------
+
+def test_llm_stream_accumulates_text_and_fires_deltas(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    import paulus.llm as llm
+
+    def chunk(content=None, tool=None, finish=None):
+        return NS(choices=[NS(delta=NS(content=content, tool_calls=tool), finish_reason=finish)])
+
+    fake = [chunk(content="Hel"), chunk(content="lo"), chunk(finish="stop")]
+    monkeypatch.setattr(llm.litellm, "completion", lambda **kw: iter(fake))
+
+    seen: list[str] = []
+    resp = llm.stream("sys", [{"role": "user", "content": "hi"}], on_delta=seen.append)
+
+    assert "".join(seen) == "Hello"
+    assert resp.stop_reason == "end_turn"
+    assert resp.content[0].text == "Hello"
+
+
+def test_llm_stream_reassembles_tool_calls(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    import paulus.llm as llm
+
+    def chunk(tool=None, finish=None):
+        return NS(choices=[NS(delta=NS(content=None, tool_calls=tool), finish_reason=finish)])
+
+    # A tool call whose name + arguments are split across two chunks.
+    part1 = NS(index=0, id="call_1", function=NS(name="recall", arguments='{"q":'))
+    part2 = NS(index=0, id=None, function=NS(name=None, arguments='"x"}'))
+    fake = [chunk(tool=[part1]), chunk(tool=[part2]), chunk(finish="tool_calls")]
+    monkeypatch.setattr(llm.litellm, "completion", lambda **kw: iter(fake))
+
+    resp = llm.stream("sys", [{"role": "user", "content": "hi"}])
+
+    assert resp.stop_reason == "tool_use"
+    (block,) = resp.content
+    assert block.type == "tool_use"
+    assert block.name == "recall" and block.input == {"q": "x"}
+
+
+def test_revealable_gates_silence_sentinels():
+    tg = _telegram_module()
+    for hidden in ("", "[", "[SIL", "[SILENT]", "NO_REPLY"):
+        assert not tg._revealable(hidden)
+    for shown in ("Hello", "[note] hi"):
+        assert tg._revealable(shown)
+
+
+class _FakeMsg:
+    message_id = 99
+
+
+def _streaming_runner(monkeypatch, parse_mode="plain"):
+    tg = _telegram_module()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    monkeypatch.setenv("TELEGRAM_PARSE_MODE", parse_mode)
+    monkeypatch.setenv("TELEGRAM_STREAMING", "1")
+
+    runner = GatewayRunner()
+    adapter = tg.TelegramAdapter(runner)
+    adapter._state = AdapterState.RUNNING
+    runner.register("telegram", adapter)
+
+    events: list[tuple[str, str, dict]] = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kw):
+            events.append(("send", text, kw))
+            return _FakeMsg()
+
+        async def edit_message_text(self, chat_id, message_id, text, **kw):
+            events.append(("edit", text, kw))
+
+        async def delete_message(self, chat_id, message_id):
+            events.append(("delete", "", {}))
+
+        async def send_chat_action(self, **kw):
+            pass
+
+    adapter._app = type("App", (), {"bot": FakeBot()})()
+    return tg, runner, adapter, events
+
+
+def test_streaming_inbound_creates_and_finalizes(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    def fake_respond(text, user_id=None, on_delta=None):
+        for piece in ("Hello ", "world"):
+            on_delta(piece)
+        return "Hello world"
+
+    monkeypatch.setattr(agent, "respond", fake_respond)
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    # A message is created and the final visible text is the full reply.
+    assert any(kind == "send" for kind, _, _ in events)
+    assert events[-1][1] == "Hello world"
+
+
+def test_streaming_silent_reply_shows_nothing(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    def fake_respond(text, user_id=None, on_delta=None):
+        on_delta("[SILENT]")          # sentinel never gets revealed
+        return "[SILENT]"
+
+    monkeypatch.setattr(agent, "respond", fake_respond)
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    assert events == []               # no placeholder, nothing to delete
+
+
+def test_streaming_finalizes_with_markdown(monkeypatch):
+    pytest.importorskip("telegramify_markdown")
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch, parse_mode="MarkdownV2")
+
+    def fake_respond(text, user_id=None, on_delta=None):
+        on_delta("**done**")
+        return "**done**"
+
+    monkeypatch.setattr(agent, "respond", fake_respond)
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    final_kind, final_text, final_kw = events[-1]
+    assert final_kw.get("parse_mode") == "MarkdownV2"
+    assert "*done*" in final_text      # CommonMark bold -> MarkdownV2

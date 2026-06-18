@@ -68,11 +68,18 @@ def _blocks_to_dicts(content):
     return out
 
 
-def _run_tool_loop(system, messages, user_id=None):
+def _run_tool_loop(system, messages, user_id=None, on_delta=None):
     """Drive the model<->tool exchange, with the safety gate between the
-    model's decision and any real-world effect. Returns the final text."""
+    model's decision and any real-world effect. Returns the final text.
+
+    When ``on_delta`` is given, each turn is streamed and text fragments are
+    forwarded to it as they arrive (the gateway uses this to live-edit the
+    outgoing message); the safety gate is unchanged."""
     while True:
-        resp = llm.complete(system, messages, tools=tools.TOOL_SPECS)
+        if on_delta is not None:
+            resp = llm.stream(system, messages, tools=tools.TOOL_SPECS, on_delta=on_delta)
+        else:
+            resp = llm.complete(system, messages, tools=tools.TOOL_SPECS)
         messages.append({"role": "assistant", "content": _blocks_to_dicts(resp.content)})
 
         if resp.stop_reason != "tool_use":
@@ -110,7 +117,7 @@ def _run_tool_loop(system, messages, user_id=None):
         messages.append({"role": "user", "content": tool_results})
 
 
-def respond(owner_text, user_id=None):
+def respond(owner_text, user_id=None, on_delta=None):
     memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
 
     low = owner_text.lower()
@@ -121,7 +128,7 @@ def respond(owner_text, user_id=None):
 
     system = _build_system(user_id)
     messages = _history_to_messages(user_id)
-    final_text = _run_tool_loop(system, messages, user_id)
+    final_text = _run_tool_loop(system, messages, user_id, on_delta=on_delta)
 
     memory.log_episode("agent", final_text, trust="trusted", user_id=user_id)
     affect.decay()

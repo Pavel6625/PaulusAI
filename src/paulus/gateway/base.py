@@ -43,6 +43,7 @@ class BasePlatformAdapter(ABC):
     supports_images: bool = False
     supports_typing_indicator: bool = False
     supports_threads: bool = False
+    supports_streaming: bool = False
 
     def __init__(self, runner) -> None:
         self._runner = runner

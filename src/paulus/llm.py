@@ -162,3 +162,60 @@ def complete(system, messages, tools=None):
         api_base=config.API_BASE or None,
         api_key=config.API_KEY or None,
     ))
+
+
+def stream(system, messages, tools=None, on_delta=None):
+    """One streaming turn. Forwards each text delta to ``on_delta(piece)`` as it
+    arrives, then returns the same Anthropic-shaped _Response as complete() so
+    the caller's tool loop is otherwise unchanged. Tool-call fragments are
+    reassembled across chunks before the response is built."""
+    oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
+    chunks = litellm.completion(
+        model=config.CORE_MODEL,
+        max_tokens=config.MAX_TOKENS,
+        messages=oai_messages,
+        tools=_to_litellm_tools(tools) if tools else None,
+        api_base=config.API_BASE or None,
+        api_key=config.API_KEY or None,
+        stream=True,
+    )
+
+    text_parts: list[str] = []
+    tool_calls: dict[int, dict] = {}   # call index -> {id, name, args}
+    finish = None
+
+    for chunk in chunks:
+        choice = chunk.choices[0]
+        if choice.finish_reason:
+            finish = choice.finish_reason
+        delta = choice.delta
+
+        piece = getattr(delta, "content", None)
+        if piece:
+            text_parts.append(piece)
+            if on_delta:
+                on_delta(piece)
+
+        for tc in getattr(delta, "tool_calls", None) or []:
+            slot = tool_calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+            if tc.id:
+                slot["id"] = tc.id
+            fn = getattr(tc, "function", None)
+            if fn:
+                if fn.name:
+                    slot["name"] = fn.name
+                if fn.arguments:
+                    slot["args"] += fn.arguments
+
+    stop_reason = "tool_use" if finish == "tool_calls" else "end_turn"
+    content: list = []
+    text = "".join(text_parts)
+    if text:
+        content.append(_TextBlock(text=text))
+    for _, slot in sorted(tool_calls.items()):
+        content.append(_ToolUseBlock(
+            id=slot["id"],
+            name=slot["name"],
+            input=json.loads(slot["args"] or "{}"),
+        ))
+    return _Response(stop_reason=stop_reason, content=content)

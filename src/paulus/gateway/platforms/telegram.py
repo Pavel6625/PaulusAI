@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 
 from telegram import Update
 from telegram.error import BadRequest
@@ -22,12 +23,15 @@ except ImportError:  # pragma: no cover - exercised only without the extra
     telegramify_markdown = None
 
 from ... import security
-from ..base import AdapterState, BasePlatformAdapter, SessionSource
+from ..base import SILENCE_TOKENS, AdapterState, BasePlatformAdapter, SessionSource
 
 _TELEGRAM_MSG_LIMIT = 4096
 # Split raw text below the hard limit: MarkdownV2 escaping adds backslashes, so
 # a converted chunk can grow past its pre-escaped length.
 _SPLIT_LIMIT = 3500
+# Minimum seconds between intermediate edits while streaming, to stay under
+# Telegram's per-message edit-rate limit.
+_STREAM_EDIT_INTERVAL = 1.2
 
 
 class TelegramAdapter(BasePlatformAdapter):
@@ -57,6 +61,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # to plain/none/off (or leave the library uninstalled) for raw text.
         mode = os.environ.get("TELEGRAM_PARSE_MODE", "MarkdownV2").strip().lower()
         self._parse_mode = None if mode in ("", "plain", "none", "off") else "MarkdownV2"
+        # Stream replies by live-editing one message as tokens arrive. On by
+        # default; TELEGRAM_STREAMING=0/off/false delivers the reply in one shot.
+        stream_env = os.environ.get("TELEGRAM_STREAMING", "1").strip().lower()
+        self.supports_streaming = stream_env not in ("", "0", "off", "false", "no")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -158,6 +166,77 @@ class TelegramAdapter(BasePlatformAdapter):
                 security.audit("telegram_markdown_fallback", str(exc))
         await self._app.bot.send_message(chat_id=chat_id, text=chunk, **kwargs)
 
+    # ------------------------------------------------------------------
+    # Streaming
+    # ------------------------------------------------------------------
+
+    def stream_sink(self, source: SessionSource, loop) -> _StreamSink:
+        """A sink that live-edits one message as the agent streams its reply.
+        ``loop`` is the gateway's event loop; the agent feeds deltas from a
+        worker thread, so edits are marshalled back onto it."""
+        return _StreamSink(self, source, loop)
+
+    async def _stream_render(self, source: SessionSource, message, text: str) -> object:
+        """Show ``text`` as plain text: create the message if needed, else edit
+        it. Returns the message object (created or existing). Used for the
+        intermediate, still-growing frames."""
+        text = _clip(text.strip())
+        if not text:
+            return message
+        if message is None:
+            kwargs: dict = {}
+            if source.thread_id:
+                kwargs["message_thread_id"] = int(source.thread_id)
+            return await self._app.bot.send_message(
+                chat_id=source.chat_id, text=text, **kwargs
+            )
+        try:
+            await self._app.bot.edit_message_text(
+                chat_id=source.chat_id, message_id=message.message_id, text=text
+            )
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                raise
+        return message
+
+    async def _stream_finalize(self, source: SessionSource, message, text: str) -> None:
+        """Replace the streamed placeholder with the final, Markdown-rendered
+        reply. Long replies are split: the first chunk edits the placeholder,
+        the rest are sent as fresh messages (a message can't exceed 4096)."""
+        chunks = _split(text)
+        if not chunks:
+            return
+        if message is None:
+            await self.send(source, text)
+            return
+
+        first, rest = chunks[0], chunks[1:]
+        body = first
+        parse_mode = None
+        if self._parse_mode and telegramify_markdown is not None:
+            body, parse_mode = telegramify_markdown.markdownify(first), self._parse_mode
+        try:
+            await self._app.bot.edit_message_text(
+                chat_id=source.chat_id, message_id=message.message_id,
+                text=body, parse_mode=parse_mode,
+            )
+        except BadRequest as exc:
+            low = str(exc).lower()
+            if "not modified" not in low:
+                if parse_mode:                      # formatting rejected -> plain
+                    security.audit("telegram_markdown_fallback", str(exc))
+                    await self._app.bot.edit_message_text(
+                        chat_id=source.chat_id, message_id=message.message_id, text=first
+                    )
+                else:
+                    raise
+
+        kwargs: dict = {}
+        if source.thread_id:
+            kwargs["message_thread_id"] = int(source.thread_id)
+        for chunk in rest:
+            await self._send_chunk(source.chat_id, chunk, kwargs)
+
     async def send_typing(self, source: SessionSource) -> None:
         if not self._app:
             return
@@ -184,6 +263,85 @@ class TelegramAdapter(BasePlatformAdapter):
             user_id=str(user.id),
             thread_id=thread_id,
         )
+
+
+class _StreamSink:
+    """Renders one streamed reply as a single live-edited Telegram message.
+
+    ``feed`` is called from the agent's worker thread for every text fragment;
+    it buffers the text and, on a throttle, schedules a plain-text edit on the
+    gateway loop. ``finalize`` (awaited on the loop once the reply is complete)
+    applies Markdown. A short silence sentinel is never shown: nothing is sent
+    until the buffer is clearly not a sentinel.
+    """
+
+    def __init__(self, adapter: TelegramAdapter, source: SessionSource, loop) -> None:
+        self._adapter = adapter
+        self._source = source
+        self._loop = loop
+        self._buf = ""
+        self._message = None          # telegram Message, once created
+        self._last_edit = 0.0
+        self._lock = asyncio.Lock()   # serialises edits; orders interim vs final
+        self._done = False
+
+    # -- called from the worker thread -------------------------------------
+    def feed(self, delta: str) -> None:
+        if not delta:
+            return
+        self._buf += delta
+        if not _revealable(self._buf):
+            return
+        now = time.monotonic()
+        if self._message is None or now - self._last_edit >= _STREAM_EDIT_INTERVAL:
+            self._last_edit = now
+            asyncio.run_coroutine_threadsafe(self._render(self._buf), self._loop)
+
+    # -- run on the gateway loop -------------------------------------------
+    async def _render(self, snapshot: str) -> None:
+        async with self._lock:
+            if self._done or not self._adapter._app:
+                return
+            self._message = await self._adapter._stream_render(
+                self._source, self._message, snapshot
+            )
+
+    async def finalize(self, reply: str) -> None:
+        """Commit the final reply. ``reply`` is the agent's return value; the
+        streamed buffer (everything shown) is preferred when present so the
+        bubble isn't truncated to just the last turn."""
+        async with self._lock:
+            self._done = True
+            text = self._buf if self._buf.strip() else reply
+            await self._adapter._stream_finalize(self._source, self._message, text)
+
+    async def discard(self) -> None:
+        """Drop the in-progress message (e.g. the reply turned out silent)."""
+        async with self._lock:
+            self._done = True
+            if self._message is not None and self._adapter._app:
+                try:
+                    await self._adapter._app.bot.delete_message(
+                        chat_id=self._source.chat_id,
+                        message_id=self._message.message_id,
+                    )
+                except Exception:
+                    pass
+
+
+def _clip(text: str, limit: int = _TELEGRAM_MSG_LIMIT) -> str:
+    """A single Telegram message can't exceed the hard limit; clip interim
+    streaming frames (the final reply is split across messages instead)."""
+    return text if len(text) <= limit else text[:limit]
+
+
+def _revealable(text: str) -> bool:
+    """True once buffered text is clearly not a silence sentinel, so a streamed
+    ``[SILENT]`` / ``NO_REPLY`` is never momentarily shown before it's swallowed."""
+    s = text.strip()
+    if not s:
+        return False
+    return not any(tok.startswith(s) or tok in s for tok in SILENCE_TOKENS)
 
 
 def _split(text: str, limit: int = _SPLIT_LIMIT) -> list[str]:

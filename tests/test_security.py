@@ -50,6 +50,21 @@ def test_confirm_uses_gateway_approval_when_user_reachable(monkeypatch):
     assert runner.calls == [("u", "run_command", {"command": "ls"})]
 
 
+def test_gateway_request_not_hijacked_by_attached_console(monkeypatch):
+    # Running the gateway in a terminal must NOT route a Telegram user's action
+    # to a blocking console prompt; it must go to the gateway channel.
+    monkeypatch.setattr(security, "_interactive", lambda: True)
+    monkeypatch.setattr(config, "GATEWAY_APPROVALS", True)
+    console = []
+    monkeypatch.setattr(security, "_console_confirm",
+                        lambda *a: console.append(a) or True)
+    runner = _FakeRunner(decision=True)
+    _patch_runner(monkeypatch, runner)
+
+    assert security.confirm("run_command", {"command": "ls"}, user_id="u") is True
+    assert runner.calls and console == []   # gateway used, console untouched
+
+
 def test_confirm_gateway_denial_is_respected(monkeypatch):
     monkeypatch.setattr(security, "_interactive", lambda: False)
     monkeypatch.setattr(config, "GATEWAY_APPROVALS", True)

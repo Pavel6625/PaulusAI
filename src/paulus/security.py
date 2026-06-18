@@ -45,23 +45,30 @@ def _interactive() -> bool:
 def confirm(tool_name, tool_input, user_id=None):
     """Human-in-the-loop gate. Returns True only on explicit approval.
 
-    Approval is sought from whoever can actually answer, in order:
-      1. A real terminal, if one is attached (the local CLI).
-      2. The chat gateway, if the requesting ``user_id`` is reachable on an
-         adapter that supports interactive approval (e.g. Telegram buttons).
-      3. Otherwise the owner can't be prompted, so we fall back to the configured
-         ``DP_UNATTENDED_POLICY`` ("deny" by default = fail safe).
-    Every decision is audited either way.
+    Approval is sought from whoever can actually answer. The request is routed
+    to the channel it CAME from, so a gateway request is never hijacked by a
+    console prompt just because the server happens to have a terminal attached:
+      1. If the request arrived via the chat gateway (a ``user_id`` is present),
+         ask that user — e.g. Telegram Approve/Deny buttons — and otherwise fall
+         back to ``DP_UNATTENDED_POLICY``. A server-side console is never used.
+      2. Otherwise it's the local CLI: prompt the attached terminal if there is
+         one, else fall back to the policy.
+    "deny" is the default policy (fail safe). Every decision is audited.
     """
+    if user_id is not None:
+        decision = _gateway_confirm(tool_name, tool_input, user_id)
+        if decision is not None:
+            audit("gateway_" + ("approve" if decision else "deny"),
+                  f"{tool_name} {tool_input}")
+            return decision
+        return _unattended(tool_name, tool_input)
+
     if _interactive():
         return _console_confirm(tool_name, tool_input)
+    return _unattended(tool_name, tool_input)
 
-    decision = _gateway_confirm(tool_name, tool_input, user_id)
-    if decision is not None:
-        audit("gateway_" + ("approve" if decision else "deny"),
-              f"{tool_name} {tool_input}")
-        return decision
 
+def _unattended(tool_name, tool_input):
     approved = config.UNATTENDED_POLICY == "approve"
     audit("unattended_" + ("approve" if approved else "deny"),
           f"{tool_name} {tool_input}")

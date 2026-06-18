@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paulusai"
-version = "0.1.1"
+version = "0.1.2"
 description = "A long-running, autonomous digital companion with persistent memory, a functional affective system, continuous learning, and tool use."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,10 +30,14 @@ dependencies = [
 
 [project.optional-dependencies]
 vectors = ["chromadb>=0.5,<2"]
-telegram = ["python-telegram-bot>=21.0,<23"]
+telegram = [
+    "python-telegram-bot>=21.0,<23",
+    "telegramify-markdown>=1.0,<2",
+]
 all = [
     "chromadb>=0.5,<2",
     "python-telegram-bot>=21.0,<23",
+    "telegramify-markdown>=1.0,<2",
 ]
 dev = [
     "pytest>=8,<9",

@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from paulus.gateway.base import AdapterState, BasePlatformAdapter, SessionSource
 from paulus.gateway.presence import PresenceStore
 from paulus.gateway.runner import GatewayRunner
@@ -220,3 +222,84 @@ def test_circuit_breaker_opens_then_resumes():
     assert a.state == AdapterState.CIRCUIT_OPEN
     a.resume()
     assert a.state == AdapterState.RUNNING
+
+
+# --- Telegram Markdown rendering -------------------------------------------
+# These need python-telegram-bot (the adapter imports it at module load);
+# importorskip keeps the suite green in a core-only install.
+
+def _telegram_module():
+    return pytest.importorskip("paulus.gateway.platforms.telegram")
+
+
+def test_split_under_hard_limit_and_hard_splits_long_lines():
+    tg = _telegram_module()
+    chunks = tg._split("x" * 9000, limit=3500)
+    assert len(chunks) > 1
+    assert all(len(c) <= tg._TELEGRAM_MSG_LIMIT for c in chunks)
+    assert "".join(chunks) == "x" * 9000   # nothing lost in the hard split
+
+
+def test_split_keeps_code_fence_intact():
+    tg = _telegram_module()
+    body = "\n".join(f"code line {i}" for i in range(10))
+    text = f"intro paragraph\n```python\n{body}\n```\noutro paragraph"
+    chunks = tg._split(text, limit=40)
+    assert len(chunks) > 1                       # genuinely split
+    # No chunk may contain an unbalanced fence -> the block stayed whole.
+    assert all(c.count("```") % 2 == 0 for c in chunks)
+    assert all(len(c) <= tg._TELEGRAM_MSG_LIMIT for c in chunks)
+
+
+def test_markdownify_escapes_specials_outside_code():
+    t = pytest.importorskip("telegramify_markdown")
+    out = t.markdownify("**bold** then a-b.c\n```\nkeep-as.is\n```")
+    assert "*bold*" in out                       # CommonMark bold -> MarkdownV2
+    assert "\\." in out and "\\-" in out          # specials escaped in prose
+
+
+def _markdown_adapter(monkeypatch, parse_mode="MarkdownV2"):
+    tg = _telegram_module()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    monkeypatch.setenv("TELEGRAM_PARSE_MODE", parse_mode)
+    return tg, tg.TelegramAdapter(runner=None)
+
+
+def _wire_fake_bot(tg, adapter, fail_on_markdown):
+    calls: list[tuple[str, str | None]] = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, parse_mode=None, **kw):
+            calls.append((text, parse_mode))
+            if fail_on_markdown and parse_mode == "MarkdownV2":
+                from telegram.error import BadRequest
+                raise BadRequest("can't parse entities")
+
+    adapter._app = type("App", (), {"bot": FakeBot()})()
+    return calls
+
+
+def test_send_falls_back_to_plain_on_bad_request(monkeypatch):
+    pytest.importorskip("telegramify_markdown")
+    tg, adapter = _markdown_adapter(monkeypatch)
+    calls = _wire_fake_bot(tg, adapter, fail_on_markdown=True)
+
+    audits: list[tuple] = []
+    monkeypatch.setattr(tg.security, "audit", lambda *a, **k: audits.append(a))
+
+    asyncio.run(adapter.send(SessionSource("telegram", "c", "u"), "hello **world**"))
+
+    # MarkdownV2 attempted first (rejected), then the ORIGINAL text resent plain.
+    assert [pm for _, pm in calls] == ["MarkdownV2", None]
+    assert calls[1][0] == "hello **world**"
+    assert any(a[0] == "telegram_markdown_fallback" for a in audits)
+
+
+def test_send_plain_mode_skips_markdown(monkeypatch):
+    tg, adapter = _markdown_adapter(monkeypatch, parse_mode="plain")
+    assert adapter._parse_mode is None
+    calls = _wire_fake_bot(tg, adapter, fail_on_markdown=False)
+
+    asyncio.run(adapter.send(SessionSource("telegram", "c", "u"), "raw **text**"))
+
+    assert calls == [("raw **text**", None)]      # one plain send, untouched

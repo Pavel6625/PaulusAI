@@ -104,6 +104,7 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `DP_UNATTENDED_POLICY`  | `deny`                         | What to do with a high-impact action when nobody can approve   |
 | `TELEGRAM_BOT_TOKEN`    | —                              | Required for `paulus-gateway`                                  |
 | `TELEGRAM_ALLOWED_USERS`| (all)                          | Comma-separated numeric Telegram user IDs allowed to talk to it |
+| `TELEGRAM_PARSE_MODE`   | `MarkdownV2`                   | Render replies as Markdown; `plain`/`none`/`off` for raw text   |
 
 > **Secrets never enter the repo or the model's context.** Keys are read from the
 > environment only. `.env` and `*.key` are gitignored.
@@ -157,6 +158,11 @@ paulus-gateway
 ```
 
 Message the bot on Telegram. Send `/reset` to start a fresh session.
+
+Replies are rendered as Markdown (bold, code blocks, lists, links) — the
+model's CommonMark is converted to Telegram's MarkdownV2 dialect, falling back
+to plain text if a message can't be formatted. Set `TELEGRAM_PARSE_MODE=plain`
+to disable formatting.
 
 > **High-impact actions over Telegram:** there is no terminal to approve them, so
 > they follow `DP_UNATTENDED_POLICY` — **denied by default** (the agent will tell

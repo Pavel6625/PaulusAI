@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 from .. import config, security
 from .base import SILENCE_TOKENS, AdapterState, BasePlatformAdapter, SessionSource
@@ -144,13 +145,30 @@ class GatewayRunner:
 
     async def _run_idle_pass(self, min_idle_s: float) -> None:
         if config.in_quiet_hours():
+            security.audit("idle_skip", "quiet_hours")
             return                             # don't ping during quiet hours
         candidates = self._presence.idle_users(min_idle_s, config.MAX_IDLE_MSG_SESSION)
+        security.audit(
+            "idle_pass",
+            f"tracked={len(self._presence._users)} candidates={len(candidates)} "
+            f"min_idle={min_idle_s / 60:.0f}m cap={config.MAX_IDLE_MSG_SESSION}",
+        )
         for p in candidates:
+            idle_min = (time.time() - p.last_active) / 60
             adapter = self._adapters.get(p.last_source.platform)
             if not adapter or adapter.state != AdapterState.RUNNING:
+                state = adapter.state.value if adapter else "missing"
+                security.audit(
+                    "idle_skip",
+                    f"{p.user_id} adapter={p.last_source.platform}:{state}",
+                )
                 continue
 
+            security.audit(
+                "idle_check",
+                f"{p.user_id} idle={idle_min:.1f}m nudges={p.nudges_sent} "
+                f"reach={p.last_source.platform}:{p.last_source.chat_id}",
+            )
             async with self._agent_lock:
                 from .. import agent as _agent
                 loop = asyncio.get_running_loop()
@@ -160,6 +178,7 @@ class GatewayRunner:
                 )
 
             if any(token in reply for token in SILENCE_TOKENS):
+                security.audit("idle_silent", p.user_id)
                 continue                           # model chose not to intrude
 
             try:

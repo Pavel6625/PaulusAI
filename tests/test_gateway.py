@@ -736,3 +736,21 @@ def test_streaming_finalizes_with_markdown(monkeypatch):
     final_kind, final_text, final_kw = events[-1]
     assert final_kw.get("parse_mode") == "MarkdownV2"
     assert "*done*" in final_text      # CommonMark bold -> MarkdownV2
+
+
+def test_inbound_agent_error_on_image_sends_note(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    def boom(text, user_id=None, on_delta=None, images=None):
+        on_delta("thinking…")              # a placeholder gets created
+        raise RuntimeError("model has no vision support")
+
+    monkeypatch.setattr(agent, "respond", boom)
+    asyncio.run(runner.handle_inbound(
+        SessionSource("telegram", "c", "u"), "look", images=[{"media_type": "image/jpeg", "data": "QQ=="}]
+    ))
+
+    # The streamed placeholder is dropped and a vision-specific note is delivered.
+    assert any(kind == "delete" for kind, _, _ in events)
+    assert any(kind == "send" and "vision-capable" in text for kind, text, _ in events)

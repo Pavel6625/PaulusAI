@@ -184,14 +184,19 @@ def _normalize(response):
 # ---------------------------------------------------------------------------
 
 def supports_vision():
-    """Whether the configured core model can accept image input. Used by the
-    gateway to refuse an image politely instead of letting the API reject it.
-    Defaults to True if LiteLLM can't classify the model (e.g. a custom or
-    local endpoint), so a capable-but-unknown model is never blocked."""
+    """Whether the configured core model can accept image input.
+
+    Used by the gateway to refuse an image up front, but only when the model
+    *definitively* can't see. LiteLLM's vision metadata lags new multimodal
+    releases, so an unknown/uncatalogued model (flag reported as None, or the
+    model not in LiteLLM's map at all) is given the benefit of the doubt and
+    attempted — a genuinely blind one then fails at call time and the gateway
+    reports it gracefully. Only an explicit ``supports_vision: False`` blocks."""
     try:
-        return bool(litellm.supports_vision(model=config.CORE_MODEL))
+        info = litellm.get_model_info(model=config.CORE_MODEL)
     except Exception:
-        return True
+        return True                       # not in LiteLLM's map — don't block
+    return info.get("supports_vision") is not False
 
 
 def complete(system, messages, tools=None):

@@ -52,6 +52,30 @@ def test_to_openai_messages_text_only_stays_a_string():
     assert out[0] == {"role": "user", "content": "hi"}
 
 
+def test_supports_vision_blocks_only_explicit_false(monkeypatch):
+    # Catalogued as non-vision -> block.
+    monkeypatch.setattr(llm.litellm, "get_model_info",
+                        lambda model: {"supports_vision": False})
+    assert llm.supports_vision() is False
+
+    # Vision-capable -> allow.
+    monkeypatch.setattr(llm.litellm, "get_model_info",
+                        lambda model: {"supports_vision": True})
+    assert llm.supports_vision() is True
+
+    # Unknown flag (None) -> benefit of the doubt, attempt it.
+    monkeypatch.setattr(llm.litellm, "get_model_info",
+                        lambda model: {"supports_vision": None})
+    assert llm.supports_vision() is True
+
+
+def test_supports_vision_allows_unrecognized_model(monkeypatch):
+    def raise_unknown(model):
+        raise Exception("model not in map")
+    monkeypatch.setattr(llm.litellm, "get_model_info", raise_unknown)
+    assert llm.supports_vision() is True
+
+
 def test_normalize_text_and_tool_calls():
     fake = SimpleNamespace(choices=[SimpleNamespace(
         finish_reason="tool_calls",

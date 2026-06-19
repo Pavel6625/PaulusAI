@@ -24,6 +24,11 @@ EnvironmentFile=/etc/paulus/paulus.env
 
 # Where runtime memory / audit log / vector index / workspace are written.
 Environment=DP_DATA_DIR=/var/lib/paulus
+# The dedicated user's home (/opt/paulus) is read-only under ProtectSystem=strict,
+# but Chroma caches its local embedding model under ~/.cache/chroma. Point HOME at
+# the writable state dir so that cache (and any other ~/.cache use) can be written;
+# otherwise reindexing fails and memory silently degrades to keyword search.
+Environment=HOME=/var/lib/paulus
 # No interactive console here, so high-impact tools fail safe (deny) by default.
 Environment=DP_UNATTENDED_POLICY=deny
 # Unbuffer stdout/stderr so the startup banner and prints reach journald

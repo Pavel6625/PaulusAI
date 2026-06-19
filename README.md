@@ -219,6 +219,14 @@ journalctl -u paulus-gateway -f
 systemctl status paulus-gateway
 ```
 
+> **Writable home for the model cache.** Under `ProtectSystem=strict` the user's
+> home (`/opt/paulus`) is read-only, but Chroma caches its local embedding model
+> under `~/.cache/chroma`. The unit sets `HOME=/var/lib/paulus` (a `ReadWritePath`)
+> so that cache can be written; without it you'll see `reindex failed: [Errno 30]
+> Read-only file system` and memory silently degrades to keyword search. If you
+> hit this on an already-installed unit, add `HOME=/var/lib/paulus` to
+> `/etc/paulus/paulus.env` and `systemctl restart paulus-gateway`.
+
 ---
 
 ## Data & memory layout

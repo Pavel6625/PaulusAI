@@ -666,7 +666,7 @@ def test_streaming_inbound_creates_and_finalizes(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def fake_respond(text, user_id=None, on_delta=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None):
         for piece in ("Hello ", "world"):
             on_delta(piece)
         return "Hello world"
@@ -683,7 +683,7 @@ def test_streaming_silent_reply_shows_nothing(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def fake_respond(text, user_id=None, on_delta=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None):
         on_delta("[SILENT]")          # sentinel never gets revealed
         return "[SILENT]"
 
@@ -699,7 +699,7 @@ def test_streaming_empty_reply_sends_nothing(monkeypatch):
 
     # Model streams nothing and returns empty text (e.g. a denied high-impact
     # action with no follow-up). Must not try to send an empty Telegram message.
-    monkeypatch.setattr(agent, "respond", lambda text, user_id=None, on_delta=None: "")
+    monkeypatch.setattr(agent, "respond", lambda text, user_id=None, on_delta=None, images=None: "")
     asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
 
     assert events == []        # nothing sent, no "Message text is empty" crash
@@ -709,7 +709,7 @@ def test_streaming_keeps_preamble_when_final_text_empty(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def fake_respond(text, user_id=None, on_delta=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None):
         on_delta("Working on it…")   # visible preamble streamed
         return ""                    # but the final turn returns no text
     monkeypatch.setattr(agent, "respond", fake_respond)
@@ -726,7 +726,7 @@ def test_streaming_finalizes_with_markdown(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch, parse_mode="MarkdownV2")
 
-    def fake_respond(text, user_id=None, on_delta=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None):
         on_delta("**done**")
         return "**done**"
 

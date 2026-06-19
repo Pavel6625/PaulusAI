@@ -30,6 +30,28 @@ def test_to_openai_messages_handles_all_shapes():
     assert out[2]["role"] == "tool" and out[2]["tool_call_id"] == "call_1"
 
 
+def test_to_openai_messages_converts_image_blocks():
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image", "source": {
+            "type": "base64", "media_type": "image/jpeg", "data": "QUJD"}},
+    ]}]
+    out = llm._to_openai_messages(messages)
+    assert out[0]["role"] == "user"
+    parts = out[0]["content"]
+    assert parts[0] == {"type": "text", "text": "what is this?"}
+    assert parts[1]["type"] == "image_url"
+    assert parts[1]["image_url"]["url"] == "data:image/jpeg;base64,QUJD"
+
+
+def test_to_openai_messages_text_only_stays_a_string():
+    # No image -> the user turn must remain a plain string, not a parts list.
+    out = llm._to_openai_messages(
+        [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+    )
+    assert out[0] == {"role": "user", "content": "hi"}
+
+
 def test_normalize_text_and_tool_calls():
     fake = SimpleNamespace(choices=[SimpleNamespace(
         finish_reason="tool_calls",

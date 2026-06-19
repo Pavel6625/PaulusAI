@@ -71,8 +71,12 @@ class GatewayRunner:
     def _is_user_authorized(self, source: SessionSource, allowed: set[str]) -> bool:
         return not allowed or str(source.user_id) in allowed
 
-    async def handle_inbound(self, source: SessionSource, text: str) -> None:
-        """Called by adapters when a message arrives from a platform user."""
+    async def handle_inbound(self, source: SessionSource, text: str,
+                             images: list | None = None) -> None:
+        """Called by adapters when a message arrives from a platform user.
+
+        ``images`` (optional) is a list of ``{"media_type", "data"}`` dicts
+        (base64) attached to this turn — used by adapters that accept photos."""
         session = self._sessions.get_or_create(source.key())
         session.touch()
         self._presence.touch(source)   # per-user idle clock + reachability
@@ -93,7 +97,9 @@ class GatewayRunner:
             user_id = str(source.user_id)
             on_delta = sink.feed if sink else None
             reply = await loop.run_in_executor(
-                None, lambda: _agent.respond(tagged, user_id=user_id, on_delta=on_delta)
+                None,
+                lambda: _agent.respond(tagged, user_id=user_id, on_delta=on_delta,
+                                       images=images),
             )
 
         silent = any(token in reply for token in SILENCE_TOKENS)

@@ -68,13 +68,28 @@ def _to_litellm_tools(tool_specs):
     ]
 
 
+def _to_openai_image(block):
+    """Anthropic image block -> OpenAI image_url block (a base64 data URL).
+
+    LiteLLM accepts the OpenAI multimodal shape for every vision-capable
+    provider and re-encodes it to each provider's native format, so a single
+    data URL works whether the backing model is Claude, GPT-4o, or Gemini.
+    """
+    src = block["source"]
+    return {
+        "type": "image_url",
+        "image_url": {"url": f"data:{src['media_type']};base64,{src['data']}"},
+    }
+
+
 def _to_openai_messages(messages):
     """Convert Anthropic-style message history to OpenAI-style.
 
-    Handles three content shapes agent.py produces:
+    Handles four content shapes agent.py produces:
       - plain string  (from _history_to_messages)
       - list of text/tool_use dicts  (assistant turn after tool use)
       - list of tool_result dicts    (user turn returning tool output)
+      - list of text/image dicts     (user turn carrying an attached image)
     """
     out = []
     for msg in messages:
@@ -115,9 +130,22 @@ def _to_openai_messages(messages):
                 })
 
             if regular:
-                text = " ".join(b.get("text", "") for b in regular)
-                if text:
-                    out.append({"role": "user", "content": text})
+                # When the turn carries images, emit OpenAI's multimodal list
+                # (text + image_url parts); otherwise collapse to a plain string
+                # so text-only history stays byte-identical to before.
+                if any(b.get("type") == "image" for b in regular):
+                    parts = []
+                    for b in regular:
+                        if b.get("type") == "image":
+                            parts.append(_to_openai_image(b))
+                        elif b.get("text"):
+                            parts.append({"type": "text", "text": b["text"]})
+                    if parts:
+                        out.append({"role": "user", "content": parts})
+                else:
+                    text = " ".join(b.get("text", "") for b in regular)
+                    if text:
+                        out.append({"role": "user", "content": text})
 
     return out
 
@@ -154,6 +182,17 @@ def _normalize(response):
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def supports_vision():
+    """Whether the configured core model can accept image input. Used by the
+    gateway to refuse an image politely instead of letting the API reject it.
+    Defaults to True if LiteLLM can't classify the model (e.g. a custom or
+    local endpoint), so a capable-but-unknown model is never blocked."""
+    try:
+        return bool(litellm.supports_vision(model=config.CORE_MODEL))
+    except Exception:
+        return True
+
 
 def complete(system, messages, tools=None):
     """One non-streaming turn. Returns an Anthropic-shaped _Response."""

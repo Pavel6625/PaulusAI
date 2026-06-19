@@ -117,7 +117,28 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None):
         messages.append({"role": "user", "content": tool_results})
 
 
-def respond(owner_text, user_id=None, on_delta=None):
+def _attach_images(messages, images):
+    """Attach images to the current (last) user turn as Anthropic-style image
+    blocks. Only this turn carries them — episodic memory keeps the text alone,
+    so the log isn't bloated with base64 and stays human-readable. llm.py turns
+    these blocks into the wire format the model expects."""
+    if not images or not messages or messages[-1]["role"] != "user":
+        return
+    text = messages[-1]["content"]
+    blocks = [{"type": "text", "text": text}] if text else []
+    for img in images:
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": img["media_type"],
+                "data": img["data"],
+            },
+        })
+    messages[-1]["content"] = blocks
+
+
+def respond(owner_text, user_id=None, on_delta=None, images=None):
     memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
 
     low = owner_text.lower()
@@ -128,6 +149,7 @@ def respond(owner_text, user_id=None, on_delta=None):
 
     system = _build_system(user_id)
     messages = _history_to_messages(user_id)
+    _attach_images(messages, images)
     final_text = _run_tool_loop(system, messages, user_id, on_delta=on_delta)
 
     memory.log_episode("agent", final_text, trust="trusted", user_id=user_id)

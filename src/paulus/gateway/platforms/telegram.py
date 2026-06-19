@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import time
 
@@ -43,6 +44,7 @@ class TelegramAdapter(BasePlatformAdapter):
     """
     supports_typing_indicator = True
     supports_approvals = True   # high-impact actions can be approved via buttons
+    supports_images = True      # photos / image documents are routed to the agent
 
     def __init__(self, runner) -> None:
         super().__init__(runner)
@@ -83,6 +85,10 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app = Application.builder().token(self._token).build()
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message)
+        )
+        # Photos and image documents -> vision turn (a caption rides along as text).
+        self._app.add_handler(
+            MessageHandler(filters.PHOTO | filters.Document.IMAGE, self._on_photo)
         )
         self._app.add_handler(CommandHandler("reset", self._on_reset))
         # The terminal CLI's in-chat commands, mirrored over Telegram. Routed
@@ -137,6 +143,58 @@ class TelegramAdapter(BasePlatformAdapter):
 
         await self.send_typing(source)
         await self._runner.handle_inbound(source, " ".join(texts))
+
+    async def _on_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle an inbound photo (or image document): download the image,
+        base64-encode it, and pass it to the agent as a vision turn. Any caption
+        rides along as the message text. Photos bypass the text debounce batch —
+        each is its own turn — but still serialise on the agent lock upstream."""
+        msg = update.message
+        if not msg or not update.effective_user or not update.effective_chat:
+            return
+
+        source = self._source_from(update)
+        if not self._runner._is_user_authorized(source, self._allowed):
+            await msg.reply_text("Unauthorized.")
+            return
+
+        # Don't let the API reject the request — tell the owner the model is blind.
+        from ... import llm
+        if not llm.supports_vision():
+            await msg.reply_text(
+                "I can't analyse images with the current model. "
+                "Switch DP_CORE_MODEL to a vision-capable one to enable this."
+            )
+            return
+
+        image = await self._download_image(msg)
+        if image is None:
+            await msg.reply_text("Sorry, I couldn't download that image.")
+            return
+
+        text = (msg.caption or "").strip() or "(image, no caption)"
+        await self.send_typing(source)
+        await self._runner.handle_inbound(source, text, images=[image])
+
+    async def _download_image(self, msg) -> dict | None:
+        """Fetch the best version of the image on ``msg`` and return it as a
+        ``{"media_type", "data"}`` dict (base64), or None if nothing usable is
+        attached. Telegram re-encodes ``photo`` uploads as JPEG; image documents
+        keep their original mime type."""
+        if msg.photo:
+            tg_file = await msg.photo[-1].get_file()   # last = highest resolution
+            media_type = "image/jpeg"
+        elif msg.document and (msg.document.mime_type or "").startswith("image/"):
+            tg_file = await msg.document.get_file()
+            media_type = msg.document.mime_type
+        else:
+            return None
+        try:
+            raw = await tg_file.download_as_bytearray()
+        except Exception as exc:
+            security.audit("telegram_image_download_error", str(exc))
+            return None
+        return {"media_type": media_type, "data": base64.b64encode(raw).decode("ascii")}
 
     async def _on_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user:

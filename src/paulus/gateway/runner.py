@@ -91,16 +91,44 @@ class GatewayRunner:
                 and getattr(adapter, "supports_streaming", False)):
             sink = adapter.stream_sink(source, asyncio.get_running_loop())
 
+        reply = None
+        error: Exception | None = None
         async with self._agent_lock:
             from .. import agent as _agent
             loop = asyncio.get_running_loop()
             user_id = str(source.user_id)
             on_delta = sink.feed if sink else None
-            reply = await loop.run_in_executor(
-                None,
-                lambda: _agent.respond(tagged, user_id=user_id, on_delta=on_delta,
-                                       images=images),
+            try:
+                reply = await loop.run_in_executor(
+                    None,
+                    lambda: _agent.respond(tagged, user_id=user_id, on_delta=on_delta,
+                                           images=images),
+                )
+            except Exception as exc:        # model/tool failure mid-turn
+                error = exc
+
+        # The agent raised (e.g. a non-vision model rejecting an image). Drop any
+        # streamed placeholder and tell the user, instead of dying silently.
+        if error is not None:
+            security.audit("gateway_agent_error", f"{source.key()}: {error}")
+            if sink is not None:
+                try:
+                    await sink.discard()
+                except Exception:
+                    pass
+            note = (
+                "Sorry — I couldn't process that image. The current model may "
+                "not be vision-capable; set DP_CORE_MODEL to one that supports "
+                "images." if images else
+                "Sorry — something went wrong handling that. Please try again."
             )
+            if adapter and adapter.state == AdapterState.RUNNING:
+                try:
+                    await adapter.send(source, note)
+                except Exception as exc:
+                    security.audit("gateway_send_error", str(exc))
+                    adapter._on_failure()
+            return
 
         silent = any(token in reply for token in SILENCE_TOKENS)
 

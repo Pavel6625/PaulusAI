@@ -280,6 +280,41 @@ def test_request_approval_roundtrip_approve_and_deny():
     assert asyncio.run(ask()) is False
 
 
+def test_handle_command_mood_memory_skills(monkeypatch):
+    import paulus.affect as affect
+    import paulus.memory as memory
+    import paulus.skills as skills
+
+    runner = GatewayRunner()
+    src = SessionSource("telegram", "c", "u")
+
+    monkeypatch.setattr(affect, "describe", lambda: "calm, alert")
+    monkeypatch.setattr(memory, "semantic_text", lambda user_id=None: f"facts<{user_id}>")
+    monkeypatch.setattr(skills, "describe", lambda: "(no skills yet)")
+
+    assert asyncio.run(runner.handle_command(src, "mood")) == "mood: calm, alert"
+    assert asyncio.run(runner.handle_command(src, "memory")) == "facts<u>"  # per-user
+    assert asyncio.run(runner.handle_command(src, "skills")) == "(no skills yet)"
+    assert "Unknown" in asyncio.run(runner.handle_command(src, "bogus"))
+
+
+def test_handle_command_sleep_consolidates_for_user(monkeypatch):
+    import paulus.agent as agent
+
+    runner = GatewayRunner()
+    seen: dict = {}
+
+    def fake_sleep(user_id=None):
+        seen["uid"] = user_id
+        return "Consolidated 2 fact(s)."
+
+    monkeypatch.setattr(agent, "sleep", fake_sleep)
+    out = asyncio.run(runner.handle_command(SessionSource("telegram", "c", "u"), "sleep"))
+
+    assert out == "Consolidated 2 fact(s)."
+    assert seen["uid"] == "u"               # scoped to the caller's memory
+
+
 def test_resolve_unknown_approval_is_noop():
     runner = GatewayRunner()
     assert runner.resolve_approval("nope", True) is False
@@ -523,6 +558,65 @@ def test_callback_from_unlisted_user_is_rejected(monkeypatch):
 
     assert calls == []                                 # never settled
     assert query.answered and query.answered[0][1]     # show_alert "Unauthorized"
+
+
+def _command_update(text, user_id="7", chat_id="c"):
+    """A minimal Update for a /command message, with a recording reply_text."""
+    replies: list[str] = []
+
+    async def reply_text(t):
+        replies.append(t)
+
+    msg = type("Msg", (), {
+        "text": text,
+        "is_topic_message": False,
+        "message_thread_id": None,
+        "reply_text": staticmethod(reply_text),
+    })()
+    update = type("U", (), {
+        "message": msg,
+        "effective_user": type("Usr", (), {"id": user_id})(),
+        "effective_chat": type("Chat", (), {"id": chat_id})(),
+    })()
+    return update, replies
+
+
+def test_telegram_command_routes_to_runner(monkeypatch):
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+    captured: dict = {}
+
+    async def fake_handle(source, command):
+        captured["cmd"] = command
+        captured["uid"] = source.user_id
+        return "result text"
+
+    monkeypatch.setattr(runner, "handle_command", fake_handle)
+
+    # "@botname" suffix (added by Telegram in groups) is stripped to the bare name.
+    update, _ = _command_update("/skills@PaulusBot", user_id="7")
+    asyncio.run(adapter._on_command(update, None))
+
+    assert captured == {"cmd": "skills", "uid": "7"}
+    assert events[-1] == ("send", "result text", {})   # delivered via send()
+
+
+def test_telegram_command_rejects_unauthorized(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "7")
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    called = {"n": 0}
+
+    async def fake_handle(source, command):
+        called["n"] += 1
+        return "should not happen"
+
+    monkeypatch.setattr(runner, "handle_command", fake_handle)
+
+    update, replies = _command_update("/mood", user_id="999")
+    asyncio.run(adapter._on_command(update, None))
+
+    assert called["n"] == 0                 # command never dispatched
+    assert replies == ["Unauthorized."]
 
 
 def test_revealable_gates_silence_sentinels():

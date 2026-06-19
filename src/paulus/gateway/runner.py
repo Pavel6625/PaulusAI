@@ -117,6 +117,33 @@ class GatewayRunner:
                 security.audit("gateway_send_error", str(exc))
                 adapter._on_failure()
 
+    async def handle_command(self, source: SessionSource, command: str) -> str:
+        """Run an in-chat slash command and return the reply text. Mirrors the
+        terminal CLI's /sleep, /mood, /memory and /skills, but scoped to the
+        calling user (per-user episodic/semantic memory; skills and mood are
+        global). Called by adapters that register command handlers."""
+        from .. import affect, memory, skills
+        user_id = str(source.user_id)
+
+        if command == "sleep":
+            # Consolidation hits the model and writes memory, so it runs under
+            # the agent lock (PaulusAI's memory modules aren't thread-safe) and
+            # off the event loop, exactly like a normal turn.
+            self._presence.touch(source)
+            async with self._agent_lock:
+                from .. import agent as _agent
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    None, lambda: _agent.sleep(user_id=user_id)
+                )
+        if command == "mood":
+            return f"mood: {affect.describe()}"
+        if command == "memory":
+            return memory.semantic_text(user_id)
+        if command == "skills":
+            return skills.describe()
+        return f"Unknown command: /{command}"
+
     def dispatch_outbound(self, to: str, body: str) -> str:
         """
         Deliver an outbound message; called synchronously from tools.execute().

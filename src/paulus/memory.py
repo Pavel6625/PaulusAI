@@ -129,6 +129,15 @@ def _load_facts(user_id=None):
     return []
 
 
+def semantic_text(user_id=None) -> str:
+    """The human-readable semantic-memory view (semantic.md), or a placeholder
+    when nothing has been learned yet. Used by the /memory command on the CLI
+    and the chat gateway."""
+    path = _semantic_md(user_id)
+    return (path.read_text(encoding="utf-8")
+            if path.exists() else "(no semantic memory yet)")
+
+
 def _save_facts(facts, user_id=None):
     config.ensure_dirs()
     _ensure_user_dir(user_id)

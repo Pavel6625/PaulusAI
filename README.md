@@ -161,7 +161,9 @@ command, sending a message), you are prompted to approve that single action:
 paulus-gateway
 ```
 
-Message the bot on Telegram. Send `/reset` to start a fresh session.
+Message the bot on Telegram. The in-chat commands work here too — `/sleep`,
+`/mood`, `/memory` and `/skills` (each scoped to your own per-user memory) — plus
+`/reset` to start a fresh session.
 
 Replies are rendered as Markdown (bold, code blocks, lists, links) — the
 model's CommonMark is converted to Telegram's MarkdownV2 dialect, falling back

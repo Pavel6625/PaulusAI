@@ -10,7 +10,7 @@ Commands:
   /skills   list learned skills
   /quit     consolidate and exit
 """
-from . import affect, agent, config, skills, vectorstore
+from . import affect, agent, config, memory, skills, vectorstore
 
 
 def main():
@@ -36,15 +36,10 @@ def main():
             print("mood:", affect.describe())
             continue
         if text == "/memory":
-            print(config.SEMANTIC_MD.read_text(encoding="utf-8")
-                  if config.SEMANTIC_MD.exists() else "(no semantic memory yet)")
+            print(memory.semantic_text())
             continue
         if text == "/skills":
-            sk = skills._load()
-            if not sk:
-                print("(no skills yet)")
-            for s in sk:
-                print(f"- [{s['status']}] {s['name']} (uses {s['uses']}): {s['when_to_use']}")
+            print(skills.describe())
             continue
 
         print(f"\ndp> {agent.respond(text)}\n")

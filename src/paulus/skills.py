@@ -58,6 +58,18 @@ def mark_used(name, success=True):
     return
 
 
+def describe() -> str:
+    """A human-readable listing of every skill and its status. Used by the
+    /skills command on the CLI and the chat gateway."""
+    skills = _load()
+    if not skills:
+        return "(no skills yet)"
+    return "\n".join(
+        f"- [{s['status']}] {s['name']} (uses {s['uses']}): {s['when_to_use']}"
+        for s in skills
+    )
+
+
 def find_skills(query, k=3):
     skills = _load()
     q = set(_WORD.findall(query.lower()))

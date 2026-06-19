@@ -85,6 +85,10 @@ class TelegramAdapter(BasePlatformAdapter):
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message)
         )
         self._app.add_handler(CommandHandler("reset", self._on_reset))
+        # The terminal CLI's in-chat commands, mirrored over Telegram. Routed
+        # to the runner so the behaviour stays identical across surfaces.
+        for cmd in ("sleep", "mood", "memory", "skills"):
+            self._app.add_handler(CommandHandler(cmd, self._on_command))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
         await self._app.initialize()
         await self._app.start()
@@ -143,6 +147,21 @@ class TelegramAdapter(BasePlatformAdapter):
         self._runner._sessions.reset(source.key())
         await update.message.reply_text("Session reset.")
         security.audit("gateway_session_reset", source.key())
+
+    async def _on_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the CLI-parity commands (/sleep, /mood, /memory, /skills)."""
+        if not update.message or not update.effective_user or not update.effective_chat:
+            return
+        source = self._source_from(update)
+        if not self._runner._is_user_authorized(source, self._allowed):
+            await update.message.reply_text("Unauthorized.")
+            return
+        # Strip the leading slash and any "@botname" suffix Telegram appends in
+        # group chats, leaving the bare command name.
+        cmd = (update.message.text or "").lstrip("/").split()[0].split("@", 1)[0].lower()
+        await self.send_typing(source)
+        reply = await self._runner.handle_command(source, cmd)
+        await self.send(source, reply)   # send() splits long output (e.g. /memory)
 
     # ------------------------------------------------------------------
     # Approvals (high-impact action gate)

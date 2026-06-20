@@ -866,6 +866,9 @@ def test_approval_prompt_describes_send_document():
     prompt = _approval_prompt("send_document",
                               {"to": "telegram:c", "filename": "notes.md", "content": "x"})
     assert "notes.md" in prompt and "telegram:c" in prompt
+    # Omitted 'to' reads as the current chat rather than a bare '?'.
+    prompt2 = _approval_prompt("send_document", {"filename": "notes.md", "content": "x"})
+    assert "notes.md" in prompt2 and "current chat" in prompt2
 
 
 def test_dispatch_document_routes_to_adapter():
@@ -909,6 +912,54 @@ def test_dispatch_document_unsupported_adapter():
 
     msg = runner.dispatch_document("telegram:c", "out.txt", "body")
     assert "can't send documents" in msg
+
+
+def test_dispatch_document_defaults_to_current_chat():
+    runner = GatewayRunner()
+    sent: list[SessionSource] = []
+
+    class Docs(BasePlatformAdapter):
+        supports_documents = True
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, source, text): ...
+        async def send_document(self, source, filename, content):
+            sent.append(source)
+
+    adapter = Docs(runner)
+    adapter._state = AdapterState.RUNNING
+    runner.register("telegram", adapter)
+    # The user last reached us in chat "c7", forum topic "9".
+    runner._presence.touch(SessionSource("telegram", "c7", "u", thread_id="9"))
+
+    async def go():
+        result = runner.dispatch_document("", "out.txt", "body", user_id="u")
+        await asyncio.sleep(0)
+        return result
+
+    result = asyncio.run(go())
+    assert "c7" in result
+    assert sent and sent[0].chat_id == "c7"
+    assert sent[0].thread_id == "9"            # replies land in the same topic
+
+
+def test_dispatch_document_no_destination_for_unknown_user():
+    runner = GatewayRunner()
+
+    class Docs(BasePlatformAdapter):
+        supports_documents = True
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, source, text): ...
+        async def send_document(self, source, filename, content): ...
+
+    adapter = Docs(runner)
+    adapter._state = AdapterState.RUNNING
+    runner.register("telegram", adapter)
+
+    # No explicit 'to' and no presence record -> nothing to resolve to.
+    msg = runner.dispatch_document("", "out.txt", "body", user_id="ghost")
+    assert "no known chat" in msg
 
 
 def test_send_document_method_uploads_file(monkeypatch):

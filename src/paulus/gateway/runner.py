@@ -29,7 +29,8 @@ def _approval_prompt(tool_name: str, tool_input) -> str:
             preview = body if len(body) <= 200 else body[:200] + "…"
             detail = f"to {tool_input.get('to', '?')}: {preview}"
         elif tool_name == "send_document":
-            detail = f"file '{tool_input.get('filename', '?')}' to {tool_input.get('to', '?')}"
+            dest = tool_input.get("to") or "the current chat"
+            detail = f"file '{tool_input.get('filename', '?')}' to {dest}"
         else:
             detail = str(tool_input)
     else:
@@ -224,22 +225,44 @@ class GatewayRunner:
         self._schedule_send(adapter.send(source, body))
         return f"Message dispatched to {to} via {platform_name}."
 
-    def dispatch_document(self, to: str, filename: str, body: str) -> str:
+    def _resolve_destination(self, to: str, user_id) -> tuple[SessionSource | None, str | None]:
+        """Resolve where an agent-initiated payload should go, returning
+        (source, error). An explicit ``to`` ('platform:chat_id' or bare chat_id)
+        wins; otherwise it falls back to the caller's most recent reachable
+        conversation — preserving its thread — so the agent can answer in the
+        current chat without knowing the chat id."""
+        if to:
+            platform_name, chat_id, error = self._resolve_target(to)
+            if error is not None:
+                return None, error
+            return SessionSource(platform=platform_name, chat_id=chat_id, user_id="agent"), None
+
+        presence = self._presence._users.get(str(user_id)) if user_id is not None else None
+        if presence is None:
+            return None, "[gateway] no destination given and no known chat for this user."
+        src = presence.last_source
+        adapter = self._adapters.get(src.platform)
+        if not adapter or adapter.state != AdapterState.RUNNING:
+            return None, f"[{src.platform}] adapter unavailable; nothing sent."
+        return SessionSource(platform=src.platform, chat_id=src.chat_id,
+                             user_id="agent", thread_id=src.thread_id), None
+
+    def dispatch_document(self, to: str, filename: str, body: str, user_id=None) -> str:
         """Deliver an outbound text document as a file attachment; called
-        synchronously from tools.execute(). Same 'to' format as
-        dispatch_outbound. Falls back with a note if the target adapter can't
-        send documents."""
-        platform_name, chat_id, error = self._resolve_target(to)
+        synchronously from tools.execute(). ``to`` is optional: when empty, the
+        document goes to the calling user's current chat (see
+        ``_resolve_destination``). Falls back with a note if the target adapter
+        can't send documents."""
+        source, error = self._resolve_destination(to, user_id)
         if error is not None:
             return error
 
-        adapter = self._adapters[platform_name]
+        adapter = self._adapters[source.platform]
         if not getattr(adapter, "supports_documents", False):
-            return f"[{platform_name}] adapter can't send documents; {filename} not sent."
+            return f"[{source.platform}] adapter can't send documents; {filename} not sent."
 
-        source = SessionSource(platform=platform_name, chat_id=chat_id, user_id="agent")
         self._schedule_send(adapter.send_document(source, filename, body))
-        return f"Document '{filename}' dispatched to {to} via {platform_name}."
+        return f"Document '{filename}' dispatched to {source.platform}:{source.chat_id}."
 
     def _default_platform(self) -> str | None:
         for name, adapter in self._adapters.items():

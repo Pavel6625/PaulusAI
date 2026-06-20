@@ -666,7 +666,7 @@ def test_streaming_inbound_creates_and_finalizes(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def fake_respond(text, user_id=None, on_delta=None, images=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None):
         for piece in ("Hello ", "world"):
             on_delta(piece)
         return "Hello world"
@@ -683,7 +683,7 @@ def test_streaming_silent_reply_shows_nothing(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def fake_respond(text, user_id=None, on_delta=None, images=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None):
         on_delta("[SILENT]")          # sentinel never gets revealed
         return "[SILENT]"
 
@@ -699,7 +699,7 @@ def test_streaming_empty_reply_sends_nothing(monkeypatch):
 
     # Model streams nothing and returns empty text (e.g. a denied high-impact
     # action with no follow-up). Must not try to send an empty Telegram message.
-    monkeypatch.setattr(agent, "respond", lambda text, user_id=None, on_delta=None, images=None: "")
+    monkeypatch.setattr(agent, "respond", lambda text, user_id=None, on_delta=None, images=None, documents=None: "")
     asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
 
     assert events == []        # nothing sent, no "Message text is empty" crash
@@ -709,7 +709,7 @@ def test_streaming_keeps_preamble_when_final_text_empty(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def fake_respond(text, user_id=None, on_delta=None, images=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None):
         on_delta("Working on it…")   # visible preamble streamed
         return ""                    # but the final turn returns no text
     monkeypatch.setattr(agent, "respond", fake_respond)
@@ -726,7 +726,7 @@ def test_streaming_finalizes_with_markdown(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch, parse_mode="MarkdownV2")
 
-    def fake_respond(text, user_id=None, on_delta=None, images=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None):
         on_delta("**done**")
         return "**done**"
 
@@ -738,11 +738,201 @@ def test_streaming_finalizes_with_markdown(monkeypatch):
     assert "*done*" in final_text      # CommonMark bold -> MarkdownV2
 
 
+# --- Documents -------------------------------------------------------------
+
+def _document_update(content, *, file_name="notes.txt", file_size=None,
+                     caption="", user_id="7", chat_id="c"):
+    """A minimal Update carrying a document, with a recording reply_text.
+    ``content`` is the raw bytes the (faked) download returns."""
+    replies: list[str] = []
+
+    async def reply_text(t):
+        replies.append(t)
+
+    class _File:
+        async def download_as_bytearray(self):
+            return bytearray(content)
+
+    async def get_file():
+        return _File()
+
+    document = type("Doc", (), {
+        "file_name": file_name,
+        "file_size": len(content) if file_size is None else file_size,
+        "get_file": staticmethod(get_file),
+    })()
+    msg = type("Msg", (), {
+        "document": document,
+        "caption": caption,
+        "is_topic_message": False,
+        "message_thread_id": None,
+        "reply_text": staticmethod(reply_text),
+    })()
+    update = type("U", (), {
+        "message": msg,
+        "effective_user": type("Usr", (), {"id": user_id})(),
+        "effective_chat": type("Chat", (), {"id": chat_id})(),
+    })()
+    return update, replies
+
+
+def test_inbound_document_decodes_and_forwards(monkeypatch):
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+    captured: dict = {}
+
+    async def fake_inbound(source, text, documents=None, **kw):
+        captured["text"] = text
+        captured["documents"] = documents
+
+    monkeypatch.setattr(runner, "handle_inbound", fake_inbound)
+
+    update, replies = _document_update(b"hello from a file", caption="read this")
+    asyncio.run(adapter._on_document(update, None))
+
+    assert replies == []                       # no rejection
+    assert captured["text"] == "read this"     # caption becomes the turn text
+    assert captured["documents"] == [{"filename": "notes.txt", "content": "hello from a file"}]
+
+
+def test_inbound_document_too_large_is_rejected(monkeypatch):
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+    called = {"n": 0}
+    monkeypatch.setattr(runner, "handle_inbound",
+                        lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+
+    over = adapter._doc_max_bytes + 1
+    update, replies = _document_update(b"x", file_size=over)
+    asyncio.run(adapter._on_document(update, None))
+
+    assert called["n"] == 0                     # agent never invoked
+    assert replies and "too large" in replies[0]
+
+
+def test_inbound_document_binary_is_rejected(monkeypatch):
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+    called = {"n": 0}
+    monkeypatch.setattr(runner, "handle_inbound",
+                        lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+
+    update, replies = _document_update(b"\xff\xfe\x00\x01")   # not valid UTF-8
+    asyncio.run(adapter._on_document(update, None))
+
+    assert called["n"] == 0
+    assert replies == ["I can only read text documents."]
+
+
+def test_inbound_document_rejects_unauthorized(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "7")
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+    called = {"n": 0}
+    monkeypatch.setattr(runner, "handle_inbound",
+                        lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+
+    update, replies = _document_update(b"secret", user_id="999")
+    asyncio.run(adapter._on_document(update, None))
+
+    assert called["n"] == 0
+    assert replies == ["Unauthorized."]
+
+
+def test_ingest_documents_saves_to_inbox_and_wraps_untrusted():
+    import paulus.agent as agent
+    from paulus import config
+
+    docs = [{"filename": "report.md", "content": "line one\nline two"}]
+    text = agent._ingest_documents("summarize this", docs, user_id="u")
+
+    # Saved into the user's workspace inbox...
+    saved = config.user_workspace("u") / "inbox" / "report.md"
+    assert saved.read_text(encoding="utf-8") == "line one\nline two"
+    # ...and the content is folded in, wrapped as untrusted data.
+    assert "summarize this" in text
+    assert "<untrusted_data" in text and "line one" in text
+    assert "inbox/report.md" in text            # the header references the save
+
+
+def test_ingest_documents_passthrough_when_none():
+    import paulus.agent as agent
+    assert agent._ingest_documents("just text", None, user_id="u") == "just text"
+
+
+def test_send_document_tool_is_high_impact():
+    from paulus import security
+    assert "send_document" in security.HIGH_IMPACT_TOOLS
+
+
+def test_approval_prompt_describes_send_document():
+    from paulus.gateway.runner import _approval_prompt
+    prompt = _approval_prompt("send_document",
+                              {"to": "telegram:c", "filename": "notes.md", "content": "x"})
+    assert "notes.md" in prompt and "telegram:c" in prompt
+
+
+def test_dispatch_document_routes_to_adapter():
+    runner = GatewayRunner()
+    sent: list[tuple] = []
+
+    class Docs(BasePlatformAdapter):
+        supports_documents = True
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, source, text): ...
+        async def send_document(self, source, filename, content):
+            sent.append((source.chat_id, filename, content))
+
+    adapter = Docs(runner)
+    adapter._state = AdapterState.RUNNING
+    runner.register("telegram", adapter)
+
+    async def go():
+        result = runner.dispatch_document("telegram:c", "out.txt", "body")
+        await asyncio.sleep(0)                  # let the scheduled task run
+        return result
+
+    result = asyncio.run(go())
+    assert "out.txt" in result and "telegram" in result
+    assert sent == [("c", "out.txt", "body")]
+
+
+def test_dispatch_document_unsupported_adapter():
+    runner = GatewayRunner()
+
+    class NoDocs(BasePlatformAdapter):
+        supports_documents = False
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, source, text): ...
+
+    adapter = NoDocs(runner)
+    adapter._state = AdapterState.RUNNING
+    runner.register("telegram", adapter)
+
+    msg = runner.dispatch_document("telegram:c", "out.txt", "body")
+    assert "can't send documents" in msg
+
+
+def test_send_document_method_uploads_file(monkeypatch):
+    tg = _telegram_module()
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    adapter = tg.TelegramAdapter(runner=None)
+    uploads: list[dict] = []
+
+    class FakeBot:
+        async def send_document(self, chat_id, document, **kw):
+            uploads.append({"chat_id": chat_id, "document": document, **kw})
+
+    adapter._app = type("App", (), {"bot": FakeBot()})()
+    asyncio.run(adapter.send_document(SessionSource("telegram", "c", "u"), "a.txt", "hi"))
+
+    assert uploads and uploads[0]["chat_id"] == "c"
+    assert uploads[0]["document"].filename == "a.txt"
+
+
 def test_inbound_agent_error_on_image_sends_note(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def boom(text, user_id=None, on_delta=None, images=None):
+    def boom(text, user_id=None, on_delta=None, images=None, documents=None):
         on_delta("thinking…")              # a placeholder gets created
         raise RuntimeError("model has no vision support")
 

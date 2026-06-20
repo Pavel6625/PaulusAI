@@ -3,6 +3,7 @@
 between the model's decision and any real-world effect.
 """
 import json
+import os
 
 from . import affect, llm, memory, security, skills, tools
 
@@ -138,7 +139,32 @@ def _attach_images(messages, images):
     messages[-1]["content"] = blocks
 
 
-def respond(owner_text, user_id=None, on_delta=None, images=None):
+def _ingest_documents(owner_text, documents, user_id=None):
+    """Fold inbound text documents into the owner's turn: save each into the
+    user's sandbox workspace (under ``inbox/``) so the file tools can reach it,
+    and append its content wrapped as untrusted data so the model treats it as
+    information, never as instructions. Returns the combined turn text. This is
+    a direct, ungated save — the owner explicitly sent the file, so it does not
+    go through the high-impact ``write_local_file`` gate."""
+    if not documents:
+        return owner_text
+    parts = [owner_text] if owner_text else []
+    for doc in documents:
+        name = os.path.basename(doc.get("filename") or "document.txt") or "document.txt"
+        content = doc.get("content", "")
+        try:
+            tools._sbx.write_file(f"inbox/{name}", content, user_id=user_id)
+            saved = f", saved to inbox/{name}"
+        except Exception as exc:
+            security.audit("document_save_error", f"{name}: {exc}")
+            saved = ""
+        parts.append(f"[Owner sent a document: {name} ({len(content)} chars){saved}]")
+        parts.append(security.wrap_untrusted(f"document:{name}", content))
+    return "\n\n".join(parts)
+
+
+def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None):
+    owner_text = _ingest_documents(owner_text, documents, user_id)
     memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
 
     low = owner_text.lower()

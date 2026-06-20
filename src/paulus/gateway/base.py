@@ -41,6 +41,7 @@ class BasePlatformAdapter(ABC):
     """
     supports_voice: bool = False
     supports_images: bool = False
+    supports_documents: bool = False
     supports_typing_indicator: bool = False
     supports_threads: bool = False
     supports_streaming: bool = False

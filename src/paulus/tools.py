@@ -88,6 +88,20 @@ TOOL_SPECS = [
             "required": ["to", "body"],
         },
     },
+    {
+        "name": "send_document",
+        "description": "Send a text document as a file attachment (e.g. notes, a report, code). "
+                       "HIGH-IMPACT: requires owner confirmation.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "platform:chat_id, or bare chat_id for the default adapter."},
+                "filename": {"type": "string", "description": "The attachment's file name, e.g. notes.md."},
+                "content": {"type": "string", "description": "The document's text content."},
+            },
+            "required": ["to", "filename", "content"],
+        },
+    },
 ]
 
 
@@ -145,6 +159,19 @@ def execute(name, tool_input, user_id=None):
                 result = runner.dispatch_outbound(tool_input["to"], tool_input["body"])
             else:
                 result = f"[simulated] message sent to {tool_input['to']}."
+            return result, False
+
+        if name == "send_document":
+            security.audit("send_document",
+                           f"to={tool_input['to']} file={tool_input['filename']}")
+            from .gateway.runner import get_runner
+            runner = get_runner()
+            if runner is not None:
+                result = runner.dispatch_document(
+                    tool_input["to"], tool_input["filename"], tool_input["content"]
+                )
+            else:
+                result = f"[simulated] document {tool_input['filename']} sent to {tool_input['to']}."
             return result, False
 
         return f"Unknown tool: {name}", True

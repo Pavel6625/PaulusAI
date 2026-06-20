@@ -6,7 +6,7 @@ import base64
 import os
 import time
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -45,6 +45,7 @@ class TelegramAdapter(BasePlatformAdapter):
     supports_typing_indicator = True
     supports_approvals = True   # high-impact actions can be approved via buttons
     supports_images = True      # photos / image documents are routed to the agent
+    supports_documents = True   # text documents are read in and can be sent back
 
     def __init__(self, runner) -> None:
         super().__init__(runner)
@@ -68,6 +69,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Pending batched messages keyed by SessionSource.key()
         self._pending: dict[str, list[str]] = {}
         self._batch_delay = 0.3  # seconds
+        # Largest inbound text document we'll ingest. Bigger files are rejected
+        # so a huge upload can't blow the model context / episodic memory.
+        self._doc_max_bytes = int(os.environ.get("TELEGRAM_DOC_MAX_BYTES", "262144"))
         # Outbound formatting. Default renders Markdown; set TELEGRAM_PARSE_MODE
         # to plain/none/off (or leave the library uninstalled) for raw text.
         mode = os.environ.get("TELEGRAM_PARSE_MODE", "MarkdownV2").strip().lower()
@@ -89,6 +93,14 @@ class TelegramAdapter(BasePlatformAdapter):
         # Photos and image documents -> vision turn (a caption rides along as text).
         self._app.add_handler(
             MessageHandler(filters.PHOTO | filters.Document.IMAGE, self._on_photo)
+        )
+        # Non-image documents (.txt/.md/.csv/...) -> read in as text. Registered
+        # after the photo handler (and excluding image docs) so images still
+        # route to the vision turn above.
+        self._app.add_handler(
+            MessageHandler(
+                filters.Document.ALL & ~filters.Document.IMAGE, self._on_document
+            )
         )
         self._app.add_handler(CommandHandler("reset", self._on_reset))
         # The terminal CLI's in-chat commands, mirrored over Telegram. Routed
@@ -195,6 +207,50 @@ class TelegramAdapter(BasePlatformAdapter):
             security.audit("telegram_image_download_error", str(exc))
             return None
         return {"media_type": media_type, "data": base64.b64encode(raw).decode("ascii")}
+
+    async def _on_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle an inbound text document: download it, decode as UTF-8, and pass
+        the contents to the agent as a turn (folded in as untrusted data and saved
+        to the user's workspace upstream). Any caption rides along as the message
+        text. Image documents are handled by ``_on_photo``; binary documents are
+        rejected. Like photos, documents bypass the text debounce batch."""
+        msg = update.message
+        if not msg or not msg.document or not update.effective_user or not update.effective_chat:
+            return
+
+        source = self._source_from(update)
+        if not self._runner._is_user_authorized(source, self._allowed):
+            await msg.reply_text("Unauthorized.")
+            return
+
+        doc = msg.document
+        if doc.file_size and doc.file_size > self._doc_max_bytes:
+            await msg.reply_text(
+                f"That document is too large ({doc.file_size} bytes). "
+                f"I can read text files up to {self._doc_max_bytes} bytes."
+            )
+            return
+
+        try:
+            tg_file = await doc.get_file()
+            raw = await tg_file.download_as_bytearray()
+        except Exception as exc:
+            security.audit("telegram_document_download_error", str(exc))
+            await msg.reply_text("Sorry, I couldn't download that document.")
+            return
+
+        try:
+            text = bytes(raw).decode("utf-8")
+        except UnicodeDecodeError:
+            await msg.reply_text("I can only read text documents.")
+            return
+
+        caption = (msg.caption or "").strip()
+        await self.send_typing(source)
+        await self._runner.handle_inbound(
+            source, caption,
+            documents=[{"filename": doc.file_name or "document.txt", "content": text}],
+        )
 
     async def _on_reset(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user:
@@ -304,6 +360,20 @@ class TelegramAdapter(BasePlatformAdapter):
             kwargs["message_thread_id"] = int(source.thread_id)
         for chunk in _split(text):
             await self._send_chunk(source.chat_id, chunk, kwargs)
+
+    async def send_document(self, source: SessionSource, filename: str,
+                            content: str) -> None:
+        """Deliver text ``content`` as a file attachment named ``filename``."""
+        if not self._app:
+            return
+        kwargs: dict = {}
+        if source.thread_id:
+            kwargs["message_thread_id"] = int(source.thread_id)
+        await self._app.bot.send_document(
+            chat_id=source.chat_id,
+            document=InputFile(content.encode("utf-8"), filename=filename),
+            **kwargs,
+        )
 
     async def _send_chunk(self, chat_id: str, chunk: str, kwargs: dict) -> None:
         """Deliver one <=4096-char chunk, rendering Markdown when enabled.

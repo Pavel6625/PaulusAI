@@ -15,7 +15,7 @@ from . import config
 
 # Tools whose effects are irreversible or reach outside the machine.
 # These ALWAYS require per-action owner confirmation. Never generalise a yes.
-HIGH_IMPACT_TOOLS = {"write_local_file", "send_message", "run_command"}
+HIGH_IMPACT_TOOLS = {"write_local_file", "send_message", "send_document", "run_command"}
 
 
 def is_high_impact(tool_name):

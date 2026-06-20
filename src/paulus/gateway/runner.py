@@ -28,6 +28,8 @@ def _approval_prompt(tool_name: str, tool_input) -> str:
             body = str(tool_input.get("body", ""))
             preview = body if len(body) <= 200 else body[:200] + "…"
             detail = f"to {tool_input.get('to', '?')}: {preview}"
+        elif tool_name == "send_document":
+            detail = f"file '{tool_input.get('filename', '?')}' to {tool_input.get('to', '?')}"
         else:
             detail = str(tool_input)
     else:
@@ -72,11 +74,14 @@ class GatewayRunner:
         return not allowed or str(source.user_id) in allowed
 
     async def handle_inbound(self, source: SessionSource, text: str,
-                             images: list | None = None) -> None:
+                             images: list | None = None,
+                             documents: list | None = None) -> None:
         """Called by adapters when a message arrives from a platform user.
 
         ``images`` (optional) is a list of ``{"media_type", "data"}`` dicts
-        (base64) attached to this turn — used by adapters that accept photos."""
+        (base64) attached to this turn — used by adapters that accept photos.
+        ``documents`` (optional) is a list of ``{"filename", "content"}`` text
+        documents — folded into the turn and saved to the user's workspace."""
         session = self._sessions.get_or_create(source.key())
         session.touch()
         self._presence.touch(source)   # per-user idle clock + reachability
@@ -102,7 +107,7 @@ class GatewayRunner:
                 reply = await loop.run_in_executor(
                     None,
                     lambda: _agent.respond(tagged, user_id=user_id, on_delta=on_delta,
-                                           images=images),
+                                           images=images, documents=documents),
                 )
             except Exception as exc:        # model/tool failure mid-turn
                 error = exc
@@ -178,11 +183,10 @@ class GatewayRunner:
             return skills.describe()
         return f"Unknown command: /{command}"
 
-    def dispatch_outbound(self, to: str, body: str) -> str:
-        """
-        Deliver an outbound message; called synchronously from tools.execute().
+    def _resolve_target(self, to: str) -> tuple[str | None, str, str | None]:
+        """Resolve a 'to' spec into (platform_name, chat_id, error).
         'to' format: 'platform:chat_id' or bare 'chat_id' for the default adapter.
-        """
+        ``error`` is a user-facing string when no live adapter can serve it."""
         parts = to.split(":", 1)
         if len(parts) == 2:
             platform_name, chat_id = parts
@@ -190,21 +194,52 @@ class GatewayRunner:
             platform_name = self._default_platform()
             chat_id = to
             if platform_name is None:
-                return f"[gateway] no active adapter to deliver message to {to}."
+                return None, chat_id, f"[gateway] no active adapter to deliver to {to}."
 
         adapter = self._adapters.get(platform_name)
         if not adapter or adapter.state != AdapterState.RUNNING:
-            return f"[{platform_name}] adapter unavailable; message to {to} not sent."
+            return None, chat_id, f"[{platform_name}] adapter unavailable; nothing sent to {to}."
+        return platform_name, chat_id, None
 
-        source = SessionSource(platform=platform_name, chat_id=chat_id, user_id="agent")
+    def _schedule_send(self, coro) -> None:
+        """Run an adapter send coroutine on the gateway loop, or synchronously
+        when there is no running loop (terminal REPL mode)."""
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(adapter.send(source, body))
+            loop.create_task(coro)
         except RuntimeError:
-            # No running event loop (terminal REPL mode) — run synchronously.
-            asyncio.run(adapter.send(source, body))
+            asyncio.run(coro)
 
+    def dispatch_outbound(self, to: str, body: str) -> str:
+        """
+        Deliver an outbound message; called synchronously from tools.execute().
+        'to' format: 'platform:chat_id' or bare 'chat_id' for the default adapter.
+        """
+        platform_name, chat_id, error = self._resolve_target(to)
+        if error is not None:
+            return error
+
+        adapter = self._adapters[platform_name]
+        source = SessionSource(platform=platform_name, chat_id=chat_id, user_id="agent")
+        self._schedule_send(adapter.send(source, body))
         return f"Message dispatched to {to} via {platform_name}."
+
+    def dispatch_document(self, to: str, filename: str, body: str) -> str:
+        """Deliver an outbound text document as a file attachment; called
+        synchronously from tools.execute(). Same 'to' format as
+        dispatch_outbound. Falls back with a note if the target adapter can't
+        send documents."""
+        platform_name, chat_id, error = self._resolve_target(to)
+        if error is not None:
+            return error
+
+        adapter = self._adapters[platform_name]
+        if not getattr(adapter, "supports_documents", False):
+            return f"[{platform_name}] adapter can't send documents; {filename} not sent."
+
+        source = SessionSource(platform=platform_name, chat_id=chat_id, user_id="agent")
+        self._schedule_send(adapter.send_document(source, filename, body))
+        return f"Document '{filename}' dispatched to {to} via {platform_name}."
 
     def _default_platform(self) -> str | None:
         for name, adapter in self._adapters.items():

@@ -16,6 +16,7 @@ agent.py is unaware of the provider — it always sees Anthropic-shaped
 response objects. All format conversion lives here.
 """
 import json
+import sys
 from dataclasses import dataclass, field
 
 import litellm
@@ -150,6 +151,32 @@ def _to_openai_messages(messages):
     return out
 
 
+def _loads_tool_args(raw):
+    """Parse a tool call's JSON arguments, tolerating a provider that appends
+    trailing data after a valid object.
+
+    Some models (observed with ollama_chat cloud) occasionally emit a valid
+    arguments object followed by stray content (e.g. a second object or prose),
+    which makes strict ``json.loads`` raise ``Extra data`` and crash the turn.
+    Recover the first complete JSON object and ignore the rest; only a string
+    with no leading JSON object at all falls back to ``{}``."""
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            obj, _end = json.JSONDecoder().raw_decode(raw)
+        except json.JSONDecodeError:
+            print(f"[llm] unparseable tool arguments, ignoring: {raw!r}",
+                  file=sys.stderr)
+            return {}
+        print(f"[llm] recovered tool arguments with trailing data: {raw!r}",
+              file=sys.stderr)
+        return obj
+
+
 # ---------------------------------------------------------------------------
 # Format conversion: LiteLLM response -> Anthropic-shaped _Response
 # ---------------------------------------------------------------------------
@@ -173,7 +200,7 @@ def _normalize(response):
         content.append(_ToolUseBlock(
             id=tc.id,
             name=tc.function.name,
-            input=json.loads(tc.function.arguments),
+            input=_loads_tool_args(tc.function.arguments),
         ))
 
     return _Response(stop_reason=stop_reason, content=content)
@@ -266,6 +293,6 @@ def stream(system, messages, tools=None, on_delta=None):
         content.append(_ToolUseBlock(
             id=slot["id"],
             name=slot["name"],
-            input=json.loads(slot["args"] or "{}"),
+            input=_loads_tool_args(slot["args"]),
         ))
     return _Response(stop_reason=stop_reason, content=content)

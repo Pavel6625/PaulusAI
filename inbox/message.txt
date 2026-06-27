@@ -1,0 +1,695 @@
+This is how to list messages in your inbox:
+# List Messages
+
+GET https://api.agentmail.to/v0/inboxes/{inbox_id}/messages
+
+Lists messages in the inbox, most recent first. Pass `from`, `to`, or
+`subject` to filter by substring. Filtered requests are served by
+search, which caps `limit` at 100. For relevance-ranked full-text
+search across sender, recipients, subject, and message body, use
+`Search Messages`.
+
+**CLI:**
+```bash
+agentmail inboxes:messages list --inbox-id <inbox_id>
+```
+
+Reference: https://docs.agentmail.to/api-reference/inboxes/messages/list
+
+## OpenAPI Specification
+
+```yaml
+openapi: 3.1.0
+info:
+  title: api
+  version: 1.0.0
+paths:
+  /v0/inboxes/{inbox_id}/messages:
+    get:
+      operationId: list
+      summary: List Messages
+      description: |-
+        Lists messages in the inbox, most recent first. Pass `from`, `to`, or
+        `subject` to filter by substring. Filtered requests are served by
+        search, which caps `limit` at 100. For relevance-ranked full-text
+        search across sender, recipients, subject, and message body, use
+        `Search Messages`.
+
+        **CLI:**
+        ```bash
+        agentmail inboxes:messages list --inbox-id <inbox_id>
+        ```
+      tags:
+        - subpackage_inboxes.subpackage_inboxes/messages
+      parameters:
+        - name: inbox_id
+          in: path
+          required: true
+          schema:
+            $ref: '#/components/schemas/type_inboxes:InboxId'
+        - name: limit
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/type_:Limit'
+        - name: page_token
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/type_:PageToken'
+        - name: labels
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/type_:Labels'
+        - name: before
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/type_:Before'
+        - name: after
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/type_:After'
+        - name: ascending
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/type_:Ascending'
+        - name: include_spam
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/type_:IncludeSpam'
+        - name: include_blocked
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/type_:IncludeBlocked'
+        - name: include_unauthenticated
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/type_:IncludeUnauthenticated'
+        - name: include_trash
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/type_:IncludeTrash'
+        - name: from
+          in: query
+          description: >-
+            Filter to messages whose sender contains this value (substring
+            match). Repeatable; all values must match.
+          required: false
+          schema:
+            type: array
+            items:
+              type: string
+        - name: to
+          in: query
+          description: >-
+            Filter to messages whose recipients (to, cc, or bcc) contain this
+            value (substring match). Repeatable; all values must match.
+          required: false
+          schema:
+            type: array
+            items:
+              type: string
+        - name: subject
+          in: query
+          description: >-
+            Filter to messages whose subject contains this value (substring
+            match). Repeatable; all values must match.
+          required: false
+          schema:
+            type: array
+            items:
+              type: string
+        - name: Authorization
+          in: header
+          description: Bearer authentication
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Response with status 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/type_messages:ListMessagesResponse'
+        '404':
+          description: Error response with status 404
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/type_:ErrorResponse'
+servers:
+  - url: https://api.agentmail.to
+    description: prod
+  - url: https://x402.api.agentmail.to
+    description: prod-x402
+  - url: https://mpp.api.agentmail.to
+    description: prod-mpp
+  - url: https://api.agentmail.eu
+    description: eu-prod
+components:
+  schemas:
+    type_inboxes:InboxId:
+      type: string
+      description: The ID of the inbox.
+      title: InboxId
+    type_:Limit:
+      type: integer
+      description: Limit of number of items returned.
+      title: Limit
+    type_:PageToken:
+      type: string
+      description: Page token for pagination.
+      title: PageToken
+    type_:Labels:
+      type: array
+      items:
+        type: string
+      description: Labels to filter by.
+      title: Labels
+    type_:Before:
+      type: string
+      format: date-time
+      description: Timestamp before which to filter by.
+      title: Before
+    type_:After:
+      type: string
+      format: date-time
+      description: Timestamp after which to filter by.
+      title: After
+    type_:Ascending:
+      type: boolean
+      description: Sort in ascending temporal order.
+      title: Ascending
+    type_:IncludeSpam:
+      type: boolean
+      description: Include spam in results.
+      title: IncludeSpam
+    type_:IncludeBlocked:
+      type: boolean
+      description: Include blocked in results.
+      title: IncludeBlocked
+    type_:IncludeUnauthenticated:
+      type: boolean
+      description: Include unauthenticated in results.
+      title: IncludeUnauthenticated
+    type_:IncludeTrash:
+      type: boolean
+      description: Include trash in results.
+      title: IncludeTrash
+    type_:Count:
+      type: integer
+      description: Number of items returned.
+      title: Count
+    type_threads:ThreadId:
+      type: string
+      description: ID of thread.
+      title: ThreadId
+    type_messages:MessageId:
+      type: string
+      description: ID of message.
+      title: MessageId
+    type_messages:MessageLabels:
+      type: array
+      items:
+        type: string
+      description: Labels of message.
+      title: MessageLabels
+    type_messages:MessageTimestamp:
+      type: string
+      format: date-time
+      description: Time at which message was sent or drafted.
+      title: MessageTimestamp
+    type_messages:MessageFrom:
+      type: string
+      description: >-
+        Address of sender. In format `username@domain.com` or `Display Name
+        <username@domain.com>`.
+      title: MessageFrom
+    type_messages:MessageTo:
+      type: array
+      items:
+        type: string
+      description: >-
+        Addresses of recipients. In format `username@domain.com` or `Display
+        Name <username@domain.com>`.
+      title: MessageTo
+    type_messages:MessageCc:
+      type: array
+      items:
+        type: string
+      description: >-
+        Addresses of CC recipients. In format `username@domain.com` or `Display
+        Name <username@domain.com>`.
+      title: MessageCc
+    type_messages:MessageBcc:
+      type: array
+      items:
+        type: string
+      description: >-
+        Addresses of BCC recipients. In format `username@domain.com` or `Display
+        Name <username@domain.com>`.
+      title: MessageBcc
+    type_messages:MessageSubject:
+      type: string
+      description: Subject of message.
+      title: MessageSubject
+    type_messages:MessagePreview:
+      type: string
+      description: Text preview of message.
+      title: MessagePreview
+    type_attachments:AttachmentId:
+      type: string
+      description: ID of attachment.
+      title: AttachmentId
+    type_attachments:AttachmentFilename:
+      type: string
+      description: Filename of attachment.
+      title: AttachmentFilename
+    type_attachments:AttachmentSize:
+      type: integer
+      description: Size of attachment in bytes.
+      title: AttachmentSize
+    type_attachments:AttachmentContentType:
+      type: string
+      description: Content type of attachment.
+      title: AttachmentContentType
+    type_attachments:AttachmentContentDisposition:
+      type: string
+      enum:
+        - inline
+        - attachment
+      description: Content disposition of attachment.
+      title: AttachmentContentDisposition
+    type_attachments:AttachmentContentId:
+      type: string
+      description: Content ID of attachment.
+      title: AttachmentContentId
+    type_attachments:Attachment:
+      type: object
+      properties:
+        attachment_id:
+          $ref: '#/components/schemas/type_attachments:AttachmentId'
+        filename:
+          $ref: '#/components/schemas/type_attachments:AttachmentFilename'
+        size:
+          $ref: '#/components/schemas/type_attachments:AttachmentSize'
+        content_type:
+          $ref: '#/components/schemas/type_attachments:AttachmentContentType'
+        content_disposition:
+          $ref: '#/components/schemas/type_attachments:AttachmentContentDisposition'
+        content_id:
+          $ref: '#/components/schemas/type_attachments:AttachmentContentId'
+      required:
+        - attachment_id
+        - size
+      title: Attachment
+    type_messages:MessageAttachments:
+      type: array
+      items:
+        $ref: '#/components/schemas/type_attachments:Attachment'
+      description: Attachments in message.
+      title: MessageAttachments
+    type_messages:MessageInReplyTo:
+      type: string
+      description: ID of message being replied to.
+      title: MessageInReplyTo
+    type_messages:MessageReferences:
+      type: array
+      items:
+        type: string
+      description: IDs of previous messages in thread.
+      title: MessageReferences
+    type_messages:MessageHeaders:
+      type: object
+      additionalProperties:
+        type: string
+      description: Headers in message.
+      title: MessageHeaders
+    type_messages:MessageSize:
+      type: integer
+      description: Size of message in bytes.
+      title: MessageSize
+    type_messages:MessageUpdatedAt:
+      type: string
+      format: date-time
+      description: Time at which message was last updated.
+      title: MessageUpdatedAt
+    type_messages:MessageCreatedAt:
+      type: string
+      format: date-time
+      description: Time at which message was created.
+      title: MessageCreatedAt
+    type_messages:MessageItem:
+      type: object
+      properties:
+        inbox_id:
+          $ref: '#/components/schemas/type_inboxes:InboxId'
+        thread_id:
+          $ref: '#/components/schemas/type_threads:ThreadId'
+        message_id:
+          $ref: '#/components/schemas/type_messages:MessageId'
+        labels:
+          $ref: '#/components/schemas/type_messages:MessageLabels'
+        timestamp:
+          $ref: '#/components/schemas/type_messages:MessageTimestamp'
+        from:
+          $ref: '#/components/schemas/type_messages:MessageFrom'
+        to:
+          $ref: '#/components/schemas/type_messages:MessageTo'
+        cc:
+          $ref: '#/components/schemas/type_messages:MessageCc'
+        bcc:
+          $ref: '#/components/schemas/type_messages:MessageBcc'
+        subject:
+          $ref: '#/components/schemas/type_messages:MessageSubject'
+        preview:
+          $ref: '#/components/schemas/type_messages:MessagePreview'
+        attachments:
+          $ref: '#/components/schemas/type_messages:MessageAttachments'
+        in_reply_to:
+          $ref: '#/components/schemas/type_messages:MessageInReplyTo'
+        references:
+          $ref: '#/components/schemas/type_messages:MessageReferences'
+        headers:
+          $ref: '#/components/schemas/type_messages:MessageHeaders'
+        size:
+          $ref: '#/components/schemas/type_messages:MessageSize'
+        updated_at:
+          $ref: '#/components/schemas/type_messages:MessageUpdatedAt'
+        created_at:
+          $ref: '#/components/schemas/type_messages:MessageCreatedAt'
+      required:
+        - inbox_id
+        - thread_id
+        - message_id
+        - labels
+        - timestamp
+        - from
+        - to
+        - size
+        - updated_at
+        - created_at
+      title: MessageItem
+    type_messages:ListMessagesResponse:
+      type: object
+      properties:
+        count:
+          $ref: '#/components/schemas/type_:Count'
+        limit:
+          $ref: '#/components/schemas/type_:Limit'
+        next_page_token:
+          $ref: '#/components/schemas/type_:PageToken'
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/type_messages:MessageItem'
+          description: Ordered by `timestamp` descending.
+      required:
+        - count
+        - messages
+      title: ListMessagesResponse
+    type_:ErrorName:
+      type: string
+      description: Name of error.
+      title: ErrorName
+    type_:ErrorMessage:
+      type: string
+      description: Error message.
+      title: ErrorMessage
+    type_:ErrorResponse:
+      type: object
+      properties:
+        name:
+          $ref: '#/components/schemas/type_:ErrorName'
+        message:
+          $ref: '#/components/schemas/type_:ErrorMessage'
+      required:
+        - name
+        - message
+      title: ErrorResponse
+  securitySchemes:
+    Bearer:
+      type: http
+      scheme: bearer
+
+```
+
+## Examples
+
+**Response**
+
+```json
+{
+  "count": 1,
+  "messages": [
+    {
+      "inbox_id": "inbox_id",
+      "thread_id": "thread_id",
+      "message_id": "message_id",
+      "labels": [
+        "labels",
+        "labels"
+      ],
+      "timestamp": "2024-01-15T09:30:00Z",
+      "from": "from",
+      "to": [
+        "to",
+        "to"
+      ],
+      "size": 1,
+      "updated_at": "2024-01-15T09:30:00Z",
+      "created_at": "2024-01-15T09:30:00Z",
+      "cc": [
+        "cc",
+        "cc"
+      ],
+      "bcc": [
+        "bcc",
+        "bcc"
+      ],
+      "subject": "subject",
+      "preview": "preview",
+      "attachments": [
+        {
+          "attachment_id": "attachment_id",
+          "size": 1,
+          "filename": "filename",
+          "content_type": "content_type",
+          "content_disposition": "inline",
+          "content_id": "content_id"
+        },
+        {
+          "attachment_id": "attachment_id",
+          "size": 1,
+          "filename": "filename",
+          "content_type": "content_type",
+          "content_disposition": "inline",
+          "content_id": "content_id"
+        }
+      ],
+      "in_reply_to": "in_reply_to",
+      "references": [
+        "references",
+        "references"
+      ],
+      "headers": {
+        "headers": "headers"
+      }
+    },
+    {
+      "inbox_id": "inbox_id",
+      "thread_id": "thread_id",
+      "message_id": "message_id",
+      "labels": [
+        "labels",
+        "labels"
+      ],
+      "timestamp": "2024-01-15T09:30:00Z",
+      "from": "from",
+      "to": [
+        "to",
+        "to"
+      ],
+      "size": 1,
+      "updated_at": "2024-01-15T09:30:00Z",
+      "created_at": "2024-01-15T09:30:00Z",
+      "cc": [
+        "cc",
+        "cc"
+      ],
+      "bcc": [
+        "bcc",
+        "bcc"
+      ],
+      "subject": "subject",
+      "preview": "preview",
+      "attachments": [
+        {
+          "attachment_id": "attachment_id",
+          "size": 1,
+          "filename": "filename",
+          "content_type": "content_type",
+          "content_disposition": "inline",
+          "content_id": "content_id"
+        },
+        {
+          "attachment_id": "attachment_id",
+          "size": 1,
+          "filename": "filename",
+          "content_type": "content_type",
+          "content_disposition": "inline",
+          "content_id": "content_id"
+        }
+      ],
+      "in_reply_to": "in_reply_to",
+      "references": [
+        "references",
+        "references"
+      ],
+      "headers": {
+        "headers": "headers"
+      }
+    }
+  ],
+  "limit": 1,
+  "next_page_token": "next_page_token"
+}
+```
+
+**SDK Code**
+
+```typescript
+import { AgentMailClient } from "agentmail";
+
+async function main() {
+    const client = new AgentMailClient({
+        apiKey: "YOUR_TOKEN_HERE",
+    });
+    await client.inboxes.messages.list("inbox_id", {});
+}
+main();
+
+```
+
+```python
+from agentmail import AgentMail
+
+client = AgentMail(
+    api_key="YOUR_TOKEN_HERE",
+)
+
+client.inboxes.messages.list(
+    inbox_id="inbox_id",
+)
+
+```
+
+```go
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"io"
+)
+
+func main() {
+
+	url := "https://api.agentmail.to/v0/inboxes/inbox_id/messages"
+
+	req, _ := http.NewRequest("GET", url, nil)
+
+	req.Header.Add("Authorization", "Bearer <api_key>")
+
+	res, _ := http.DefaultClient.Do(req)
+
+	defer res.Body.Close()
+	body, _ := io.ReadAll(res.Body)
+
+	fmt.Println(res)
+	fmt.Println(string(body))
+
+}
+```
+
+```ruby
+require 'uri'
+require 'net/http'
+
+url = URI("https://api.agentmail.to/v0/inboxes/inbox_id/messages")
+
+http = Net::HTTP.new(url.host, url.port)
+http.use_ssl = true
+
+request = Net::HTTP::Get.new(url)
+request["Authorization"] = 'Bearer <api_key>'
+
+response = http.request(request)
+puts response.read_body
+```
+
+```java
+import com.mashape.unirest.http.HttpResponse;
+import com.mashape.unirest.http.Unirest;
+
+HttpResponse<String> response = Unirest.get("https://api.agentmail.to/v0/inboxes/inbox_id/messages")
+  .header("Authorization", "Bearer <api_key>")
+  .asString();
+```
+
+```php
+<?php
+require_once('vendor/autoload.php');
+
+$client = new \GuzzleHttp\Client();
+
+$response = $client->request('GET', 'https://api.agentmail.to/v0/inboxes/inbox_id/messages', [
+  'headers' => [
+    'Authorization' => 'Bearer <api_key>',
+  ],
+]);
+
+echo $response->getBody();
+```
+
+```csharp
+using RestSharp;
+
+var client = new RestClient("https://api.agentmail.to/v0/inboxes/inbox_id/messages");
+var request = new RestRequest(Method.GET);
+request.AddHeader("Authorization", "Bearer <api_key>");
+IRestResponse response = client.Execute(request);
+```
+
+```swift
+import Foundation
+
+let headers = ["Authorization": "Bearer <api_key>"]
+
+let request = NSMutableURLRequest(url: NSURL(string: "https://api.agentmail.to/v0/inboxes/inbox_id/messages")! as URL,
+                                        cachePolicy: .useProtocolCachePolicy,
+                                    timeoutInterval: 10.0)
+request.httpMethod = "GET"
+request.allHTTPHeaderFields = headers
+
+let session = URLSession.shared
+let dataTask = session.dataTask(with: request as URLRequest, completionHandler: { (data, response, error) -> Void in
+  if (error != nil) {
+    print(error as Any)
+  } else {
+    let httpResponse = response as? HTTPURLResponse
+    print(httpResponse)
+  }
+})
+
+dataTask.resume()
+```

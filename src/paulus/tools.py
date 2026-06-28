@@ -202,7 +202,20 @@ def execute(name, tool_input, user_id=None):
 
             from agentmail import AgentMail
             client = AgentMail(api_key=os.environ.get("AGENTMAIL_API_KEY"))
-            emails = client.list_emails(query=tool_input.get("query"))
+            # The API requires an inbox_id. We get it from environment variables.
+            inbox_id = os.environ.get("AGENTMAIL_INBOX_ID")
+            if not inbox_id:
+                return "Error: AGENTMAIL_INBOX_ID environment variable is not set.", True
+            
+            # According to docs, filter parameters (from, to, subject) are separate.
+            # For a generic 'query', we can pass it as a subject filter if it's simple, 
+            # or just list everything if no query is provided.
+            params = {}
+            query = tool_input.get("query")
+            if query:
+                params["subject"] = query
+            
+            emails = client.inboxes.messages.list(inbox_id=inbox_id, **params)
             return str(emails), False
 
         if name == "send_email_agentmail":
@@ -210,10 +223,15 @@ def execute(name, tool_input, user_id=None):
 
             from agentmail import AgentMail
             client = AgentMail(api_key=os.environ.get("AGENTMAIL_API_KEY"))
-            res = client.send_email(
+            inbox_id = os.environ.get("AGENTMAIL_INBOX_ID")
+            if not inbox_id:
+                return "Error: AGENTMAIL_INBOX_ID environment variable is not set.", True
+            
+            res = client.inboxes.messages.send(
+                inbox_id=inbox_id,
                 to=tool_input["to"], 
                 subject=tool_input["subject"], 
-                body=tool_input["body"]
+                text=tool_input["body"]
             )
             security.audit("send_email_agentmail", f"to={tool_input['to']}")
             return str(res), False

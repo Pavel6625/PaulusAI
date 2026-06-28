@@ -7,7 +7,7 @@ python-dotenv>=1.0,<2
 chromadb>=0.5,<2
 python-telegram-bot>=21.0,<23
 telegramify-markdown>=1.0,<2
-agentmail-python
+agentmail>=0.5,<1
 
 # Dev / test
 pytest>=8,<9

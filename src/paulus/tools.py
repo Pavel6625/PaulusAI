@@ -200,7 +200,14 @@ def execute(name, tool_input, user_id=None):
         if name == "list_emails_agentmail":
             import os
 
-            from agentmail import AgentMail
+            try:
+                from agentmail import AgentMail
+            except ImportError:
+                return (
+                    "Error: AgentMail is not installed. Install the email extra with "
+                    "`pip install \"paulusai[email]\"` (or `[all]`).",
+                    True,
+                )
             client = AgentMail(api_key=os.environ.get("AGENTMAIL_API_KEY"))
             # The API requires an inbox_id. We get it from environment variables.
             inbox_id = os.environ.get("AGENTMAIL_INBOX_ID")
@@ -221,7 +228,14 @@ def execute(name, tool_input, user_id=None):
         if name == "send_email_agentmail":
             import os
 
-            from agentmail import AgentMail
+            try:
+                from agentmail import AgentMail
+            except ImportError:
+                return (
+                    "Error: AgentMail is not installed. Install the email extra with "
+                    "`pip install \"paulusai[email]\"` (or `[all]`).",
+                    True,
+                )
             client = AgentMail(api_key=os.environ.get("AGENTMAIL_API_KEY"))
             inbox_id = os.environ.get("AGENTMAIL_INBOX_ID")
             if not inbox_id:

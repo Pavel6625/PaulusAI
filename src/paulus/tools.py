@@ -103,6 +103,27 @@ TOOL_SPECS = [
             "required": ["filename", "content"],
         },
     },
+    {
+        "name": "list_emails_agentmail",
+        "description": "List or search for messages in the AgentMail inbox.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"query": {"type": "string", "description": "Optional search query."}},
+        },
+    },
+    {
+        "name": "send_email_agentmail",
+        "description": "Send an email using the AgentMail service.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "subject": {"type": "string"},
+                "body": {"type": "string"},
+            },
+            "required": ["to", "subject", "body"],
+        },
+    },
 ]
 
 
@@ -175,6 +196,27 @@ def execute(name, tool_input, user_id=None):
             else:
                 result = f"[simulated] document {tool_input['filename']} sent."
             return result, False
+
+        if name == "list_emails_agentmail":
+            import os
+
+            from agentmail import AgentMail
+            client = AgentMail(api_key=os.environ.get("AGENTMAIL_API_KEY"))
+            emails = client.list_emails(query=tool_input.get("query"))
+            return str(emails), False
+
+        if name == "send_email_agentmail":
+            import os
+
+            from agentmail import AgentMail
+            client = AgentMail(api_key=os.environ.get("AGENTMAIL_API_KEY"))
+            res = client.send_email(
+                to=tool_input["to"], 
+                subject=tool_input["subject"], 
+                body=tool_input["body"]
+            )
+            security.audit("send_email_agentmail", f"to={tool_input['to']}")
+            return str(res), False
 
         return f"Unknown tool: {name}", True
     except Exception as e:

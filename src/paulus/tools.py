@@ -199,6 +199,7 @@ def execute(name, tool_input, user_id=None):
 
         if name == "list_emails_agentmail":
             import os
+
             from agentmail import AgentMail
             client = AgentMail(api_key=os.environ.get("AGENTMAIL_API_KEY"))
             emails = client.list_emails(query=tool_input.get("query"))
@@ -206,6 +207,7 @@ def execute(name, tool_input, user_id=None):
 
         if name == "send_email_agentmail":
             import os
+
             from agentmail import AgentMail
             client = AgentMail(api_key=os.environ.get("AGENTMAIL_API_KEY"))
             res = client.send_email(

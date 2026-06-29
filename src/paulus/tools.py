@@ -112,6 +112,15 @@ TOOL_SPECS = [
         },
     },
     {
+        "name": "read_email_agentmail",
+        "description": "When the owner needs to read the full content of a specific email beyond the preview provided by the list function.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"message_id": {"type": "string", "description": "The unique ID of the email message."}},
+            "required": ["message_id"],
+        },
+    },
+    {
         "name": "send_email_agentmail",
         "description": "Send an email using the AgentMail service.",
         "input_schema": {
@@ -224,6 +233,25 @@ def execute(name, tool_input, user_id=None):
             
             emails = client.inboxes.messages.list(inbox_id=inbox_id, **params)
             return str(emails), False
+
+        if name == "read_email_agentmail":
+            import os
+
+            try:
+                from agentmail import AgentMail
+            except ImportError:
+                return (
+                    "Error: AgentMail is not installed. Install the email extra with "
+                    "`pip install \"paulusai[email]\"` (or `[all]`).",
+                    True,
+                )
+            client = AgentMail(api_key=os.environ.get("AGENTMAIL_API_KEY"))
+            inbox_id = os.environ.get("AGENTMAIL_INBOX_ID")
+            if not inbox_id:
+                return "Error: AGENTMAIL_INBOX_ID environment variable is not set.", True
+            
+            res = client.inboxes.messages.get(inbox_id=inbox_id, message_id=tool_input["message_id"])
+            return str(res), False
 
         if name == "send_email_agentmail":
             import os

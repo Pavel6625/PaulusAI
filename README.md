@@ -27,8 +27,9 @@ point it at Anthropic, OpenAI, Gemini, OpenRouter, or a local Ollama model.
   "verified" once used successfully. Salience decays each pass and facts that
   fade below `DP_SALIENCE_FLOOR` are forgotten, keeping memory bounded.
 - **Tools with a safety gate** — `remember`, `recall`, `find_skill`,
-  `save_skill`, `read_local_file`, plus the high-impact `write_local_file`,
-  `run_command`, and `send_message` which require explicit approval.
+  `save_skill`, `read_local_file`, `web_search`/`fetch_url` (browse and scrape
+  the web), plus the high-impact `write_local_file`, `run_command`, and
+  `send_message` which require explicit approval.
 - **Pluggable sandbox** — command/file execution runs `local`, in a
   network-disabled `docker` container, or over `ssh`.
 - **Messaging gateway** — a Hermes-style gateway with a Telegram adapter
@@ -79,7 +80,8 @@ This puts two commands on your `PATH`:
 |--------------|-------------------------------|-----------------------------------------|
 | `vectors`    | `chromadb` semantic memory    | Falls back to keyword search            |
 | `telegram`   | `python-telegram-bot`         | `paulus-gateway` has no adapter to run  |
-| `all`        | both of the above             | —                                       |
+| `web`        | `beautifulsoup4` (clean scrape)| `fetch_url` falls back to a stdlib stripper |
+| `all`        | all of the above              | —                                       |
 | `dev`        | `pytest`, `ruff`              | —                                       |
 
 ---

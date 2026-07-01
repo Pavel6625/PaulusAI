@@ -138,6 +138,21 @@ DOCKER_IMAGE = os.environ.get("DP_DOCKER_IMAGE", "python:3.12-slim")
 SSH_TARGET = os.environ.get("DP_SSH_TARGET", "")          # e.g. user@host
 SSH_REMOTE_DIR = os.environ.get("DP_SSH_REMOTE_DIR", "~/dp-workspace")
 
+# --- Web access -------------------------------------------------------------
+# `web_search` works with no key via DuckDuckGo's HTML endpoint. Set a provider
+# key (TAVILY_API_KEY or BRAVE_API_KEY) for a higher-quality keyed backend;
+# DP_SEARCH_PROVIDER pins one explicitly ("duckduckgo"|"tavily"|"brave"), while
+# "auto" (default) picks a keyed provider when its key is present, else DuckDuckGo.
+SEARCH_PROVIDER = os.environ.get("DP_SEARCH_PROVIDER", "auto")
+WEB_MAX_RESULTS = int(os.environ.get("DP_WEB_MAX_RESULTS", "5"))
+WEB_MAX_CHARS = int(os.environ.get("DP_WEB_MAX_CHARS", "8000"))   # per fetched page
+WEB_MAX_BYTES = int(os.environ.get("DP_WEB_MAX_BYTES", str(5 * 1024 * 1024)))
+WEB_TIMEOUT = int(os.environ.get("DP_WEB_TIMEOUT", "20"))
+WEB_USER_AGENT = os.environ.get(
+    "DP_WEB_USER_AGENT",
+    "Mozilla/5.0 (compatible; PaulusAI/1.0; +https://github.com/Pavel6625/PaulusAI)",
+)
+
 # --- Safety -----------------------------------------------------------------
 # What to do with a high-impact action when there is no interactive console to
 # approve it (e.g. running as a systemd service or behind the chat gateway):

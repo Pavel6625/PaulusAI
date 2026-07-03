@@ -9,7 +9,7 @@ from decimal import Decimal
 
 from django.test import Client, TestCase, override_settings
 
-from .models import Account, Invoice, PaymentTransaction
+from .models import Account, PaymentTransaction
 from .services import (
     PAID,
     PENDING,

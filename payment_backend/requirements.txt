@@ -1,0 +1,4 @@
+Django>=5.0,<6
+requests>=2.31,<3
+# Optional: load a local .env in development.
+python-dotenv>=1.0,<2

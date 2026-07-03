@@ -36,12 +36,16 @@ telegram = [
 ]
 email = ["agentmail>=0.5,<1"]
 web = ["beautifulsoup4>=4.12,<5"]
+# TON crypto payments. The validator uses only the stdlib; this extra just adds
+# the Flask app that exposes the /validate endpoint the Django backend calls.
+payments = ["flask>=3.0,<4"]
 all = [
     "chromadb>=0.5,<2",
     "python-telegram-bot>=21.0,<23",
     "telegramify-markdown>=1.0,<2",
     "agentmail>=0.5,<1",
     "beautifulsoup4>=4.12,<5",
+    "flask>=3.0,<4",
 ]
 dev = [
     "pytest>=8,<9",

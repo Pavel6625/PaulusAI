@@ -71,6 +71,14 @@ class BasePlatformAdapter(ABC):
         """Show a typing indicator. Optional hook; no-op by default."""
         return
 
+    async def send_link_button(self, source: SessionSource, text: str,
+                               label: str, url: str) -> None:
+        """Send *text* with a tappable button that opens *url* (e.g. a pay
+        prompt). Default has no native button, so it appends the link inline;
+        adapters that support inline keyboards should override."""
+        body = f"{text}\n\n{label}: {url}" if url else text
+        await self.send(source, body)
+
     def can_approve(self, user_id) -> bool:
         """Whether this user is trusted to approve high-impact actions.
         Default: no. Adapters that set ``supports_approvals`` should override."""

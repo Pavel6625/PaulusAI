@@ -175,6 +175,58 @@ APPROVAL_TIMEOUT = int(os.environ.get("DP_APPROVAL_TIMEOUT", "300"))
 # TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USERS are read by the adapter itself.
 GATEWAY_IDLE_TIMEOUT = int(os.environ.get("DP_GATEWAY_IDLE_TIMEOUT", "3600"))
 
+# --- Payments (TON Connect) -------------------------------------------------
+# PaulusAI is a STATELESS payment validator. The Django backend owns balances
+# and transactions; when its mini app reports a payment, Django calls our
+# validate endpoint, we read the transaction from a public TON API and return
+# the on-chain facts (amount, sender, comment). Django decides the credit and
+# enforces idempotency (UNIQUE tx hash). We never write to Django and keep no
+# payment state here.
+#
+# The HTTP endpoint needs the `payments` extra (Flask); the verification logic
+# uses only the stdlib. A transaction validates only when ALL hold: it succeeded
+# on-chain, its destination is our wallet, it carries a positive value, and it
+# is not stale. The reported amount is read FROM THE CHAIN, never from the caller.
+TON_API_BASE = os.environ.get("DP_TON_API_BASE", "https://tonapi.io/v2").rstrip("/")
+TON_API_KEY = os.environ.get("DP_TON_API_KEY", "")          # optional; raises rate limits
+# Our receiving wallet. Set it in the same raw form the API returns
+# ("0:<64-hex>") for an exact match; friendly "EQ..."/"UQ..." forms are compared
+# best-effort. A native-TON payment whose destination isn't this wallet is rejected.
+TON_WALLET_ADDRESS = os.environ.get("DP_TON_WALLET_ADDRESS", "")
+# Our USD₮ jetton wallet (the jetton wallet contract that holds OUR USD₮). A
+# stablecoin payment is accepted only if its transfer-notification comes from
+# this address — that proves both "it's USD₮" and "it's to us". Leave empty to
+# accept native TON only. Set it in raw "0:<hex>" form.
+USDT_JETTON_WALLET = os.environ.get("DP_USDT_JETTON_WALLET", "")
+# Reject payments whose on-chain timestamp is older than this (seconds); guards
+# against someone replaying an ancient unrelated transaction. 0 disables.
+TON_MAX_TX_AGE = int(os.environ.get("DP_TON_MAX_TX_AGE", "3600"))
+TON_HTTP_TIMEOUT = int(os.environ.get("DP_TON_HTTP_TIMEOUT", "20"))
+# How many recent wallet transactions a memo scan (find_payment) inspects.
+TON_SCAN_LIMIT = int(os.environ.get("DP_TON_SCAN_LIMIT", "100"))
+# Shared secret the Django backend must present (Bearer) to call the validate
+# endpoint. Empty disables the check (dev only) — set it in production.
+PAYMENTS_TOKEN = os.environ.get("DP_PAYMENTS_TOKEN", "")
+
+# --- Payment gate (agent -> Django) -----------------------------------------
+# The read/spend side: the gateway checks a user's balance before answering and
+# debits usage after. Gating is INACTIVE unless both URL and token are set, so
+# the CLI and unpaid deployments are unaffected.
+#   DP_PAYMENTS_BACKEND_URL -> the Django API root, e.g. https://api.example.com/api
+#   DP_PAYMENTS_BACKEND_TOKEN -> matches the backend's INTERNAL_API_TOKEN
+PAYMENTS_BACKEND_URL = os.environ.get("DP_PAYMENTS_BACKEND_URL", "").rstrip("/")
+PAYMENTS_BACKEND_TOKEN = os.environ.get("DP_PAYMENTS_BACKEND_TOKEN", "")
+PAYMENTS_HTTP_TIMEOUT = int(os.environ.get("DP_PAYMENTS_HTTP_TIMEOUT", "15"))
+# USD charged per user interaction. 0 gates on balance but never debits.
+USAGE_COST_USD = float(os.environ.get("DP_USAGE_COST_USD", "0.02"))
+# URL the "top up" button opens (the Mini App, e.g. https://t.me/YourBot/pay).
+PAYMENTS_MINIAPP_URL = os.environ.get("DP_PAYMENTS_MINIAPP_URL", "")
+# On a backend outage: allow turns (default, fail-open) or refuse them.
+PAYMENTS_FAIL_CLOSED = (
+    os.environ.get("DP_PAYMENTS_FAIL_CLOSED", "0").strip().lower()
+    not in ("", "0", "off", "false", "no")
+)
+
 
 def ensure_dirs() -> None:
     """Create the runtime data directories. Called lazily so that merely

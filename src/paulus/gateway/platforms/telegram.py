@@ -361,6 +361,22 @@ class TelegramAdapter(BasePlatformAdapter):
         for chunk in _split(text):
             await self._send_chunk(source.chat_id, chunk, kwargs)
 
+    async def send_link_button(self, source: SessionSource, text: str,
+                               label: str, url: str) -> None:
+        """Send *text* with an inline URL button (used for the pay prompt). A
+        t.me/<bot>/<app> link opens the Mini App directly."""
+        if not self._app or not text.strip():
+            return
+        if not url:
+            await self.send(source, text)
+            return
+        kwargs: dict = {"reply_markup": InlineKeyboardMarkup(
+            [[InlineKeyboardButton(label, url=url)]])}
+        if source.thread_id:
+            kwargs["message_thread_id"] = int(source.thread_id)
+        # Keep the button attached: send as one chunk (pay prompts are short).
+        await self._send_chunk(source.chat_id, text, kwargs)
+
     async def send_document(self, source: SessionSource, filename: str,
                             content: str) -> None:
         """Deliver text ``content`` as a file attachment named ``filename``."""

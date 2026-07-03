@@ -90,6 +90,27 @@ class GatewayRunner:
         tagged = f"[via {source.platform}] {text}"
 
         adapter = self._adapters.get(source.platform)
+
+        # Balance pay-gate (opt-in): if the user can't cover this interaction,
+        # send a top-up prompt with a pay button and stop before spending model
+        # tokens. Inactive unless the payment backend is configured.
+        user_id = str(source.user_id)
+        loop = asyncio.get_running_loop()
+        from ..payments import gate as _gate
+        if _gate.enabled():
+            prompt = await loop.run_in_executor(None, lambda: _gate.precheck(user_id))
+            if prompt is not None:
+                if adapter and adapter.state == AdapterState.RUNNING:
+                    try:
+                        await adapter.send_link_button(
+                            source, prompt, "💎 Add funds",
+                            config.PAYMENTS_MINIAPP_URL)
+                        adapter._on_success()
+                    except Exception as exc:
+                        security.audit("gateway_send_error", str(exc))
+                        adapter._on_failure()
+                return
+
         # Stream (live-edit the reply as it's generated) when the adapter opts
         # in; otherwise deliver the reply in one shot once it's complete.
         sink = None
@@ -101,8 +122,6 @@ class GatewayRunner:
         error: Exception | None = None
         async with self._agent_lock:
             from .. import agent as _agent
-            loop = asyncio.get_running_loop()
-            user_id = str(source.user_id)
             on_delta = sink.feed if sink else None
             try:
                 reply = await loop.run_in_executor(
@@ -145,6 +164,9 @@ class GatewayRunner:
             except Exception as exc:
                 security.audit("gateway_send_error", str(exc))
                 adapter._on_failure()
+                return
+            if not silent:
+                await self._settle_usage(user_id, loop)
             return
 
         if silent:
@@ -156,6 +178,15 @@ class GatewayRunner:
             except Exception as exc:
                 security.audit("gateway_send_error", str(exc))
                 adapter._on_failure()
+                return
+            await self._settle_usage(user_id, loop)
+
+    async def _settle_usage(self, user_id: str, loop) -> None:
+        """Debit one interaction's usage cost after a reply is delivered.
+        Best-effort and off unless payments are configured."""
+        from ..payments import gate as _gate
+        if _gate.enabled():
+            await loop.run_in_executor(None, lambda: _gate.settle(user_id))
 
     async def handle_command(self, source: SessionSource, command: str) -> str:
         """Run an in-chat slash command and return the reply text. Mirrors the

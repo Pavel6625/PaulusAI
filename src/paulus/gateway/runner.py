@@ -5,7 +5,7 @@ import asyncio
 import concurrent.futures
 import time
 
-from .. import config, security
+from .. import billing, config, security
 from .base import SILENCE_TOKENS, AdapterState, BasePlatformAdapter, SessionSource
 from .presence import PresenceStore
 from .session_store import SessionStore
@@ -136,11 +136,23 @@ class GatewayRunner:
                     adapter._on_failure()
             return
 
-        silent = any(token in reply for token in SILENCE_TOKENS)
+        # A pay-gate block carries its top-up link inline (see billing.gate());
+        # pull it back out so it can render as a real button rather than a
+        # pasted URL. text == reply, unchanged, when no link is present.
+        text, pay_url = billing.split_pay_link(reply)
+        silent = any(token in text for token in SILENCE_TOKENS)
 
         if sink is not None:
             try:
-                await (sink.discard() if silent else sink.finalize(reply))
+                if silent:
+                    await sink.discard()
+                elif pay_url:
+                    # Nothing was streamed for a pay-gate block (it short-circuits
+                    # before the model runs), so there's no placeholder to finalize.
+                    await sink.discard()
+                    await adapter.send_with_link(source, text, billing.TOPUP_BUTTON_LABEL, pay_url)
+                else:
+                    await sink.finalize(reply)
                 adapter._on_success()
             except Exception as exc:
                 security.audit("gateway_send_error", str(exc))
@@ -151,7 +163,10 @@ class GatewayRunner:
             return
         if adapter and adapter.state == AdapterState.RUNNING:
             try:
-                await adapter.send(source, reply)
+                if pay_url:
+                    await adapter.send_with_link(source, text, billing.TOPUP_BUTTON_LABEL, pay_url)
+                else:
+                    await adapter.send(source, text)
                 adapter._on_success()
             except Exception as exc:
                 security.audit("gateway_send_error", str(exc))

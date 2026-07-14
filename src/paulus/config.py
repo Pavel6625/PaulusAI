@@ -175,6 +175,22 @@ APPROVAL_TIMEOUT = int(os.environ.get("DP_APPROVAL_TIMEOUT", "300"))
 # TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USERS are read by the adapter itself.
 GATEWAY_IDLE_TIMEOUT = int(os.environ.get("DP_GATEWAY_IDLE_TIMEOUT", "3600"))
 
+# --- Billing (usage pay gate) ------------------------------------------------
+# Optional. Balance, transactions and per-message pricing all live in an
+# external billing service, not here. When DP_BILLING_API_BASE is set, every
+# gateway user (a real user_id, e.g. from Telegram) is checked against it
+# before each LLM turn; local CLI / single-owner mode (user_id=None) is never
+# gated. Unset = the gate is a no-op.
+BILLING_API_BASE = os.environ.get("DP_BILLING_API_BASE", "").strip()
+BILLING_CHECK_PATH = os.environ.get("DP_BILLING_CHECK_PATH", "/usage/check")
+BILLING_API_KEY = os.environ.get("DP_BILLING_API_KEY", "")
+BILLING_TIMEOUT = int(os.environ.get("DP_BILLING_TIMEOUT", "10"))
+# Fallback top-up link shown (as a button, on adapters that support one) with
+# the insufficient-balance message, when the check-usage response doesn't
+# supply its own "payment_url". "{user_id}" is substituted if present, so one
+# template can deep-link straight to that user's checkout. Unset = no link.
+BILLING_TOPUP_URL = os.environ.get("DP_BILLING_TOPUP_URL", "").strip()
+
 
 def ensure_dirs() -> None:
     """Create the runtime data directories. Called lazily so that merely

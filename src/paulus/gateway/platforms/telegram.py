@@ -361,6 +361,31 @@ class TelegramAdapter(BasePlatformAdapter):
         for chunk in _split(text):
             await self._send_chunk(source.chat_id, chunk, kwargs)
 
+    async def send_with_link(self, source: SessionSource, text: str, label: str,
+                             url: str) -> None:
+        """Deliver ``text`` with a single inline URL button (e.g. a payment
+        link) beneath it, instead of pasting the raw link into the message."""
+        if not self._app:
+            return
+        text = _clip(text.strip()) or "Insufficient balance."
+        kwargs: dict = {}
+        if source.thread_id:
+            kwargs["message_thread_id"] = int(source.thread_id)
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(label, url=url)]])
+        if self._parse_mode and telegramify_markdown is not None:
+            try:
+                body = telegramify_markdown.markdownify(text)
+                await self._app.bot.send_message(
+                    chat_id=source.chat_id, text=body, parse_mode=self._parse_mode,
+                    reply_markup=keyboard, **kwargs,
+                )
+                return
+            except BadRequest as exc:
+                security.audit("telegram_markdown_fallback", str(exc))
+        await self._app.bot.send_message(
+            chat_id=source.chat_id, text=text, reply_markup=keyboard, **kwargs
+        )
+
     async def send_document(self, source: SessionSource, filename: str,
                             content: str) -> None:
         """Deliver text ``content`` as a file attachment named ``filename``."""

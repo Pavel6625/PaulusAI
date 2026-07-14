@@ -111,6 +111,11 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `TELEGRAM_TRUSTED_USERS`| (= allowed)                    | IDs allowed to **approve** high-impact actions; empty = nobody  |
 | `TELEGRAM_PARSE_MODE`   | `MarkdownV2`                   | Render replies as Markdown; `plain`/`none`/`off` for raw text   |
 | `TELEGRAM_STREAMING`    | `1`                            | Live-edit the reply as it streams; `0`/`off` for one-shot send  |
+| `DP_BILLING_API_BASE`   | (unset = disabled)             | Base URL of an external billing service; enables the usage pay gate |
+| `DP_BILLING_CHECK_PATH` | `/usage/check`                 | Path appended to `DP_BILLING_API_BASE` for the check-usage call |
+| `DP_BILLING_API_KEY`    | —                              | Sent as `Authorization: Bearer <key>` to the billing service    |
+| `DP_BILLING_TIMEOUT`    | `10`                           | Seconds to wait for the billing service before failing closed   |
+| `DP_BILLING_TOPUP_URL`  | (unset)                        | Fallback top-up link (button on Telegram) if the check response has no `payment_url` |
 
 > **Secrets never enter the repo or the model's context.** Keys are read from the
 > environment only. `.env` and `*.key` are gitignored.
@@ -273,6 +278,13 @@ The trust boundaries are deliberately small and explicit (see [src/paulus/securi
 4. **Execution is sandboxed.** File ops are confined to `workspace/`; commands
    run via the configured backend — use `docker` (network-disabled) or `ssh`
    when handling anything untrusted.
+5. **Usage is pay-gated (optional).** When `DP_BILLING_API_BASE` is set, every
+   gateway turn is checked against an external billing service first — balance,
+   transactions and per-message pricing all live there. A zero balance halts
+   the turn before it reaches the LLM and replies with a top-up link (a real
+   button on Telegram, via the response's `payment_url` or `DP_BILLING_TOPUP_URL`);
+   a billing-service outage fails **closed** (blocks) rather than granting free
+   usage. See [src/paulus/billing.py](src/paulus/billing.py).
 
 ---
 
@@ -303,6 +315,7 @@ src/paulus/
 ├── skills.py         # procedural memory
 ├── tools.py          # tool schemas + dispatch
 ├── security.py       # untrusted-data wrapping, approval gate, audit log
+├── billing.py        # usage pay gate (external balance/pricing service)
 ├── sandbox.py        # local / docker / ssh execution backends
 ├── config.py         # env-driven configuration + data-dir resolution
 └── gateway/          # Hermes-style messaging gateway (Telegram adapter)

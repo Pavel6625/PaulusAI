@@ -738,6 +738,85 @@ def test_streaming_finalizes_with_markdown(monkeypatch):
     assert "*done*" in final_text      # CommonMark bold -> MarkdownV2
 
 
+# --- Pay gate (insufficient-balance top-up button) --------------------------
+
+def test_base_adapter_send_with_link_default_appends_url():
+    """Adapters that don't override send_with_link still deliver the link,
+    just as plain text rather than a real button."""
+    sent = []
+
+    class Dummy(BasePlatformAdapter):
+        async def start(self): ...
+        async def stop(self): ...
+        async def send(self, source, text):
+            sent.append(text)
+
+    adapter = Dummy(GatewayRunner())
+    asyncio.run(adapter.send_with_link(
+        SessionSource("x", "c", "u"), "Out of balance.", "Top up", "https://pay.example.com"))
+
+    assert sent == ["Out of balance.\n\nhttps://pay.example.com"]
+
+
+def test_streaming_pay_link_renders_button_not_finalize(monkeypatch):
+    import paulus.agent as agent
+    from paulus import billing
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    reply = f"You're out of balance.{billing._PAY_LINK_MARKER}https://pay.example.com/topup"
+    # No on_delta call: a pay-gate block short-circuits before the model runs,
+    # so nothing is streamed — respond() returns the block message directly.
+    monkeypatch.setattr(
+        agent, "respond",
+        lambda text, user_id=None, on_delta=None, images=None, documents=None: reply,
+    )
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    assert len(events) == 1               # no placeholder created/deleted, one send
+    kind, text, kw = events[0]
+    assert kind == "send"
+    assert text == "You're out of balance."
+    button = kw["reply_markup"].inline_keyboard[0][0]
+    assert button.url == "https://pay.example.com/topup"
+    assert button.text == billing.TOPUP_BUTTON_LABEL
+
+
+def test_non_streaming_pay_link_renders_button(monkeypatch):
+    import paulus.agent as agent
+    from paulus import billing
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+    adapter.supports_streaming = False    # exercise the one-shot delivery path
+
+    reply = f"You're out of balance.{billing._PAY_LINK_MARKER}https://pay.example.com/topup"
+    monkeypatch.setattr(
+        agent, "respond",
+        lambda text, user_id=None, on_delta=None, images=None, documents=None: reply,
+    )
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    assert len(events) == 1
+    kind, text, kw = events[0]
+    assert kind == "send"
+    assert text == "You're out of balance."
+    button = kw["reply_markup"].inline_keyboard[0][0]
+    assert button.url == "https://pay.example.com/topup"
+
+
+def test_pay_link_falls_back_to_plain_send_when_no_url(monkeypatch):
+    """A normal (non-billing) reply is untouched by the pay-link plumbing."""
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+    adapter.supports_streaming = False
+
+    import paulus.agent as agent
+    monkeypatch.setattr(
+        agent, "respond",
+        lambda text, user_id=None, on_delta=None, images=None, documents=None: "just a reply",
+    )
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    assert events == [("send", "just a reply", {})]
+
+
 # --- Documents -------------------------------------------------------------
 
 def _document_update(content, *, file_name="notes.txt", file_size=None,

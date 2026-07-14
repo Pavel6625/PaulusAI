@@ -67,6 +67,13 @@ class BasePlatformAdapter(ABC):
     async def send(self, source: SessionSource, text: str) -> None:
         """Deliver a text message back to the given conversation."""
 
+    async def send_with_link(self, source: SessionSource, text: str, label: str,
+                             url: str) -> None:
+        """Deliver ``text`` with ``url`` attached (e.g. a payment link). Default:
+        append the raw URL and send as a normal message. Adapters that offer a
+        real button (e.g. a Telegram inline keyboard) should override this."""
+        await self.send(source, f"{text}\n\n{url}" if text.strip() else url)
+
     async def send_typing(self, source: SessionSource) -> None:  # noqa: B027
         """Show a typing indicator. Optional hook; no-op by default."""
         return

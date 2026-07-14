@@ -5,7 +5,7 @@ between the model's decision and any real-world effect.
 import json
 import os
 
-from . import affect, llm, memory, security, skills, tools
+from . import affect, billing, llm, memory, security, skills, tools
 
 SYSTEM_TEMPLATE = """You are a persistent digital companion for a single owner.
 You have long-term memory, learned skills, and a current mood. Be warm, concise,
@@ -166,6 +166,13 @@ def _ingest_documents(owner_text, documents, user_id=None):
 
 
 def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None):
+    # --- PAY GATE ---------------------------------------------------------
+    # Checked before anything else: an exhausted balance halts the turn
+    # before it ever reaches the LLM, or touches memory/the sandbox.
+    allowed, block_message = billing.gate(user_id)
+    if not allowed:
+        return block_message
+
     owner_text = _ingest_documents(owner_text, documents, user_id)
     memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
 
@@ -208,6 +215,12 @@ def proactive_check(user_id=None):
     """Idle-triggered turn: let the model decide whether to reach out. Returns a
     message to deliver, or a silence sentinel the caller swallows. The seed
     prompt is never persisted; only a real outgoing message is logged."""
+    allowed, _block_message = billing.gate(user_id)
+    if not allowed:
+        # Out of balance: stay quiet rather than proactively nagging the user
+        # about it, and don't spend an LLM call to decide that.
+        return _SILENCE_TOKENS[0]
+
     system = _build_system(user_id)
     messages = _history_to_messages(user_id)
     messages.append({"role": "user", "content": PROACTIVE_NUDGE})

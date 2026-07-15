@@ -1,6 +1,8 @@
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from paulus import llm
 
 
@@ -50,6 +52,47 @@ def test_to_openai_messages_text_only_stays_a_string():
         [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
     )
     assert out[0] == {"role": "user", "content": "hi"}
+
+
+def test_loads_json_accepts_plain_json():
+    assert llm.loads_json('{"facts": ["a"]}') == {"facts": ["a"]}
+    assert llm.loads_json("[1, 2]") == [1, 2]
+
+
+@pytest.mark.parametrize("raw", [
+    '```json\n{"facts": ["a"]}\n```',            # fenced, tagged
+    '```\n{"facts": ["a"]}\n```',                # fenced, bare
+    'Here is the JSON:\n{"facts": ["a"]}',       # prose preamble
+    '{"facts": ["a"]}\nHope that helps!',        # trailing commentary
+    '  {"facts": ["a"]}  ',                      # surrounding whitespace
+])
+def test_loads_json_recovers_what_models_actually_emit(raw):
+    # Each of these makes strict json.loads raise, and each is a thing a model
+    # does when asked for strict JSON.
+    assert llm.loads_json(raw) == {"facts": ["a"]}
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "no json here at all", "{not json"])
+def test_loads_json_raises_when_there_is_nothing_to_parse(raw):
+    with pytest.raises(ValueError):
+        llm.loads_json(raw)
+
+
+def test_loads_json_error_does_not_dump_the_whole_reply():
+    with pytest.raises(ValueError) as exc:
+        llm.loads_json("x" * 5000)
+    assert len(str(exc.value)) < 300
+
+
+def test_tool_args_recover_from_fences_and_trailing_data():
+    assert llm._loads_tool_args('{"query": "x"}') == {"query": "x"}
+    assert llm._loads_tool_args('{"query": "x"}{"stray": 1}') == {"query": "x"}
+    assert llm._loads_tool_args('```json\n{"query": "x"}\n```') == {"query": "x"}
+
+
+def test_tool_args_fall_back_to_empty_rather_than_crashing_the_turn():
+    assert llm._loads_tool_args("") == {}
+    assert llm._loads_tool_args("total nonsense") == {}
 
 
 def _capture_completion(monkeypatch, response=None):

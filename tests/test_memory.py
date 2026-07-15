@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from paulus import config, memory, vectorstore
 
 
@@ -153,3 +157,68 @@ def test_trim_disabled_when_cap_zero(monkeypatch):
         memory.log_episode("owner", f"x{i}")
     lines = config.EPISODIC_LOG.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 120
+
+
+# --- the fact-is-a-string invariant ----------------------------------------
+# Every reader assumes it and none check, so a violation used to raise
+# AttributeError out of _keyword_search — which runs on every turn.
+
+@pytest.mark.parametrize("bad", [
+    {"fact": "nested"},          # what a model emits when told facts are objects
+    ["a list"],
+    42,
+    None,
+    "",
+    "   ",
+])
+def test_add_fact_rejects_anything_that_is_not_a_real_string(bad):
+    with pytest.raises(ValueError):
+        memory.add_fact(bad)
+
+
+def test_add_fact_rejection_stores_nothing():
+    with pytest.raises(ValueError):
+        memory.add_fact({"fact": "nested"})
+    assert memory._load_facts() == []
+
+
+def _write_facts(records, user_id=None):
+    path = memory._facts_file(user_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(records), encoding="utf-8")
+
+
+def test_poisoned_records_are_quarantined_on_read():
+    # Data written before add_fact validated; the good record must survive.
+    _write_facts([
+        {"id": "1", "fact": {"fact": "nested"}, "salience": 1.0},
+        {"id": "2", "fact": "a real fact", "salience": 1.0},
+        {"id": "3", "fact": "", "salience": 1.0},
+    ])
+    assert [f["fact"] for f in memory._load_facts()] == ["a real fact"]
+
+
+def test_search_survives_a_poisoned_facts_file():
+    # The regression: one bad record used to make every search_facts call raise,
+    # and _build_system calls it on every turn.
+    _write_facts([
+        {"id": "1", "fact": {"fact": "nested"}, "salience": 1.0},
+        {"id": "2", "fact": "the owner likes coffee", "salience": 1.0},
+    ])
+    hits = memory.search_facts("coffee")
+    assert [h["fact"] for h in hits] == ["the owner likes coffee"]
+
+
+def test_quarantine_survives_a_facts_file_that_is_not_a_list():
+    _write_facts({"not": "a list"})
+    assert memory._load_facts() == []
+
+
+def test_next_save_persists_the_cleaned_list():
+    _write_facts([
+        {"id": "1", "fact": {"fact": "nested"}, "salience": 1.0},
+        {"id": "2", "fact": "keep me", "salience": 1.0},
+    ])
+    memory.add_fact("a new fact")     # any mutation rewrites the file
+    on_disk = json.loads(memory._facts_file().read_text(encoding="utf-8"))
+    assert sorted(f["fact"] for f in on_disk) == ["a new fact", "keep me"]

@@ -2,7 +2,6 @@
 -> persist, with the tool-use loop handled manually so the safety gate sits
 between the model's decision and any real-world effect.
 """
-import json
 import os
 
 from . import affect, billing, config, llm, memory, router, security, skills, tools
@@ -278,10 +277,52 @@ def proactive_check(user_id=None):
     return text
 
 
+_SKILL_KEYS = ("name", "when_to_use", "steps")
+
+
+def _store_consolidation(data, user_id):
+    """Store the facts and skills from a parsed consolidation reply.
+
+    Each entry is stored independently: a single malformed one used to abort the
+    loop, silently discarding every valid entry after it while still reporting
+    the ones before it as a success. Returns (facts_n, skills_n, dropped).
+    """
+    facts_n = skills_n = dropped = 0
+
+    for f in data.get("facts") or []:
+        try:
+            memory.add_fact(f, confidence=0.6, provenance=["consolidation"],
+                            user_id=user_id)
+            facts_n += 1
+        except Exception as exc:
+            dropped += 1
+            security.audit("consolidation_bad_fact", f"{user_id}: {exc}")
+
+    for s in data.get("skills") or []:
+        if not isinstance(s, dict) or not all(
+                isinstance(s.get(k), str) and s[k].strip() for k in _SKILL_KEYS):
+            dropped += 1
+            security.audit("consolidation_bad_skill", f"{user_id}: {s!r:.200}")
+            continue
+        try:
+            skills.add_skill(s["name"], s["when_to_use"], s["steps"],
+                             status="unverified", source="consolidation")
+            skills_n += 1
+        except Exception as exc:
+            dropped += 1
+            security.audit("consolidation_bad_skill", f"{user_id}: {exc}")
+
+    return facts_n, skills_n, dropped
+
+
 def sleep(user_id=None):
     """Consolidation / 'subconscious' loop: distil durable facts AND propose
     reusable skills from recent episodes, then decay. Proposed skills are stored
-    as 'unverified' (reflection-review gate)."""
+    as 'unverified' (reflection-review gate).
+
+    Decay and routing feedback run whatever the model returned; only the storing
+    depends on a usable reply. The returned summary distinguishes an empty
+    consolidation from a failed one — they used to read identically."""
     episodes = memory.recent_episodes(20, user_id=user_id)
     if not episodes:
         return "Nothing to consolidate yet."
@@ -293,30 +334,37 @@ def sleep(user_id=None):
         '"steps": "..."}]}. Include at most 5 durable owner-specific facts and '
         "at most 2 reusable procedures actually demonstrated. Use [] when none."
     )
-    # Pinned, not routed: this is an internal job whose only hard requirement is
-    # parseable JSON (a failure here is swallowed below and silently consolidates
-    # nothing), and it has no user waiting on it.
+    # Pinned, not routed: an internal job with no user waiting on it, whose only
+    # hard requirement is JSON this can parse.
     resp = llm.complete(system, [{"role": "user", "content": transcript}],
                         model=config.utility_model())
     text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    facts_n = skills_n = 0
+
+    problem = None
+    facts_n = skills_n = dropped = 0
     try:
-        data = json.loads(text)
-        for f in data.get("facts", []):
-            memory.add_fact(f, confidence=0.6, provenance=["consolidation"],
-                            user_id=user_id)
-            facts_n += 1
-        for s in data.get("skills", []):
-            skills.add_skill(s["name"], s["when_to_use"], s["steps"],
-                             status="unverified", source="consolidation")
-            skills_n += 1
-    except Exception:
-        pass
-    # Outside the try above on purpose: routing feedback is mechanical (no model
-    # call, nothing to parse), so a model that returns unparseable JSON must not
-    # take the router's learning down with it.
+        data = llm.loads_json(text)
+    except ValueError as exc:
+        problem = str(exc)
+    else:
+        if isinstance(data, dict):
+            facts_n, skills_n, dropped = _store_consolidation(data, user_id)
+        else:
+            problem = f"expected a JSON object, got {type(data).__name__}"
+    if problem:
+        security.audit("consolidation_parse_error", f"{user_id}: {problem}")
+
+    # Outside the parse above on purpose: routing feedback is mechanical (no
+    # model call, nothing to parse), so a model that returns unparseable JSON
+    # must not take the router's learning down with it.
     routed = router.learn(user_id=user_id)
     forgotten = memory.decay(user_id=user_id)
+
+    if problem:
+        head = "Consolidation failed: the model's reply wasn't usable JSON"
+    else:
+        head = f"Consolidated {facts_n} fact(s), proposed {skills_n} skill(s)"
+        if dropped:
+            head += f", dropped {dropped} malformed"
     learned_note = f" Routing learned {routed} example(s)." if routed else ""
-    return (f"Consolidated {facts_n} fact(s), proposed {skills_n} skill(s); "
-            f"memory decayed ({forgotten} forgotten).{learned_note}")
+    return f"{head}; memory decayed ({forgotten} forgotten).{learned_note}"

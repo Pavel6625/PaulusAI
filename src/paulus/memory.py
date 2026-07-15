@@ -22,7 +22,7 @@ import re
 import uuid
 from pathlib import Path
 
-from . import config, llm, vectorstore
+from . import config, llm, security, vectorstore
 
 
 def _safe_uid(user_id: str) -> str:
@@ -124,9 +124,30 @@ def recent_episodes(n=None, user_id=None):
 
 def _load_facts(user_id=None):
     path = _facts_file(user_id)
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return []
+    if not path.exists():
+        return []
+    return _quarantine(json.loads(path.read_text(encoding="utf-8")), user_id)
+
+
+def _quarantine(records, user_id):
+    """Drop stored records that break the fact-is-a-non-empty-string invariant.
+
+    add_fact enforces that on write, so this only ever fires on data written
+    before it did. It belongs here rather than in each reader because a single
+    malformed record raised out of _keyword_search — reached from _build_system
+    on every turn — leaving the agent unable to reply to that user at all until
+    the file was hand-edited. Reading past it is what lets such an install heal
+    itself; the next save then persists the cleaned list."""
+    if not isinstance(records, list):
+        security.audit("facts_quarantined",
+                       f"{user_id}: facts file is not a list, ignoring it")
+        return []
+    good = [r for r in records
+            if isinstance(r, dict) and isinstance(r.get("fact"), str) and r["fact"].strip()]
+    if len(good) != len(records):
+        security.audit("facts_quarantined",
+                       f"{user_id}: dropped {len(records) - len(good)} malformed record(s)")
+    return good
 
 
 def semantic_text(user_id=None) -> str:
@@ -254,6 +275,14 @@ def _reconcile(new_fact, facts, confidence, provenance, user_id):
 
 
 def add_fact(fact, confidence=0.7, provenance=None, user_id=None):
+    # Every reader assumes a fact's text is a non-empty string, and none of them
+    # check. Enforce it at the only door in: a stored non-string used to raise
+    # AttributeError out of _keyword_search, which runs on every turn, so one
+    # bad write stopped the agent replying to that user entirely. Raising is
+    # right for both callers — tools.execute turns it into a tool error the
+    # model can retry, and consolidation counts it as a dropped entry.
+    if not isinstance(fact, str) or not fact.strip():
+        raise ValueError(f"a fact must be a non-empty string, got {type(fact).__name__}")
     facts = _load_facts(user_id)
     # 1. Exact (normalized) duplicate -> reinforce. Cheap; no model call.
     for f in facts:

@@ -22,6 +22,7 @@ agent.py is unaware of the provider — it always sees Anthropic-shaped
 response objects. All format conversion lives here.
 """
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -157,30 +158,69 @@ def _to_openai_messages(messages):
     return out
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S | re.I)
+
+
+def loads_json(raw):
+    """Parse the JSON value a model *meant* to emit.
+
+    Asked for strict JSON, models reliably do three things anyway: wrap the
+    value in a markdown fence, introduce it with prose, and append commentary
+    after it. All three make ``json.loads`` raise, so recover from each —
+    strip the fence, skip to the first opening brace/bracket, and decode only
+    the leading value.
+
+    Raises ValueError when no JSON value can be found at all. Lives here
+    because parsing what a model actually said is this module's job, and every
+    caller that asks one for JSON hits the same three failures."""
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty response")
+    fenced = _FENCE_RE.search(text)
+    if fenced:
+        text = fenced.group(1).strip()
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    if not starts:
+        raise ValueError(f"no JSON object or array in {_excerpt(raw)}")
+    try:
+        # raw_decode stops at the end of the first value, ignoring any trailing
+        # commentary rather than failing on it.
+        value, _end = json.JSONDecoder().raw_decode(text[min(starts):])
+    except json.JSONDecodeError as e:
+        raise ValueError(f"unparseable JSON in {_excerpt(raw)}: {e}") from e
+    return value
+
+
+def _excerpt(raw, limit=120):
+    text = (raw or "").strip().replace("\n", " ")
+    return repr(text if len(text) <= limit else text[:limit] + "...")
+
+
 def _loads_tool_args(raw):
-    """Parse a tool call's JSON arguments, tolerating a provider that appends
-    trailing data after a valid object.
+    """Parse a tool call's JSON arguments, tolerating a provider that wraps or
+    pads them.
 
     Some models (observed with ollama_chat cloud) occasionally emit a valid
     arguments object followed by stray content (e.g. a second object or prose),
     which makes strict ``json.loads`` raise ``Extra data`` and crash the turn.
-    Recover the first complete JSON object and ignore the rest; only a string
-    with no leading JSON object at all falls back to ``{}``."""
+    Recovery is shared with loads_json; only a string with no JSON value in it
+    at all falls back to ``{}``, since a turn is better off with an empty
+    argument set than a crash."""
     raw = (raw or "").strip()
     if not raw:
         return {}
     try:
-        return json.loads(raw)
+        return json.loads(raw)          # the common case: exactly as asked
     except json.JSONDecodeError:
-        try:
-            obj, _end = json.JSONDecoder().raw_decode(raw)
-        except json.JSONDecodeError:
-            print(f"[llm] unparseable tool arguments, ignoring: {raw!r}",
-                  file=sys.stderr)
-            return {}
-        print(f"[llm] recovered tool arguments with trailing data: {raw!r}",
+        pass
+    try:
+        obj = loads_json(raw)
+    except ValueError:
+        print(f"[llm] unparseable tool arguments, ignoring: {raw!r}",
               file=sys.stderr)
-        return obj
+        return {}
+    print(f"[llm] recovered malformed tool arguments: {raw!r}", file=sys.stderr)
+    return obj
 
 
 # ---------------------------------------------------------------------------

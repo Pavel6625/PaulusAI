@@ -3,14 +3,20 @@
 Uses LiteLLM for dynamic provider switching. Set DP_CORE_MODEL to any
 LiteLLM model string:
 
-  anthropic/claude-sonnet-4-6   (default)
+  anthropic/claude-sonnet-4-6              (default)
   openai/gpt-4o
   gemini/gemini-1.5-pro
-  ollama_chat/llama3             (no key needed)
-  openrouter/openai/gpt-4o
+  openrouter/anthropic/claude-sonnet-4-6   (one key reaches many models)
+  ollama_chat/llama3                       (no key needed)
 
 The corresponding API key env var must be set (ANTHROPIC_API_KEY,
-OPENAI_API_KEY, GEMINI_API_KEY, etc.). Ollama needs no key.
+OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, etc.); LiteLLM reads it
+from the environment itself. Ollama needs no key. DP_API_BASE/DP_API_KEY
+override the endpoint for the core model only — see config.model_credentials.
+
+Every entry point takes an optional ``model=`` to override the core model for
+that call, so a caller can pick a model per turn (e.g. routing) without any
+global state; omitting it keeps the configured core model.
 
 agent.py is unaware of the provider — it always sees Anthropic-shaped
 response objects. All format conversion lives here.
@@ -210,8 +216,8 @@ def _normalize(response):
 # Public API
 # ---------------------------------------------------------------------------
 
-def supports_vision():
-    """Whether the configured core model can accept image input.
+def supports_vision(model=None):
+    """Whether *model* (default: the core model) can accept image input.
 
     Used by the gateway to refuse an image up front, but only when the model
     *definitively* can't see. LiteLLM's vision metadata lags new multimodal
@@ -220,39 +226,44 @@ def supports_vision():
     attempted — a genuinely blind one then fails at call time and the gateway
     reports it gracefully. Only an explicit ``supports_vision: False`` blocks."""
     try:
-        info = litellm.get_model_info(model=config.CORE_MODEL)
+        info = litellm.get_model_info(model=model or config.CORE_MODEL)
     except Exception:
         return True                       # not in LiteLLM's map — don't block
     return info.get("supports_vision") is not False
 
 
-def complete(system, messages, tools=None):
-    """One non-streaming turn. Returns an Anthropic-shaped _Response."""
+def complete(system, messages, tools=None, model=None):
+    """One non-streaming turn. Returns an Anthropic-shaped _Response.
+
+    *model* overrides the configured core model for this call only; its
+    credentials are resolved per-model (see config.model_credentials)."""
+    model = model or config.CORE_MODEL
     oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
     return _normalize(litellm.completion(
-        model=config.CORE_MODEL,
+        model=model,
         max_tokens=config.MAX_TOKENS,
         messages=oai_messages,
         tools=_to_litellm_tools(tools) if tools else None,
-        api_base=config.API_BASE or None,
-        api_key=config.API_KEY or None,
+        **config.model_credentials(model),
     ))
 
 
-def stream(system, messages, tools=None, on_delta=None):
+def stream(system, messages, tools=None, on_delta=None, model=None):
     """One streaming turn. Forwards each text delta to ``on_delta(piece)`` as it
     arrives, then returns the same Anthropic-shaped _Response as complete() so
     the caller's tool loop is otherwise unchanged. Tool-call fragments are
-    reassembled across chunks before the response is built."""
+    reassembled across chunks before the response is built.
+
+    *model* overrides the configured core model for this call only."""
+    model = model or config.CORE_MODEL
     oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
     chunks = litellm.completion(
-        model=config.CORE_MODEL,
+        model=model,
         max_tokens=config.MAX_TOKENS,
         messages=oai_messages,
         tools=_to_litellm_tools(tools) if tools else None,
-        api_base=config.API_BASE or None,
-        api_key=config.API_KEY or None,
         stream=True,
+        **config.model_credentials(model),
     )
 
     text_parts: list[str] = []

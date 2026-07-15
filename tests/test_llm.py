@@ -52,6 +52,81 @@ def test_to_openai_messages_text_only_stays_a_string():
     assert out[0] == {"role": "user", "content": "hi"}
 
 
+def _capture_completion(monkeypatch, response=None):
+    """Patch litellm.completion and record the kwargs it was called with."""
+    seen = {}
+
+    def fake_completion(**kwargs):
+        seen.update(kwargs)
+        return response or SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content="ok", tool_calls=None),
+        )])
+
+    monkeypatch.setattr(llm.litellm, "completion", fake_completion)
+    return seen
+
+
+def test_complete_defaults_to_core_model_with_its_credentials(monkeypatch):
+    monkeypatch.setattr(llm.config, "CORE_MODEL", "anthropic/claude-sonnet-4-6")
+    monkeypatch.setattr(llm.config, "API_BASE", "https://proxy.example/v1")
+    monkeypatch.setattr(llm.config, "API_KEY", "core-secret")
+    seen = _capture_completion(monkeypatch)
+
+    llm.complete("sys", [{"role": "user", "content": "hi"}])
+
+    assert seen["model"] == "anthropic/claude-sonnet-4-6"
+    assert seen["api_base"] == "https://proxy.example/v1"
+    assert seen["api_key"] == "core-secret"
+
+
+def test_complete_with_explicit_model_does_not_get_core_credentials(monkeypatch):
+    monkeypatch.setattr(llm.config, "CORE_MODEL", "ollama_chat/gemma4:31b-cloud")
+    monkeypatch.setattr(llm.config, "API_BASE", "https://ollama.example/v1")
+    monkeypatch.setattr(llm.config, "API_KEY", "ollama-secret")
+    seen = _capture_completion(monkeypatch)
+
+    llm.complete("sys", [{"role": "user", "content": "hi"}],
+                 model="openrouter/openai/gpt-4o")
+
+    assert seen["model"] == "openrouter/openai/gpt-4o"
+    assert seen["api_base"] is None
+    assert seen["api_key"] is None
+
+
+def test_stream_honours_explicit_model(monkeypatch):
+    monkeypatch.setattr(llm.config, "CORE_MODEL", "anthropic/claude-sonnet-4-6")
+    monkeypatch.setattr(llm.config, "API_BASE", None)
+    monkeypatch.setattr(llm.config, "API_KEY", None)
+    chunk = SimpleNamespace(choices=[SimpleNamespace(
+        finish_reason="stop",
+        delta=SimpleNamespace(content="hello", tool_calls=None),
+    )])
+    seen = _capture_completion(monkeypatch, response=[chunk])
+
+    pieces = []
+    resp = llm.stream("sys", [{"role": "user", "content": "hi"}],
+                      on_delta=pieces.append, model="openrouter/openai/gpt-4o")
+
+    assert seen["model"] == "openrouter/openai/gpt-4o"
+    assert seen["stream"] is True
+    assert pieces == ["hello"]
+    assert resp.content[0].text == "hello"
+
+
+def test_supports_vision_checks_the_given_model(monkeypatch):
+    monkeypatch.setattr(llm.config, "CORE_MODEL", "text-only/model")
+    asked = []
+
+    def fake_info(model):
+        asked.append(model)
+        return {"supports_vision": True}
+
+    monkeypatch.setattr(llm.litellm, "get_model_info", fake_info)
+    assert llm.supports_vision("openrouter/openai/gpt-4o") is True
+    assert asked == ["openrouter/openai/gpt-4o"]
+
+
 def test_supports_vision_blocks_only_explicit_false(monkeypatch):
     # Catalogued as non-vision -> block.
     monkeypatch.setattr(llm.litellm, "get_model_info",

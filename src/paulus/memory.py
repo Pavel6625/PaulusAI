@@ -208,7 +208,10 @@ def _llm_reconcile(new_fact, candidates):
         'duplicate/contradiction, otherwise null.'
     )
     user = f"NEW fact:\n{new_fact}\n\nEXISTING facts:\n{numbered}"
-    resp = llm.complete(system, [{"role": "user", "content": user}])
+    # Pinned to the utility model, not routed: an internal strict-JSON job with
+    # no user waiting on it (see config.utility_model).
+    resp = llm.complete(system, [{"role": "user", "content": user}],
+                        model=config.utility_model())
     text = "".join(b.text for b in resp.content if b.type == "text").strip()
     return json.loads(text)
 

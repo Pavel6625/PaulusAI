@@ -5,7 +5,7 @@ between the model's decision and any real-world effect.
 import json
 import os
 
-from . import affect, billing, llm, memory, security, skills, tools
+from . import affect, billing, config, llm, memory, router, security, skills, tools
 
 SYSTEM_TEMPLATE = """You are a persistent digital companion for a single owner.
 You have long-term memory, learned skills, and a current mood. Be warm, concise,
@@ -35,6 +35,19 @@ Relevant long-term memory:
 Possibly relevant skills:
 {skill_list}
 """
+
+
+# Phrases that say the ANSWER was wrong, as opposed to affect's broader mood
+# scan below. They must be separate: affect matches a bare "bad", so "i had a
+# bad day at work" reads as frustration — harmless for a mood, but as a routing
+# label it would blame the previous turn and drag small talk up a tier.
+_COMPLAINT_PHRASES = (
+    "that's wrong", "thats wrong", "you're wrong", "youre wrong",
+    "that's not right", "thats not right", "that's incorrect",
+    "not what i asked", "not what i meant", "you misunderstood",
+    "you didn't understand", "you didnt understand", "makes no sense",
+    "that's useless", "wrong answer",
+)
 
 
 def _context_query(user_id=None):
@@ -71,18 +84,28 @@ def _blocks_to_dicts(content):
     return out
 
 
-def _run_tool_loop(system, messages, user_id=None, on_delta=None):
+def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
+                   tools_used=None):
     """Drive the model<->tool exchange, with the safety gate between the
     model's decision and any real-world effect. Returns the final text.
 
+    *tools_used*, when given, is filled with the names of the tools the model
+    actually ran — the router uses it as objective evidence of how much the
+    turn really needed.
+
     When ``on_delta`` is given, each turn is streamed and text fragments are
     forwarded to it as they arrive (the gateway uses this to live-edit the
-    outgoing message); the safety gate is unchanged."""
+    outgoing message); the safety gate is unchanged.
+
+    *model* is fixed for the whole loop: it is chosen once per turn, so a tool
+    exchange is never handed mid-flight to a different model than the one that
+    started it."""
     while True:
         if on_delta is not None:
-            resp = llm.stream(system, messages, tools=tools.TOOL_SPECS, on_delta=on_delta)
+            resp = llm.stream(system, messages, tools=tools.TOOL_SPECS,
+                              on_delta=on_delta, model=model)
         else:
-            resp = llm.complete(system, messages, tools=tools.TOOL_SPECS)
+            resp = llm.complete(system, messages, tools=tools.TOOL_SPECS, model=model)
         messages.append({"role": "assistant", "content": _blocks_to_dicts(resp.content)})
 
         if resp.stop_reason != "tool_use":
@@ -109,6 +132,9 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None):
                     continue
 
             result, is_error = tools.execute(b.name, b.input, user_id=user_id)
+            if tools_used is not None:
+                tools_used.append(b.name)   # ran (error or not); a declined
+                                            # action never reached the world
             affect.feel("task_error" if is_error else "task_success")
             if b.name in ("remember", "save_skill") and not is_error:
                 affect.feel("new_learning")
@@ -173,6 +199,21 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     if not allowed:
         return block_message
 
+    # A complaint is about the reply the owner just read, so it labels the
+    # PREVIOUS turn's routing decision. Recorded before this turn is routed,
+    # while _last_turn still points at the one being complained about.
+    if any(p in owner_text.lower() for p in _COMPLAINT_PHRASES):
+        router.log_complaint(user_id=user_id)
+
+    # Route on what the owner actually wrote, BEFORE documents are folded in:
+    # their content is untrusted, and letting it steer model selection would
+    # hand an attacker a lever on spend. That a document is present is signal
+    # enough, and is passed separately.
+    model, tier, reason = router.route(owner_text, user_id=user_id,
+                                       has_images=bool(images),
+                                       has_documents=bool(documents))
+    turn_id = router.log_decision(owner_text, tier, reason, user_id=user_id)
+
     owner_text = _ingest_documents(owner_text, documents, user_id)
     memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
 
@@ -185,7 +226,10 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     system = _build_system(user_id)
     messages = _history_to_messages(user_id)
     _attach_images(messages, images)
-    final_text = _run_tool_loop(system, messages, user_id, on_delta=on_delta)
+    tools_used = []
+    final_text = _run_tool_loop(system, messages, user_id, on_delta=on_delta,
+                                model=model, tools_used=tools_used)
+    router.log_outcome(turn_id, tools_used, user_id=user_id)
 
     memory.log_episode("agent", final_text, trust="trusted", user_id=user_id)
     affect.decay()
@@ -249,7 +293,11 @@ def sleep(user_id=None):
         '"steps": "..."}]}. Include at most 5 durable owner-specific facts and '
         "at most 2 reusable procedures actually demonstrated. Use [] when none."
     )
-    resp = llm.complete(system, [{"role": "user", "content": transcript}])
+    # Pinned, not routed: this is an internal job whose only hard requirement is
+    # parseable JSON (a failure here is swallowed below and silently consolidates
+    # nothing), and it has no user waiting on it.
+    resp = llm.complete(system, [{"role": "user", "content": transcript}],
+                        model=config.utility_model())
     text = "".join(b.text for b in resp.content if b.type == "text").strip()
     facts_n = skills_n = 0
     try:
@@ -264,6 +312,11 @@ def sleep(user_id=None):
             skills_n += 1
     except Exception:
         pass
+    # Outside the try above on purpose: routing feedback is mechanical (no model
+    # call, nothing to parse), so a model that returns unparseable JSON must not
+    # take the router's learning down with it.
+    routed = router.learn(user_id=user_id)
     forgotten = memory.decay(user_id=user_id)
+    learned_note = f" Routing learned {routed} example(s)." if routed else ""
     return (f"Consolidated {facts_n} fact(s), proposed {skills_n} skill(s); "
-            f"memory decayed ({forgotten} forgotten).")
+            f"memory decayed ({forgotten} forgotten).{learned_note}")

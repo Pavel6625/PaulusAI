@@ -99,8 +99,13 @@ Key settings (see [.env.example](.env.example) for the full list):
 
 | Variable                | Default                        | Purpose                                                        |
 |-------------------------|--------------------------------|----------------------------------------------------------------|
-| `DP_CORE_MODEL`         | `anthropic/claude-sonnet-4-6`  | Any LiteLLM model string                                       |
-| `ANTHROPIC_API_KEY`     | —                              | Provider key (use the one matching your model)                 |
+| `DP_CORE_MODEL`         | `anthropic/claude-sonnet-4-6`  | Any LiteLLM model string, e.g. `openrouter/anthropic/claude-sonnet-4-6` |
+| `ANTHROPIC_API_KEY`     | —                              | Provider key (use the one matching your model; `OPENROUTER_API_KEY` for any `openrouter/*` model) |
+| `DP_ROUTING`            | `off`                          | `semantic` enables per-turn model routing (`off` pins every turn to `DP_CORE_MODEL`) |
+| `DP_MID_MODEL`          | (unset = collapses to core)    | Middle tier, used when a turn needs more than the floor  |
+| `DP_TOP_MODEL`          | (unset = collapses to mid)     | Top tier, for code/debugging and hard reasoning          |
+| `DP_UTILITY_MODEL`      | (unset = `DP_CORE_MODEL`)      | Pinned model for internal strict-JSON jobs (consolidation, fact reconciliation) |
+| `DP_ROUTE_LEARNING`     | `0`                            | Let consolidation promote the phrasings behind under-routes (inspect `/routes` first) |
 | `DP_DATA_DIR`           | `~/.local/share/paulus`        | Where memory, audit log, vector index, workspace are written   |
 | `DP_SANDBOX`            | `local`                        | `local` \| `docker` \| `ssh`                                   |
 | `DP_UNATTENDED_POLICY`  | `deny`                         | High-impact action when nobody is reachable to approve         |
@@ -145,6 +150,8 @@ In-chat commands:
 | `/mood`   | Show the current mood (PAD + last emotion)                    |
 | `/memory` | Print the human-readable semantic memory                      |
 | `/skills` | List learned skills and their status                          |
+| `/route X`| Show which model tier the text `X` routes to, and why (tuning) |
+| `/routes` | Show recent routing decisions, their outcomes, and what was learned |
 | `/quit`   | Consolidate and exit                                          |
 
 When the agent proposes a **high-impact action** (writing a file, running a

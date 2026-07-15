@@ -10,13 +10,14 @@ Environment:
 import asyncio
 import os
 
-from . import config, vectorstore
+from . import config, router, vectorstore
 from .gateway.runner import GatewayRunner
 
 
 async def _main() -> None:
     config.ensure_dirs()
     vectorstore.init()
+    router.init()   # no-op unless DP_ROUTING is enabled
 
     runner = GatewayRunner()
 

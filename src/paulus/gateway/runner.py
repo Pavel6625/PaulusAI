@@ -123,9 +123,10 @@ class GatewayRunner:
                 except Exception:
                     pass
             note = (
-                "Sorry — I couldn't process that image. The current model may "
-                "not be vision-capable; set DP_CORE_MODEL to one that supports "
-                "images." if images else
+                "Sorry — I couldn't process that image. The model it was sent "
+                "to may not be vision-capable; set DP_CORE_MODEL (or "
+                "DP_MID_MODEL / DP_TOP_MODEL) to one that supports images."
+                if images else
                 "Sorry — something went wrong handling that. Please try again."
             )
             if adapter and adapter.state == AdapterState.RUNNING:

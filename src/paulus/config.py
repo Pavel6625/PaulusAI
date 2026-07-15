@@ -138,7 +138,7 @@ def user_workspace(user_id=None) -> Path:
     return WORKSPACE_DIR / "users" / safe_uid(user_id)
 
 # --- Memory tuning ----------------------------------------------------------
-RECENT_EPISODES = 8
+RECENT_EPISODES = 12
 TOP_FACTS = 6
 DECAY_PER_SLEEP = 0.9
 # Facts whose salience decays below this are forgotten (dropped from facts.json

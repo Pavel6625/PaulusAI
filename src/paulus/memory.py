@@ -234,7 +234,13 @@ def _llm_reconcile(new_fact, candidates):
     resp = llm.complete(system, [{"role": "user", "content": user}],
                         model=config.utility_model())
     text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    return json.loads(text)
+    # Lenient, like every other place we ask a model for JSON: strict json.loads
+    # here failed on 100% of production calls (all "Expecting value: line 1
+    # column 1", i.e. something before the JSON), and _reconcile swallows the
+    # failure by storing the fact as new — so dedup and contradiction resolution
+    # simply never happened, and paraphrases piled up. loads_json also puts an
+    # excerpt of the reply in its error, so any remaining failure says why.
+    return llm.loads_json(text)
 
 
 def _reconcile(new_fact, facts, confidence, provenance, user_id):

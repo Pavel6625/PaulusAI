@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -212,6 +213,28 @@ def test_search_survives_a_poisoned_facts_file():
 def test_quarantine_survives_a_facts_file_that_is_not_a_list():
     _write_facts({"not": "a list"})
     assert memory._load_facts() == []
+
+
+def test_reconcile_recovers_a_wrapped_verdict(monkeypatch):
+    # Production reality: every reconcile call failed on strict json.loads with
+    # "Expecting value: line 1 column 1" -- the model puts something before the
+    # JSON. _reconcile swallows that by storing the fact as new, so dedup never
+    # ran and paraphrases accumulated. Recovery has to happen here.
+    verdict = '```json\n{"action": "duplicate", "id": "abc"}\n```'
+    monkeypatch.setattr(memory.llm, "complete", lambda *a, **k: SimpleNamespace(
+        content=[SimpleNamespace(type="text", text=verdict)]))
+    assert memory._llm_reconcile("x", [{"id": "abc", "fact": "y"}]) == {
+        "action": "duplicate", "id": "abc",
+    }
+
+
+def test_reconcile_error_names_what_the_model_said(monkeypatch):
+    # The old failure logged only "Expecting value: line 1 column 1", which says
+    # nothing about the cause. The excerpt is what makes it diagnosable.
+    monkeypatch.setattr(memory.llm, "complete", lambda *a, **k: SimpleNamespace(
+        content=[SimpleNamespace(type="text", text="I cannot help with that.")]))
+    with pytest.raises(ValueError, match="I cannot help"):
+        memory._llm_reconcile("x", [{"id": "abc", "fact": "y"}])
 
 
 def test_next_save_persists_the_cleaned_list():

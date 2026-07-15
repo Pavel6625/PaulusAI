@@ -41,9 +41,67 @@ def _resolve_data_dir() -> Path:
 #   anthropic/claude-sonnet-4-6  (needs ANTHROPIC_API_KEY)
 #   openai/gpt-4o                (needs OPENAI_API_KEY)
 #   gemini/gemini-1.5-pro        (needs GEMINI_API_KEY)
+#   openrouter/anthropic/claude-sonnet-4-6   (needs OPENROUTER_API_KEY)
 #   ollama_chat/llama3           (needs Ollama running locally, no key)
 CORE_MODEL = os.environ.get("DP_CORE_MODEL", "anthropic/claude-sonnet-4-6")
 MAX_TOKENS = int(os.environ.get("DP_MAX_TOKENS", "2048"))
+
+# --- Model routing (optional) -----------------------------------------------
+# CORE_MODEL is the FLOOR: every turn runs on it unless the router finds
+# positive evidence that the turn needs more. Routing therefore only ever
+# escalates upward, and buys quality rather than saving cost.
+#
+#   low  -> CORE_MODEL                       (always; also the fallback)
+#   mid  -> DP_MID_MODEL, else low
+#   top  -> DP_TOP_MODEL, else mid, else low
+#
+# Unset tiers collapse into the one below, so a two-tier setup is just
+# DP_TOP_MODEL. DP_ROUTING=off (the default) pins everything to CORE_MODEL, so
+# routing is strictly opt-in and an existing deployment is unaffected.
+ROUTING = os.environ.get("DP_ROUTING", "off").strip().lower()
+MID_MODEL = os.environ.get("DP_MID_MODEL", "").strip()
+TOP_MODEL = os.environ.get("DP_TOP_MODEL", "").strip()
+
+# Internal, non-conversational LLM jobs (consolidation, fact reconciliation).
+# These need reliable strict JSON but no tools and no low latency, so they are
+# pinned rather than routed. Defaults to CORE_MODEL: no behaviour change.
+UTILITY_MODEL = os.environ.get("DP_UTILITY_MODEL", "").strip()
+
+# Minimum cosine margin between the best and runner-up tier before an
+# escalation is trusted. Measured on all-MiniLM-L6-v2, genuinely novel hard
+# queries separate by only ~0.01-0.15, so a thin margin means "not confident"
+# and must fall back DOWN rather than spend a flagship model on a coin flip.
+ROUTE_MARGIN = float(os.environ.get("DP_ROUTE_MARGIN", "0.08"))
+
+
+# --- Routing feedback -------------------------------------------------------
+# Every routing decision is logged with its outcome, so the router's behaviour
+# is inspectable rather than a black box (CLI: /routes). Logging is cheap and
+# always on when routing is; it is the only way to tune the rest.
+MAX_ROUTE_LOG = int(os.environ.get("DP_MAX_ROUTE_LOG", "2000"))
+
+# Learning from that log is OFF by default, and deliberately so: it promotes
+# real user phrasings into the exemplar bank, and a wrong promotion drags
+# chitchat toward an escalation tier — degrading the floor it is meant to
+# protect. Inspect /routes on real traffic first, then enable.
+ROUTE_LEARNING = (os.environ.get("DP_ROUTE_LEARNING", "0").strip().lower()
+                  not in ("", "0", "off", "false", "no"))
+# Cap per tier, per user. Oldest learned exemplars are evicted first, so a bad
+# promotion ages out instead of poisoning the bank forever.
+MAX_LEARNED_EXEMPLARS = int(os.environ.get("DP_MAX_LEARNED", "40"))
+
+
+def tier_model(tier: str) -> str:
+    """Resolve a routing tier to a model string, collapsing unset tiers down."""
+    if tier == "top":
+        return TOP_MODEL or MID_MODEL or CORE_MODEL
+    if tier == "mid":
+        return MID_MODEL or CORE_MODEL
+    return CORE_MODEL
+
+
+def utility_model() -> str:
+    return UTILITY_MODEL or CORE_MODEL
 
 # --- Paths ------------------------------------------------------------------
 DATA_DIR = _resolve_data_dir()
@@ -91,11 +149,29 @@ SALIENCE_FLOOR = float(os.environ.get("DP_SALIENCE_FLOOR", "0.05"))
 MAX_EPISODES = int(os.environ.get("DP_MAX_EPISODES", "2000"))
 
 # --- Provider overrides (optional) -----------------------------------------
-# Set these when using a non-default API endpoint (e.g. Ollama Cloud).
+# Set these when CORE_MODEL uses a non-default API endpoint (e.g. Ollama Cloud).
 # DP_API_KEY falls back to OLLAMA_CLOUD_API_KEY so the .env needs no change.
 API_BASE = os.environ.get("DP_API_BASE")
 API_KEY = (os.environ.get("DP_API_KEY")
            or os.environ.get("OLLAMA_CLOUD_API_KEY"))
+
+
+def model_credentials(model: str) -> dict:
+    """The ``api_base``/``api_key`` kwargs to call *model* with.
+
+    DP_API_BASE/DP_API_KEY are a single global pair, so they describe exactly
+    one endpoint: the one CORE_MODEL was pointed at. They are therefore applied
+    ONLY to CORE_MODEL. Any other model resolves its own credentials from its
+    provider's conventional env var (ANTHROPIC_API_KEY, OPENROUTER_API_KEY,
+    ...), which LiteLLM reads by itself when we pass None.
+
+    This scoping is what makes a second model usable at all: passing the global
+    override to every call would hand, say, an Ollama Cloud key and base URL to
+    an OpenRouter model and break it.
+    """
+    if model == CORE_MODEL:
+        return {"api_base": API_BASE or None, "api_key": API_KEY or None}
+    return {"api_base": None, "api_key": None}
 
 # --- Idle / proactive behaviour ---------------------------------------------
 IDLE_CHECK_INTERVAL = int(os.environ.get("DP_IDLE_CHECK", "300"))

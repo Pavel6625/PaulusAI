@@ -3,19 +3,26 @@
 Uses LiteLLM for dynamic provider switching. Set DP_CORE_MODEL to any
 LiteLLM model string:
 
-  anthropic/claude-sonnet-4-6   (default)
+  anthropic/claude-sonnet-4-6              (default)
   openai/gpt-4o
   gemini/gemini-1.5-pro
-  ollama_chat/llama3             (no key needed)
-  openrouter/openai/gpt-4o
+  openrouter/anthropic/claude-sonnet-4-6   (one key reaches many models)
+  ollama_chat/llama3                       (no key needed)
 
 The corresponding API key env var must be set (ANTHROPIC_API_KEY,
-OPENAI_API_KEY, GEMINI_API_KEY, etc.). Ollama needs no key.
+OPENAI_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, etc.); LiteLLM reads it
+from the environment itself. Ollama needs no key. DP_API_BASE/DP_API_KEY
+override the endpoint for the core model only — see config.model_credentials.
+
+Every entry point takes an optional ``model=`` to override the core model for
+that call, so a caller can pick a model per turn (e.g. routing) without any
+global state; omitting it keeps the configured core model.
 
 agent.py is unaware of the provider — it always sees Anthropic-shaped
 response objects. All format conversion lives here.
 """
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 
@@ -151,30 +158,69 @@ def _to_openai_messages(messages):
     return out
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S | re.I)
+
+
+def loads_json(raw):
+    """Parse the JSON value a model *meant* to emit.
+
+    Asked for strict JSON, models reliably do three things anyway: wrap the
+    value in a markdown fence, introduce it with prose, and append commentary
+    after it. All three make ``json.loads`` raise, so recover from each —
+    strip the fence, skip to the first opening brace/bracket, and decode only
+    the leading value.
+
+    Raises ValueError when no JSON value can be found at all. Lives here
+    because parsing what a model actually said is this module's job, and every
+    caller that asks one for JSON hits the same three failures."""
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("empty response")
+    fenced = _FENCE_RE.search(text)
+    if fenced:
+        text = fenced.group(1).strip()
+    starts = [i for i in (text.find("{"), text.find("[")) if i != -1]
+    if not starts:
+        raise ValueError(f"no JSON object or array in {_excerpt(raw)}")
+    try:
+        # raw_decode stops at the end of the first value, ignoring any trailing
+        # commentary rather than failing on it.
+        value, _end = json.JSONDecoder().raw_decode(text[min(starts):])
+    except json.JSONDecodeError as e:
+        raise ValueError(f"unparseable JSON in {_excerpt(raw)}: {e}") from e
+    return value
+
+
+def _excerpt(raw, limit=120):
+    text = (raw or "").strip().replace("\n", " ")
+    return repr(text if len(text) <= limit else text[:limit] + "...")
+
+
 def _loads_tool_args(raw):
-    """Parse a tool call's JSON arguments, tolerating a provider that appends
-    trailing data after a valid object.
+    """Parse a tool call's JSON arguments, tolerating a provider that wraps or
+    pads them.
 
     Some models (observed with ollama_chat cloud) occasionally emit a valid
     arguments object followed by stray content (e.g. a second object or prose),
     which makes strict ``json.loads`` raise ``Extra data`` and crash the turn.
-    Recover the first complete JSON object and ignore the rest; only a string
-    with no leading JSON object at all falls back to ``{}``."""
+    Recovery is shared with loads_json; only a string with no JSON value in it
+    at all falls back to ``{}``, since a turn is better off with an empty
+    argument set than a crash."""
     raw = (raw or "").strip()
     if not raw:
         return {}
     try:
-        return json.loads(raw)
+        return json.loads(raw)          # the common case: exactly as asked
     except json.JSONDecodeError:
-        try:
-            obj, _end = json.JSONDecoder().raw_decode(raw)
-        except json.JSONDecodeError:
-            print(f"[llm] unparseable tool arguments, ignoring: {raw!r}",
-                  file=sys.stderr)
-            return {}
-        print(f"[llm] recovered tool arguments with trailing data: {raw!r}",
+        pass
+    try:
+        obj = loads_json(raw)
+    except ValueError:
+        print(f"[llm] unparseable tool arguments, ignoring: {raw!r}",
               file=sys.stderr)
-        return obj
+        return {}
+    print(f"[llm] recovered malformed tool arguments: {raw!r}", file=sys.stderr)
+    return obj
 
 
 # ---------------------------------------------------------------------------
@@ -210,8 +256,8 @@ def _normalize(response):
 # Public API
 # ---------------------------------------------------------------------------
 
-def supports_vision():
-    """Whether the configured core model can accept image input.
+def supports_vision(model=None):
+    """Whether *model* (default: the core model) can accept image input.
 
     Used by the gateway to refuse an image up front, but only when the model
     *definitively* can't see. LiteLLM's vision metadata lags new multimodal
@@ -220,39 +266,44 @@ def supports_vision():
     attempted — a genuinely blind one then fails at call time and the gateway
     reports it gracefully. Only an explicit ``supports_vision: False`` blocks."""
     try:
-        info = litellm.get_model_info(model=config.CORE_MODEL)
+        info = litellm.get_model_info(model=model or config.CORE_MODEL)
     except Exception:
         return True                       # not in LiteLLM's map — don't block
     return info.get("supports_vision") is not False
 
 
-def complete(system, messages, tools=None):
-    """One non-streaming turn. Returns an Anthropic-shaped _Response."""
+def complete(system, messages, tools=None, model=None):
+    """One non-streaming turn. Returns an Anthropic-shaped _Response.
+
+    *model* overrides the configured core model for this call only; its
+    credentials are resolved per-model (see config.model_credentials)."""
+    model = model or config.CORE_MODEL
     oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
     return _normalize(litellm.completion(
-        model=config.CORE_MODEL,
+        model=model,
         max_tokens=config.MAX_TOKENS,
         messages=oai_messages,
         tools=_to_litellm_tools(tools) if tools else None,
-        api_base=config.API_BASE or None,
-        api_key=config.API_KEY or None,
+        **config.model_credentials(model),
     ))
 
 
-def stream(system, messages, tools=None, on_delta=None):
+def stream(system, messages, tools=None, on_delta=None, model=None):
     """One streaming turn. Forwards each text delta to ``on_delta(piece)`` as it
     arrives, then returns the same Anthropic-shaped _Response as complete() so
     the caller's tool loop is otherwise unchanged. Tool-call fragments are
-    reassembled across chunks before the response is built."""
+    reassembled across chunks before the response is built.
+
+    *model* overrides the configured core model for this call only."""
+    model = model or config.CORE_MODEL
     oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
     chunks = litellm.completion(
-        model=config.CORE_MODEL,
+        model=model,
         max_tokens=config.MAX_TOKENS,
         messages=oai_messages,
         tools=_to_litellm_tools(tools) if tools else None,
-        api_base=config.API_BASE or None,
-        api_key=config.API_KEY or None,
         stream=True,
+        **config.model_credentials(model),
     )
 
     text_parts: list[str] = []

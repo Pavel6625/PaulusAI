@@ -2,10 +2,9 @@
 -> persist, with the tool-use loop handled manually so the safety gate sits
 between the model's decision and any real-world effect.
 """
-import json
 import os
 
-from . import affect, billing, llm, memory, security, skills, tools
+from . import affect, billing, config, llm, memory, router, security, skills, tools
 
 SYSTEM_TEMPLATE = """You are a persistent digital companion for a single owner.
 You have long-term memory, learned skills, and a current mood. Be warm, concise,
@@ -35,6 +34,19 @@ Relevant long-term memory:
 Possibly relevant skills:
 {skill_list}
 """
+
+
+# Phrases that say the ANSWER was wrong, as opposed to affect's broader mood
+# scan below. They must be separate: affect matches a bare "bad", so "i had a
+# bad day at work" reads as frustration — harmless for a mood, but as a routing
+# label it would blame the previous turn and drag small talk up a tier.
+_COMPLAINT_PHRASES = (
+    "that's wrong", "thats wrong", "you're wrong", "youre wrong",
+    "that's not right", "thats not right", "that's incorrect",
+    "not what i asked", "not what i meant", "you misunderstood",
+    "you didn't understand", "you didnt understand", "makes no sense",
+    "that's useless", "wrong answer",
+)
 
 
 def _context_query(user_id=None):
@@ -71,18 +83,28 @@ def _blocks_to_dicts(content):
     return out
 
 
-def _run_tool_loop(system, messages, user_id=None, on_delta=None):
+def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
+                   tools_used=None):
     """Drive the model<->tool exchange, with the safety gate between the
     model's decision and any real-world effect. Returns the final text.
 
+    *tools_used*, when given, is filled with the names of the tools the model
+    actually ran — the router uses it as objective evidence of how much the
+    turn really needed.
+
     When ``on_delta`` is given, each turn is streamed and text fragments are
     forwarded to it as they arrive (the gateway uses this to live-edit the
-    outgoing message); the safety gate is unchanged."""
+    outgoing message); the safety gate is unchanged.
+
+    *model* is fixed for the whole loop: it is chosen once per turn, so a tool
+    exchange is never handed mid-flight to a different model than the one that
+    started it."""
     while True:
         if on_delta is not None:
-            resp = llm.stream(system, messages, tools=tools.TOOL_SPECS, on_delta=on_delta)
+            resp = llm.stream(system, messages, tools=tools.TOOL_SPECS,
+                              on_delta=on_delta, model=model)
         else:
-            resp = llm.complete(system, messages, tools=tools.TOOL_SPECS)
+            resp = llm.complete(system, messages, tools=tools.TOOL_SPECS, model=model)
         messages.append({"role": "assistant", "content": _blocks_to_dicts(resp.content)})
 
         if resp.stop_reason != "tool_use":
@@ -109,6 +131,9 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None):
                     continue
 
             result, is_error = tools.execute(b.name, b.input, user_id=user_id)
+            if tools_used is not None:
+                tools_used.append(b.name)   # ran (error or not); a declined
+                                            # action never reached the world
             affect.feel("task_error" if is_error else "task_success")
             if b.name in ("remember", "save_skill") and not is_error:
                 affect.feel("new_learning")
@@ -173,6 +198,21 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     if not allowed:
         return block_message
 
+    # A complaint is about the reply the owner just read, so it labels the
+    # PREVIOUS turn's routing decision. Recorded before this turn is routed,
+    # while _last_turn still points at the one being complained about.
+    if any(p in owner_text.lower() for p in _COMPLAINT_PHRASES):
+        router.log_complaint(user_id=user_id)
+
+    # Route on what the owner actually wrote, BEFORE documents are folded in:
+    # their content is untrusted, and letting it steer model selection would
+    # hand an attacker a lever on spend. That a document is present is signal
+    # enough, and is passed separately.
+    model, tier, reason = router.route(owner_text, user_id=user_id,
+                                       has_images=bool(images),
+                                       has_documents=bool(documents))
+    turn_id = router.log_decision(owner_text, tier, reason, user_id=user_id)
+
     owner_text = _ingest_documents(owner_text, documents, user_id)
     memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
 
@@ -185,7 +225,10 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     system = _build_system(user_id)
     messages = _history_to_messages(user_id)
     _attach_images(messages, images)
-    final_text = _run_tool_loop(system, messages, user_id, on_delta=on_delta)
+    tools_used = []
+    final_text = _run_tool_loop(system, messages, user_id, on_delta=on_delta,
+                                model=model, tools_used=tools_used)
+    router.log_outcome(turn_id, tools_used, user_id=user_id)
 
     memory.log_episode("agent", final_text, trust="trusted", user_id=user_id)
     affect.decay()
@@ -234,10 +277,52 @@ def proactive_check(user_id=None):
     return text
 
 
+_SKILL_KEYS = ("name", "when_to_use", "steps")
+
+
+def _store_consolidation(data, user_id):
+    """Store the facts and skills from a parsed consolidation reply.
+
+    Each entry is stored independently: a single malformed one used to abort the
+    loop, silently discarding every valid entry after it while still reporting
+    the ones before it as a success. Returns (facts_n, skills_n, dropped).
+    """
+    facts_n = skills_n = dropped = 0
+
+    for f in data.get("facts") or []:
+        try:
+            memory.add_fact(f, confidence=0.6, provenance=["consolidation"],
+                            user_id=user_id)
+            facts_n += 1
+        except Exception as exc:
+            dropped += 1
+            security.audit("consolidation_bad_fact", f"{user_id}: {exc}")
+
+    for s in data.get("skills") or []:
+        if not isinstance(s, dict) or not all(
+                isinstance(s.get(k), str) and s[k].strip() for k in _SKILL_KEYS):
+            dropped += 1
+            security.audit("consolidation_bad_skill", f"{user_id}: {s!r:.200}")
+            continue
+        try:
+            skills.add_skill(s["name"], s["when_to_use"], s["steps"],
+                             status="unverified", source="consolidation")
+            skills_n += 1
+        except Exception as exc:
+            dropped += 1
+            security.audit("consolidation_bad_skill", f"{user_id}: {exc}")
+
+    return facts_n, skills_n, dropped
+
+
 def sleep(user_id=None):
     """Consolidation / 'subconscious' loop: distil durable facts AND propose
     reusable skills from recent episodes, then decay. Proposed skills are stored
-    as 'unverified' (reflection-review gate)."""
+    as 'unverified' (reflection-review gate).
+
+    Decay and routing feedback run whatever the model returned; only the storing
+    depends on a usable reply. The returned summary distinguishes an empty
+    consolidation from a failed one — they used to read identically."""
     episodes = memory.recent_episodes(20, user_id=user_id)
     if not episodes:
         return "Nothing to consolidate yet."
@@ -249,21 +334,37 @@ def sleep(user_id=None):
         '"steps": "..."}]}. Include at most 5 durable owner-specific facts and '
         "at most 2 reusable procedures actually demonstrated. Use [] when none."
     )
-    resp = llm.complete(system, [{"role": "user", "content": transcript}])
+    # Pinned, not routed: an internal job with no user waiting on it, whose only
+    # hard requirement is JSON this can parse.
+    resp = llm.complete(system, [{"role": "user", "content": transcript}],
+                        model=config.utility_model())
     text = "".join(b.text for b in resp.content if b.type == "text").strip()
-    facts_n = skills_n = 0
+
+    problem = None
+    facts_n = skills_n = dropped = 0
     try:
-        data = json.loads(text)
-        for f in data.get("facts", []):
-            memory.add_fact(f, confidence=0.6, provenance=["consolidation"],
-                            user_id=user_id)
-            facts_n += 1
-        for s in data.get("skills", []):
-            skills.add_skill(s["name"], s["when_to_use"], s["steps"],
-                             status="unverified", source="consolidation")
-            skills_n += 1
-    except Exception:
-        pass
+        data = llm.loads_json(text)
+    except ValueError as exc:
+        problem = str(exc)
+    else:
+        if isinstance(data, dict):
+            facts_n, skills_n, dropped = _store_consolidation(data, user_id)
+        else:
+            problem = f"expected a JSON object, got {type(data).__name__}"
+    if problem:
+        security.audit("consolidation_parse_error", f"{user_id}: {problem}")
+
+    # Outside the parse above on purpose: routing feedback is mechanical (no
+    # model call, nothing to parse), so a model that returns unparseable JSON
+    # must not take the router's learning down with it.
+    routed = router.learn(user_id=user_id)
     forgotten = memory.decay(user_id=user_id)
-    return (f"Consolidated {facts_n} fact(s), proposed {skills_n} skill(s); "
-            f"memory decayed ({forgotten} forgotten).")
+
+    if problem:
+        head = "Consolidation failed: the model's reply wasn't usable JSON"
+    else:
+        head = f"Consolidated {facts_n} fact(s), proposed {skills_n} skill(s)"
+        if dropped:
+            head += f", dropped {dropped} malformed"
+    learned_note = f" Routing learned {routed} example(s)." if routed else ""
+    return f"{head}; memory decayed ({forgotten} forgotten).{learned_note}"

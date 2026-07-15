@@ -170,12 +170,17 @@ class TelegramAdapter(BasePlatformAdapter):
             await msg.reply_text("Unauthorized.")
             return
 
-        # Don't let the API reject the request — tell the owner the model is blind.
-        from ... import llm
-        if not llm.supports_vision():
+        # Don't let the API reject the request — tell the owner the model is
+        # blind. Ask about the model an image turn would actually be routed to,
+        # not the core model: with routing on, an image escalates to whichever
+        # tier can see, so checking the core model here would refuse images the
+        # agent is perfectly able to handle.
+        from ... import llm, router
+        if not llm.supports_vision(router.vision_model()):
             await msg.reply_text(
-                "I can't analyse images with the current model. "
-                "Switch DP_CORE_MODEL to a vision-capable one to enable this."
+                "I can't analyse images — none of the configured models are "
+                "vision-capable. Set DP_CORE_MODEL (or DP_MID_MODEL / "
+                "DP_TOP_MODEL) to a model that supports images."
             )
             return
 

@@ -257,18 +257,29 @@ PROACTIVE_NUDGE = (
 def proactive_check(user_id=None):
     """Idle-triggered turn: let the model decide whether to reach out. Returns a
     message to deliver, or a silence sentinel the caller swallows. The seed
-    prompt is never persisted; only a real outgoing message is logged."""
-    allowed, _block_message = billing.gate(user_id)
-    if not allowed:
-        # Out of balance: stay quiet rather than proactively nagging the user
-        # about it, and don't spend an LLM call to decide that.
-        return _SILENCE_TOKENS[0]
+    prompt is never persisted; only a real outgoing message is logged.
 
+    Deliberately NOT pay-gated. A nudge is bot-initiated, not something the user
+    asked for, so it must never debit their balance — unlike respond(), which
+    gates because the user requested that turn. This means the idle loop can
+    still reach out to a user whose balance is exhausted; that is intended (a
+    warm, unsolicited check-in isn't a paid reply), and if they answer, that
+    reply goes through respond() and is gated normally.
+
+    Pinned to the utility model, not routed: this is an unprompted, internal job
+    with no user waiting on it, and it fires on every idle interval for every
+    quiet user. Charging it flagship rates — as it did when it defaulted to
+    CORE_MODEL — drains the operator's provider credit on messages nobody asked
+    for. Pointing DP_UTILITY_MODEL at a free/cheap model makes the whole idle
+    loop (the silent checks AND the nudges it does send) effectively free;
+    leaving it unset falls back to CORE_MODEL, so an existing deployment is
+    unaffected. Mirrors sleep()'s treatment of consolidation for the same
+    reason."""
     system = _build_system(user_id)
     messages = _history_to_messages(user_id)
     messages.append({"role": "user", "content": PROACTIVE_NUDGE})
 
-    text = _run_tool_loop(system, messages, user_id)
+    text = _run_tool_loop(system, messages, user_id, model=config.utility_model())
 
     if any(tok in text for tok in _SILENCE_TOKENS):
         return text                      # swallowed upstream; nothing persisted

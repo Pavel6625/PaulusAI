@@ -315,3 +315,43 @@ def test_jev_failure_falls_back_to_the_prompt(jev, auto):
     auto.decision = True
     assert security.confirm("run_command", {"command": "ls"}, "u", _ctx()) is True
     assert auto.asked == [None]          # plain prompt: the reviewer errored
+
+
+@pytest.mark.parametrize("model, base, key_var, model_id", [
+    ("openrouter/typesafe/jev-latest", "https://openrouter.ai/api",
+     "OPENROUTER_API_KEY", "typesafe/jev-latest"),
+    ("openrouter/~typesafe/jev-latest", "https://openrouter.ai/api",
+     "OPENROUTER_API_KEY", "~typesafe/jev-latest"),
+    ("typesafe/jev-latest", "https://api.typesafe.ai",
+     "TYPESAFE_API_KEY", "jev-latest"),
+])
+def test_jev_routes(model, base, key_var, model_id):
+    got_base, got_var, _key, got_id = automode.jev_route(model)
+    assert (got_base, got_var, got_id) == (base, key_var, model_id)
+
+
+@pytest.mark.parametrize("model", ["openrouter/anthropic/claude-sonnet-4-6",
+                                   "anthropic/claude-sonnet-4-6"])
+def test_other_models_stay_on_the_llm_reviewer(model):
+    assert automode.jev_route(model) is None
+
+
+def test_jev_via_openrouter_uses_the_openrouter_key(jev, monkeypatch):
+    import json
+    monkeypatch.setattr(config, "AUTO_MODEL", "openrouter/typesafe/jev-latest")
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setattr(config, "TYPESAFE_API_KEY", "")
+
+    assert automode.review("run_command", {"command": "ls"}, _ctx()).allow
+    req = jev.requests[0]
+    assert req.full_url == "https://openrouter.ai/api/v1/systemone"
+    assert req.get_header("Authorization") == "Bearer or-key"
+    assert json.loads(req.data)["model"] == "typesafe/jev-latest"
+
+
+def test_jev_via_openrouter_names_the_missing_key(jev, monkeypatch):
+    monkeypatch.setattr(config, "AUTO_MODEL", "openrouter/typesafe/jev-latest")
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "")
+    with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+        automode.review("run_command", {"command": "ls"}, _ctx())
+    assert jev.requests == []

@@ -9,7 +9,7 @@ agent into proposing an action, but it has no channel to argue that action past
 the reviewer.
 
 The reviewer is an LLM (via LiteLLM) by default, or TypeSafe's Jev classifier
-when DP_AUTO_MODEL starts with "typesafe/".
+when DP_AUTO_MODEL names it ("openrouter/typesafe/..." or "typesafe/...").
 
 A block is not a denial: the action goes to the owner's normal approval prompt
 with the reviewer's concern attached. A reviewer failure falls back to that
@@ -88,7 +88,27 @@ TOOLS = """The high-impact tools:
 # Jev answers yes/no questions ("nouls") with a calibrated probability rather
 # than writing text, so the LLM reviewer's two lists become two questions. Each
 # is phrased so that "yes" is the unambiguous side, as TypeSafe recommends.
-JEV_PREFIX = "typesafe/"
+_JEV_VENDOR = "typesafe/"
+_OPENROUTER = "openrouter/"
+
+
+def jev_route(model):
+    """Where to send a Jev review for DP_AUTO_MODEL *model*, as
+    ``(base_url, key_env_var, key, model_id)``; ``None`` if it isn't Jev.
+
+    Both routes speak the same System One API and differ only in where it
+    lives, whose key it takes, and the model id: OpenRouter needs the vendor
+    prefix (``typesafe/jev-latest``), TypeSafe direct takes the bare id."""
+    if model.startswith(_OPENROUTER):
+        model_id = model[len(_OPENROUTER):]
+        if model_id.lstrip("~").startswith(_JEV_VENDOR):
+            return (config.OPENROUTER_API_BASE, "OPENROUTER_API_KEY",
+                    config.OPENROUTER_API_KEY, model_id)
+        return None
+    if model.startswith(_JEV_VENDOR):
+        return (config.TYPESAFE_API_BASE, "TYPESAFE_API_KEY",
+                config.TYPESAFE_API_KEY, model[len(_JEV_VENDOR):])
+    return None
 
 JEV_QUESTIONS = {
     "requested": {
@@ -183,8 +203,9 @@ def review(tool_name, tool_input, context):
     decision — and the caller treats that as "ask the owner". Nothing here
     ever turns an unclear answer into an allow."""
     model = config.auto_model()
-    if model.startswith(JEV_PREFIX):
-        return _review_jev(tool_name, tool_input, context, model[len(JEV_PREFIX):])
+    route = jev_route(model)
+    if route is not None:
+        return _review_jev(tool_name, tool_input, context, route)
     return _review_llm(tool_name, tool_input, context, model)
 
 
@@ -207,19 +228,21 @@ def _review_llm(tool_name, tool_input, context, model):
     return Verdict(allow=decision == "allow", reason=reason or "(no reason given)")
 
 
-def _review_jev(tool_name, tool_input, context, model):
-    """Review with TypeSafe's Jev (POST /v1/systemone).
+def _review_jev(tool_name, tool_input, context, route):
+    """Review with TypeSafe's Jev (POST /v1/systemone) on *route* (see
+    jev_route).
 
     Allows only when Jev is at least DP_JEV_THRESHOLD sure the owner asked for
     the action AND at least that sure it isn't risky. The band in between is
     exactly what TypeSafe recommends sending to human review, and here that is
     the owner's prompt."""
-    if not config.TYPESAFE_API_KEY:
-        raise ValueError("TYPESAFE_API_KEY is not set")
+    base, key_var, key, model_id = route
+    if not key:
+        raise ValueError(f"{key_var} is not set")
     state = (TOOLS.format(backend=config.SANDBOX_BACKEND) + "\n\n"
              + render(tool_name, tool_input, context))
-    answers = _systemone({"model": model, "state": state,
-                          "questions": JEV_QUESTIONS})
+    answers = _systemone(base, key, {"model": model_id, "state": state,
+                                     "questions": JEV_QUESTIONS})
     requested = _noul(answers, "requested")
     risky = _noul(answers, "risky")
 
@@ -235,18 +258,19 @@ def _review_jev(tool_name, tool_input, context, model):
                    reason=f"Jev: requested {requested:.0%}, risky {risky:.0%}")
 
 
-def _systemone(body):
+def _systemone(base, key, body):
     """POST to Jev and return its ``answers`` map. Raises on any failure."""
-    url = config.TYPESAFE_API_BASE.rstrip("/") + "/v1/systemone"
+    url = base.rstrip("/") + "/v1/systemone"
     req = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"), method="POST",
         headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {config.TYPESAFE_API_KEY}"})
+                 "Authorization": f"Bearer {key}"})
     try:
         with urllib.request.urlopen(req, timeout=config.AUTO_TIMEOUT) as resp:
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        # 422 explains which field failed validation; keep it for the audit log.
+        # A 400/422 body names the field that failed validation, and a 402 on
+        # OpenRouter means credits ran out; keep it for the audit log.
         detail = exc.read().decode("utf-8", "replace")[:200]
         raise RuntimeError(f"Jev HTTP {exc.code}: {detail}") from exc
     answers = data.get("answers") if isinstance(data, dict) else None

@@ -266,14 +266,19 @@ def auto_model() -> str:
     return AUTO_MODEL or CORE_MODEL
 
 
-# DP_AUTO_MODEL=typesafe/<model> (e.g. typesafe/jev-latest) reviews with
-# TypeSafe's Jev, a classifier that returns calibrated probabilities instead of
-# text, rather than through LiteLLM. An action is approved only when Jev is at
-# least DP_JEV_THRESHOLD sure the owner asked for it AND at least that sure it
-# isn't risky; everything in between goes to the owner's prompt.
+# Jev, TypeSafe's classifier that returns calibrated probabilities instead of
+# text, can be the reviewer instead of an LLM. Both routes speak the same
+# System One API (POST <base>/v1/systemone); the prefix picks the route:
+#   openrouter/typesafe/jev-latest -> via OpenRouter  (needs OPENROUTER_API_KEY)
+#   typesafe/jev-latest            -> TypeSafe direct (needs TYPESAFE_API_KEY)
+# An action is approved only when Jev is at least DP_JEV_THRESHOLD sure the
+# owner asked for it AND at least that sure it isn't risky; everything in
+# between goes to the owner's prompt.
 TYPESAFE_API_BASE = os.environ.get("DP_TYPESAFE_API_BASE",
                                    "https://api.typesafe.ai").strip()
 TYPESAFE_API_KEY = os.environ.get("TYPESAFE_API_KEY", "").strip()
+OPENROUTER_API_BASE = "https://openrouter.ai/api"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 JEV_THRESHOLD = float(os.environ.get("DP_JEV_THRESHOLD", "0.9"))
 AUTO_TIMEOUT = int(os.environ.get("DP_AUTO_TIMEOUT", "10"))
 

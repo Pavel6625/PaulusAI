@@ -28,8 +28,9 @@ point it at Anthropic, OpenAI, Gemini, OpenRouter, or a local Ollama model.
   fade below `DP_SALIENCE_FLOOR` are forgotten, keeping memory bounded.
 - **Tools with a safety gate** — `remember`, `recall`, `find_skill`,
   `save_skill`, `read_local_file`, `web_search`/`fetch_url` (browse and scrape
-  the web), plus the high-impact `write_local_file`, `run_command`, and
-  `send_message` which require explicit approval.
+  the web), plus the high-impact `write_local_file`, `run_command`,
+  `send_message`, `send_document` and `send_email_agentmail` which require
+  explicit approval.
 - **Pluggable sandbox** — command/file execution runs `local`, in a
   network-disabled `docker` container, or over `ssh`.
 - **Messaging gateway** — a Hermes-style gateway with a Telegram adapter
@@ -111,6 +112,11 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `DP_UNATTENDED_POLICY`  | `deny`                         | High-impact action when nobody is reachable to approve         |
 | `DP_GATEWAY_APPROVALS`  | `1`                            | Ask reachable users to approve high-impact actions in chat     |
 | `DP_APPROVAL_TIMEOUT`   | `300`                          | Seconds to wait for an in-chat approval before failing to deny  |
+| `DP_PERMISSION_MODE`    | `ask`                          | `auto` lets a reviewer model approve high-impact actions you clearly asked for (see [Auto mode](#auto-mode)) |
+| `DP_AUTO_MODEL`         | (unset = `DP_CORE_MODEL`)      | The auto-mode reviewer's model; `typesafe/jev-latest` uses [Jev](#reviewing-with-jev) |
+| `TYPESAFE_API_KEY`      | —                              | TypeSafe API key, for the Jev reviewer                         |
+| `DP_JEV_THRESHOLD`      | `0.9`                          | How sure Jev must be (requested, and not risky) to auto-approve |
+| `DP_AUTO_TIMEOUT`       | `10`                           | Seconds to wait for the Jev reviewer before prompting instead  |
 | `TELEGRAM_BOT_TOKEN`    | —                              | Required for `paulus-gateway`                                  |
 | `TELEGRAM_ALLOWED_USERS`| (all)                          | Numeric Telegram user IDs allowed to **chat**; empty = everyone |
 | `TELEGRAM_TRUSTED_USERS`| (= allowed)                    | IDs allowed to **approve** high-impact actions; empty = nobody  |
@@ -152,6 +158,7 @@ In-chat commands:
 | `/skills` | List learned skills and their status                          |
 | `/route X`| Show which model tier the text `X` routes to, and why (tuning) |
 | `/routes` | Show recent routing decisions, their outcomes, and what was learned |
+| `/auto`   | Toggle [auto mode](#auto-mode) for this session               |
 | `/quit`   | Consolidate and exit                                          |
 
 When the agent proposes a **high-impact action** (writing a file, running a
@@ -164,6 +171,50 @@ command, sending a message), you are prompted to approve that single action:
 ============================================================
   Approve this single action? [y/N]
 ```
+
+### Auto mode
+
+With `DP_PERMISSION_MODE=auto` (or `/auto` in the CLI), a reviewer model answers
+the approval prompt for you. It approves an action only when your own messages
+ask for it and its effects are contained. Anything else is **flagged**: you get
+the normal prompt with the reviewer's concern, e.g. `auto-review flagged: the
+owner asked to read the file, not to email it`. Examples of flagged actions:
+unrequested actions, destructive commands, messages to recipients you didn't
+name, anything touching secrets, `curl | sh`, and actions that look prompted by
+a web page or document.
+
+Guarantees:
+
+- **The reviewer can't be talked into anything by untrusted content.** It sees
+  your messages and the agent's actions, never tool results, fetched pages,
+  document contents or the agent's own prose.
+- **It only answers for someone who could have answered.** At the CLI that
+  means an attached terminal. On Telegram it means a reachable
+  `TELEGRAM_TRUSTED_USERS` member, so untrusted chat users never get
+  auto-approvals.
+- **Turns you didn't start are never reviewed.** Idle nudges always go to the
+  normal prompt.
+- **It fails safe.** A reviewer error falls back to the normal prompt. A
+  flagged action is never handed to `DP_UNATTENDED_POLICY`: if nobody answers,
+  it's denied.
+
+Every verdict is written to `audit.log` (`auto_approve` / `auto_block` /
+`auto_error`) with the reviewer's reason.
+
+#### Reviewing with Jev
+
+`DP_AUTO_MODEL=typesafe/jev-latest` (plus `TYPESAFE_API_KEY`) reviews with
+TypeSafe's [Jev](https://docs.typesafe.ai), a classifier that returns calibrated
+probabilities instead of text. It is much faster and cheaper than an LLM
+reviewer, but it is in early access and its judgement on this task is unproven.
+
+Jev is asked two yes/no questions: *did the owner ask for this?* and *is it
+risky?*. An action is approved only when Jev is at least `DP_JEV_THRESHOLD`
+(default 0.9) sure of "yes" to the first and "no" to the second. Anything in
+between goes to your prompt with the scores, e.g. `auto-review flagged: Jev
+isn't confident you asked for this (62%)`. Raising the threshold prompts more
+often; lowering it trusts Jev more. Check `auto_approve` lines in `audit.log`
+before lowering it.
 
 ### Telegram bot
 
@@ -273,14 +324,18 @@ always inspectable and the index can be rebuilt from it.
 The trust boundaries are deliberately small and explicit (see [src/paulus/security.py](src/paulus/security.py)):
 
 1. **Untrusted data is labelled.** Anything pulled from the outside world (file
-   contents, command output) is wrapped in `<untrusted_data>` tags with an
-   instruction never to follow embedded directions.
-2. **High-impact actions are gated.** `write_local_file`, `run_command`, and
-   `send_message` require explicit per-action approval — from a terminal at the
+   contents, web pages, emails, documents you send) is wrapped in
+   `<untrusted_data>` tags with an instruction never to follow embedded
+   directions. Lookalike tags inside the content are defanged, so it can't
+   close the block early and pose as trusted text.
+2. **High-impact actions are gated.** `write_local_file`, `run_command`,
+   `send_message`, `send_document` and `send_email_agentmail` require explicit
+   per-action approval — from a terminal at the
    CLI, or from inline Approve/Deny buttons in chat when running behind the
    gateway (only allow-listed users can approve; unanswered prompts time out to
    a deny). When no one is reachable to approve, they fall back to
-   `DP_UNATTENDED_POLICY` (**deny** by default).
+   `DP_UNATTENDED_POLICY` (**deny** by default). In [auto mode](#auto-mode) a
+   reviewer model answers the prompt for actions you clearly asked for.
 3. **Everything is audited.** Every tool call is appended to `audit.log`.
 4. **Execution is sandboxed.** File ops are confined to `workspace/`; commands
    run via the configured backend — use `docker` (network-disabled) or `ssh`
@@ -322,6 +377,7 @@ src/paulus/
 ├── skills.py         # procedural memory
 ├── tools.py          # tool schemas + dispatch
 ├── security.py       # untrusted-data wrapping, approval gate, audit log
+├── automode.py       # auto mode: model reviewer that answers approval prompts
 ├── billing.py        # usage pay gate (external balance/pricing service)
 ├── sandbox.py        # local / docker / ssh execution backends
 ├── config.py         # env-driven configuration + data-dir resolution

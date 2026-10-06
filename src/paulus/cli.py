@@ -10,6 +10,8 @@ Commands:
   /skills   list learned skills
   /route X  show which model tier the text X would be routed to, and why
   /routes   show recent routing decisions, their outcomes, and what was learned
+  /auto     toggle auto mode: a reviewer model approves high-impact actions
+            you clearly asked for; anything else still prompts you
   /quit     consolidate and exit
 """
 from . import affect, agent, config, memory, router, skills, vectorstore
@@ -49,7 +51,8 @@ def main():
     config.ensure_dirs()
     vectorstore.init()  # bring up embeddings, or fall back to keyword search
     router.init()       # bring up routing, or pin every turn to the core model
-    print("PaulusAI. Type a message, or /quit to exit.\n")
+    print("PaulusAI. Type a message, or /quit to exit.")
+    print(f"permission mode: {config.PERMISSION_MODE}  (/auto to toggle)\n")
     while True:
         try:
             text = input("you> ").strip()
@@ -81,6 +84,10 @@ def main():
             continue
         if text == "/routes":
             print(_routes_report())
+            continue
+        if text == "/auto":
+            config.PERMISSION_MODE = "ask" if config.PERMISSION_MODE == "auto" else "auto"
+            print(f"permission mode: {config.PERMISSION_MODE}")
             continue
 
         print(f"\ndp> {agent.respond(text)}\n")

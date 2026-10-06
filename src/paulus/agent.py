@@ -4,8 +4,7 @@ between the model's decision and any real-world effect.
 """
 import os
 
-from . import (affect, automode, billing, config, llm, memory, router, security,
-               skills, tools)
+from . import affect, automode, billing, config, llm, memory, router, security, skills, tools
 
 SYSTEM_TEMPLATE = """You are a persistent digital companion for a single owner.
 You have long-term memory, learned skills, and a current mood. Be warm, concise,

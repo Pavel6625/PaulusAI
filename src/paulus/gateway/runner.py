@@ -17,7 +17,7 @@ def get_runner() -> GatewayRunner | None:
     return _instance
 
 
-def _approval_prompt(tool_name: str, tool_input) -> str:
+def _approval_prompt(tool_name: str, tool_input, concern: str | None = None) -> str:
     """A concise, human-readable description of the action awaiting approval."""
     if isinstance(tool_input, dict):
         if tool_name == "run_command":
@@ -35,10 +35,12 @@ def _approval_prompt(tool_name: str, tool_input) -> str:
             detail = str(tool_input)
     else:
         detail = str(tool_input)
+    flagged = f"Auto-review flagged: {concern}\n" if concern else ""
     return (
         "⚠️ Approval needed for a high-impact action.\n"
         f"Action: {tool_name}\n"
-        f"Details: {detail}\n\n"
+        f"Details: {detail}\n"
+        f"{flagged}\n"
         "Approve this single action?"
     )
 
@@ -290,7 +292,8 @@ class GatewayRunner:
     # Interactive approval of high-impact actions
     # ------------------------------------------------------------------
 
-    def request_approval(self, user_id: str, tool_name: str, tool_input) -> bool | None:
+    def request_approval(self, user_id: str, tool_name: str, tool_input,
+                         concern: str | None = None) -> bool | None:
         """Ask a reachable user to approve a single high-impact action.
 
         Called synchronously from the agent's worker thread (the gate blocks
@@ -313,7 +316,7 @@ class GatewayRunner:
         fut: concurrent.futures.Future = concurrent.futures.Future()
         self._pending_approvals[approval_id] = fut
 
-        prompt = _approval_prompt(tool_name, tool_input)
+        prompt = _approval_prompt(tool_name, tool_input, concern)
         security.audit("approval_request", f"{user_id} {tool_name} {tool_input}")
         cf = asyncio.run_coroutine_threadsafe(
             adapter.request_approval(source, approval_id, prompt), self._loop
@@ -331,6 +334,11 @@ class GatewayRunner:
             return False
         finally:
             self._pending_approvals.pop(approval_id, None)
+
+    def can_request_approval(self, user_id: str) -> bool:
+        """Whether *user_id* could be shown an approval prompt right now. Auto
+        mode only answers on behalf of a user who could have answered."""
+        return self._approval_unavailable_reason(user_id) is None
 
     def _approval_unavailable_reason(self, user_id: str) -> str | None:
         """Why an interactive approval can't be sought, or None if it can."""

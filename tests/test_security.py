@@ -25,12 +25,18 @@ def test_confirm_non_interactive_honours_approve_policy(monkeypatch):
 
 
 class _FakeRunner:
-    def __init__(self, decision):
+    def __init__(self, decision, reachable=True):
         self.decision = decision
+        self.reachable = reachable
         self.calls = []
+        self.concerns = []
 
-    def request_approval(self, user_id, tool_name, tool_input):
+    def can_request_approval(self, user_id):
+        return self.reachable
+
+    def request_approval(self, user_id, tool_name, tool_input, concern=None):
         self.calls.append((user_id, tool_name, tool_input))
+        self.concerns.append(concern)
         return self.decision
 
 

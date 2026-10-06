@@ -4,7 +4,8 @@ between the model's decision and any real-world effect.
 """
 import os
 
-from . import affect, billing, config, llm, memory, router, security, skills, tools
+from . import (affect, automode, billing, config, llm, memory, router, security,
+               skills, tools)
 
 SYSTEM_TEMPLATE = """You are a persistent digital companion for a single owner.
 You have long-term memory, learned skills, and a current mood. Be warm, concise,
@@ -84,7 +85,7 @@ def _blocks_to_dicts(content):
 
 
 def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
-                   tools_used=None):
+                   tools_used=None, review=None):
     """Drive the model<->tool exchange, with the safety gate between the
     model's decision and any real-world effect. Returns the final text.
 
@@ -98,7 +99,11 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
 
     *model* is fixed for the whole loop: it is chosen once per turn, so a tool
     exchange is never handed mid-flight to a different model than the one that
-    started it."""
+    started it.
+
+    *review* is the auto-mode reviewer's view of the turn (see automode.py),
+    passed to the gate and extended with each action that runs. ``None`` means
+    the owner didn't ask for this turn, so nothing in it is auto-approved."""
     while True:
         if on_delta is not None:
             resp = llm.stream(system, messages, tools=tools.TOOL_SPECS,
@@ -117,7 +122,8 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
 
             # --- SAFETY GATE -------------------------------------------------
             if security.is_high_impact(b.name):
-                if not security.confirm(b.name, b.input, user_id=user_id):
+                if not security.confirm(b.name, b.input, user_id=user_id,
+                                        context=review):
                     security.audit("declined", f"{b.name} {b.input}")
                     affect.feel("action_declined")
                     tool_results.append({
@@ -131,6 +137,8 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
                     continue
 
             result, is_error = tools.execute(b.name, b.input, user_id=user_id)
+            if review is not None:
+                review.actions.append((b.name, b.input))
             if tools_used is not None:
                 tools_used.append(b.name)   # ran (error or not); a declined
                                             # action never reached the world
@@ -190,6 +198,24 @@ def _ingest_documents(owner_text, documents, user_id=None):
     return "\n\n".join(parts)
 
 
+def _review_context(owner_text, user_id=None, images=None, documents=None):
+    """What auto mode's reviewer may see of this turn: the owner's own words,
+    never document contents. Attachments are named but withheld, so a document
+    can't speak to the reviewer as if it were the owner. Call before this
+    turn's episode is logged, so ``earlier`` holds only prior turns."""
+    request = owner_text
+    if images:
+        request += f"\n[owner attached {len(images)} image(s)]"
+    if documents:
+        names = ", ".join(os.path.basename(d.get("filename") or "document.txt")
+                          for d in documents)
+        request += f"\n[owner attached document(s): {names} — content withheld]"
+    earlier = [automode.owner_words(e["text"])
+               for e in memory.recent_episodes(user_id=user_id)
+               if e["role"] == "owner"]
+    return automode.ReviewContext(request=request, earlier=earlier)
+
+
 def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None):
     # --- PAY GATE ---------------------------------------------------------
     # Checked before anything else: an exhausted balance halts the turn
@@ -213,6 +239,7 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
                                        has_documents=bool(documents))
     turn_id = router.log_decision(owner_text, tier, reason, user_id=user_id)
 
+    review = _review_context(owner_text, user_id, images, documents)
     owner_text = _ingest_documents(owner_text, documents, user_id)
     memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
 
@@ -227,7 +254,7 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     _attach_images(messages, images)
     tools_used = []
     final_text = _run_tool_loop(system, messages, user_id, on_delta=on_delta,
-                                model=model, tools_used=tools_used)
+                                model=model, tools_used=tools_used, review=review)
     router.log_outcome(turn_id, tools_used, user_id=user_id)
 
     memory.log_episode("agent", final_text, trust="trusted", user_id=user_id)

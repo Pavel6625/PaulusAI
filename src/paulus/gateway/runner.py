@@ -28,6 +28,11 @@ def _approval_prompt(tool_name: str, tool_input, concern: str | None = None) -> 
             body = str(tool_input.get("body", ""))
             preview = body if len(body) <= 200 else body[:200] + "…"
             detail = f"to {tool_input.get('to', '?')}: {preview}"
+        elif tool_name == "send_email_agentmail":
+            body = str(tool_input.get("body", ""))
+            preview = body if len(body) <= 200 else body[:200] + "…"
+            detail = (f"email to {tool_input.get('to', '?')}, subject "
+                      f"'{tool_input.get('subject', '')}': {preview}")
         elif tool_name == "send_document":
             dest = tool_input.get("to") or "the current chat"
             detail = f"file '{tool_input.get('filename', '?')}' to {dest}"

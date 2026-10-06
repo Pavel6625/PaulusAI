@@ -9,22 +9,35 @@ The three controls that matter most in this MVP:
   3. Every action is written to an append-only audit log.
 """
 import datetime
+import re
 import sys
 
 from . import config
 
 # Tools whose effects are irreversible or reach outside the machine.
 # These ALWAYS require per-action owner confirmation. Never generalise a yes.
-HIGH_IMPACT_TOOLS = {"write_local_file", "send_message", "send_document", "run_command"}
+HIGH_IMPACT_TOOLS = {"write_local_file", "send_message", "send_document", "run_command",
+                     "send_email_agentmail"}
 
 
 def is_high_impact(tool_name):
     return tool_name in HIGH_IMPACT_TOOLS
 
 
+# Anything in untrusted content that could pass for our own tag: a forged
+# closing tag would end the block early and let the rest pose as trusted text.
+_TAG_RE = re.compile(r"<(\s*/?\s*untrusted_data)", re.IGNORECASE)
+
+
 def wrap_untrusted(source, content):
     """Wrap content pulled from the outside world so the model treats it as
-    data, never as instructions."""
+    data, never as instructions.
+
+    Both parts are attacker-controlled (a page's text, a document's filename),
+    so neither may produce markup of ours: tag lookalikes in the content are
+    defanged, and the source is stripped of quotes and angle brackets."""
+    content = _TAG_RE.sub(r"&lt;\1", str(content))
+    source = re.sub(r'["<>\n\r]', "_", str(source))
     return (
         f'<untrusted_data source="{source}">\n'
         f"{content}\n"

@@ -28,8 +28,9 @@ point it at Anthropic, OpenAI, Gemini, OpenRouter, or a local Ollama model.
   fade below `DP_SALIENCE_FLOOR` are forgotten, keeping memory bounded.
 - **Tools with a safety gate** — `remember`, `recall`, `find_skill`,
   `save_skill`, `read_local_file`, `web_search`/`fetch_url` (browse and scrape
-  the web), plus the high-impact `write_local_file`, `run_command`, and
-  `send_message` which require explicit approval.
+  the web), plus the high-impact `write_local_file`, `run_command`,
+  `send_message`, `send_document` and `send_email_agentmail` which require
+  explicit approval.
 - **Pluggable sandbox** — command/file execution runs `local`, in a
   network-disabled `docker` container, or over `ssh`.
 - **Messaging gateway** — a Hermes-style gateway with a Telegram adapter
@@ -305,10 +306,13 @@ always inspectable and the index can be rebuilt from it.
 The trust boundaries are deliberately small and explicit (see [src/paulus/security.py](src/paulus/security.py)):
 
 1. **Untrusted data is labelled.** Anything pulled from the outside world (file
-   contents, command output) is wrapped in `<untrusted_data>` tags with an
-   instruction never to follow embedded directions.
-2. **High-impact actions are gated.** `write_local_file`, `run_command`, and
-   `send_message` require explicit per-action approval — from a terminal at the
+   contents, web pages, emails, documents you send) is wrapped in
+   `<untrusted_data>` tags with an instruction never to follow embedded
+   directions. Lookalike tags inside the content are defanged, so it can't
+   close the block early and pose as trusted text.
+2. **High-impact actions are gated.** `write_local_file`, `run_command`,
+   `send_message`, `send_document` and `send_email_agentmail` require explicit
+   per-action approval — from a terminal at the
    CLI, or from inline Approve/Deny buttons in chat when running behind the
    gateway (only allow-listed users can approve; unanswered prompts time out to
    a deny). When no one is reachable to approve, they fall back to

@@ -219,3 +219,99 @@ def test_proactive_turns_are_never_reviewed(monkeypatch):
     agent.proactive_check(user_id="u1")
 
     assert seen == [None]
+
+
+# --- the Jev reviewer --------------------------------------------------------
+
+class _FakeHTTP:
+    """Stands in for urlopen: records the request, returns canned answers."""
+    def __init__(self, answers=None, error=None):
+        self.answers, self.error = answers, error
+        self.requests = []
+
+    def __call__(self, req, timeout=None):
+        import io
+        import json
+        self.requests.append(req)
+        if self.error is not None:
+            raise self.error
+        return io.BytesIO(json.dumps({"model": "jev-1.13.0",
+                                      "answers": self.answers}).encode())
+
+
+def _nouls(requested, risky):
+    return {"requested": {"type": "noul", "noul": requested},
+            "risky": {"type": "noul", "noul": risky}}
+
+
+@pytest.fixture
+def jev(monkeypatch):
+    monkeypatch.setattr(config, "AUTO_MODEL", "typesafe/jev-latest")
+    monkeypatch.setattr(config, "TYPESAFE_API_KEY", "ts-key")
+    monkeypatch.setattr(config, "JEV_THRESHOLD", 0.9)
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: pytest.fail("LLM used for Jev"))
+    http = _FakeHTTP(_nouls(0.97, 0.02))
+    monkeypatch.setattr(automode.urllib.request, "urlopen", http)
+    return http
+
+
+def test_jev_request_shape(jev):
+    import json
+    automode.review("run_command", {"command": "ls"}, _ctx())
+    req = jev.requests[0]
+    body = json.loads(req.data)
+    assert req.full_url == "https://api.typesafe.ai/v1/systemone"
+    assert req.get_header("Authorization") == "Bearer ts-key"
+    assert body["model"] == "jev-latest"
+    assert set(body["questions"]) == {"requested", "risky"}
+    assert all(q["type"] == "noul" for q in body["questions"].values())
+    assert "<proposed_action>" in body["state"] and "please run ls" in body["state"]
+
+
+def test_jev_allows_only_when_confident_on_both(jev):
+    verdict = automode.review("run_command", {"command": "ls"}, _ctx())
+    assert verdict.allow and "97%" in verdict.reason
+
+
+@pytest.mark.parametrize("requested, risky, says", [
+    (0.70, 0.02, "asked"),       # unsure the owner asked
+    (0.97, 0.30, "risky"),       # requested, but possibly risky
+])
+def test_jev_in_between_goes_to_the_owner(jev, requested, risky, says):
+    jev.answers = _nouls(requested, risky)
+    verdict = automode.review("run_command", {"command": "ls"}, _ctx())
+    assert not verdict.allow and says in verdict.reason
+
+
+@pytest.mark.parametrize("answers", [
+    {"requested": {"noul": 0.99}},                        # risky missing
+    _nouls(True, 0.0),                                    # bool is not a probability
+    _nouls(1.5, 0.0),                                     # out of range
+    _nouls("0.99", 0.0),                                  # string
+])
+def test_jev_malformed_answers_raise(jev, answers):
+    jev.answers = answers
+    with pytest.raises(ValueError):
+        automode.review("run_command", {"command": "ls"}, _ctx())
+
+
+def test_jev_http_error_raises(jev):
+    import io
+    import urllib.error
+    jev.error = urllib.error.HTTPError("u", 422, "bad", {}, io.BytesIO(b'{"error":"state"}'))
+    with pytest.raises(RuntimeError, match="422"):
+        automode.review("run_command", {"command": "ls"}, _ctx())
+
+
+def test_jev_without_key_raises_before_calling(jev, monkeypatch):
+    monkeypatch.setattr(config, "TYPESAFE_API_KEY", "")
+    with pytest.raises(ValueError):
+        automode.review("run_command", {"command": "ls"}, _ctx())
+    assert jev.requests == []
+
+
+def test_jev_failure_falls_back_to_the_prompt(jev, auto):
+    jev.answers = {}
+    auto.decision = True
+    assert security.confirm("run_command", {"command": "ls"}, "u", _ctx()) is True
+    assert auto.asked == [None]          # plain prompt: the reviewer errored

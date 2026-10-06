@@ -113,7 +113,10 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `DP_GATEWAY_APPROVALS`  | `1`                            | Ask reachable users to approve high-impact actions in chat     |
 | `DP_APPROVAL_TIMEOUT`   | `300`                          | Seconds to wait for an in-chat approval before failing to deny  |
 | `DP_PERMISSION_MODE`    | `ask`                          | `auto` lets a reviewer model approve high-impact actions you clearly asked for (see [Auto mode](#auto-mode)) |
-| `DP_AUTO_MODEL`         | (unset = `DP_CORE_MODEL`)      | The auto-mode reviewer's model                                 |
+| `DP_AUTO_MODEL`         | (unset = `DP_CORE_MODEL`)      | The auto-mode reviewer's model; `typesafe/jev-latest` uses [Jev](#reviewing-with-jev) |
+| `TYPESAFE_API_KEY`      | —                              | TypeSafe API key, for the Jev reviewer                         |
+| `DP_JEV_THRESHOLD`      | `0.9`                          | How sure Jev must be (requested, and not risky) to auto-approve |
+| `DP_AUTO_TIMEOUT`       | `10`                           | Seconds to wait for the Jev reviewer before prompting instead  |
 | `TELEGRAM_BOT_TOKEN`    | —                              | Required for `paulus-gateway`                                  |
 | `TELEGRAM_ALLOWED_USERS`| (all)                          | Numeric Telegram user IDs allowed to **chat**; empty = everyone |
 | `TELEGRAM_TRUSTED_USERS`| (= allowed)                    | IDs allowed to **approve** high-impact actions; empty = nobody  |
@@ -197,6 +200,21 @@ Guarantees:
 
 Every verdict is written to `audit.log` (`auto_approve` / `auto_block` /
 `auto_error`) with the reviewer's reason.
+
+#### Reviewing with Jev
+
+`DP_AUTO_MODEL=typesafe/jev-latest` (plus `TYPESAFE_API_KEY`) reviews with
+TypeSafe's [Jev](https://docs.typesafe.ai), a classifier that returns calibrated
+probabilities instead of text. It is much faster and cheaper than an LLM
+reviewer, but it is in early access and its judgement on this task is unproven.
+
+Jev is asked two yes/no questions: *did the owner ask for this?* and *is it
+risky?*. An action is approved only when Jev is at least `DP_JEV_THRESHOLD`
+(default 0.9) sure of "yes" to the first and "no" to the second. Anything in
+between goes to your prompt with the scores, e.g. `auto-review flagged: Jev
+isn't confident you asked for this (62%)`. Raising the threshold prompts more
+often; lowering it trusts Jev more. Check `auto_approve` lines in `audit.log`
+before lowering it.
 
 ### Telegram bot
 

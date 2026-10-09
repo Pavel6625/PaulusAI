@@ -66,6 +66,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # Live approval prompts keyed by approval_id -> (chat_id, message_id),
         # so the inline buttons can be cleared once the action is settled.
         self._approval_msgs: dict[str, tuple[str, int]] = {}
+        # Count of non-streamed messages posted per chat_id. A streamed reply
+        # compares it against its placeholder to tell whether anything (e.g. an
+        # approval prompt) has since buried the placeholder up the chat.
+        self._posted: dict[str, int] = {}
         # Pending batched messages keyed by SessionSource.key()
         self._pending: dict[str, list[str]] = {}
         self._batch_delay = 0.3  # seconds
@@ -86,7 +90,14 @@ class TelegramAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        self._app = Application.builder().token(self._token).build()
+        # Concurrent updates: photo/document/command handlers await a whole
+        # agent turn, and PTB otherwise processes updates one at a time — so a
+        # turn waiting on an Approve button would queue that very button press
+        # behind itself until the approval timed out. Turns still serialise on
+        # the runner's agent lock.
+        self._app = (
+            Application.builder().token(self._token).concurrent_updates(True).build()
+        )
         self._app.add_handler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, self._on_message)
         )
@@ -304,8 +315,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if source.thread_id:
             kwargs["message_thread_id"] = int(source.thread_id)
         msg = await self._app.bot.send_message(
-            chat_id=source.chat_id, text=prompt, reply_markup=keyboard, **kwargs
+            chat_id=source.chat_id, text=_clip(prompt), reply_markup=keyboard, **kwargs
         )
+        self._note_posted(source.chat_id)
         self._approval_msgs[approval_id] = (source.chat_id, msg.message_id)
 
     async def expire_approval(self, source: SessionSource, approval_id: str) -> None:
@@ -365,6 +377,7 @@ class TelegramAdapter(BasePlatformAdapter):
             kwargs["message_thread_id"] = int(source.thread_id)
         for chunk in _split(text):
             await self._send_chunk(source.chat_id, chunk, kwargs)
+        self._note_posted(source.chat_id)
 
     async def send_with_link(self, source: SessionSource, text: str, label: str,
                              url: str) -> None:
@@ -384,12 +397,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     chat_id=source.chat_id, text=body, parse_mode=self._parse_mode,
                     reply_markup=keyboard, **kwargs,
                 )
+                self._note_posted(source.chat_id)
                 return
             except BadRequest as exc:
                 security.audit("telegram_markdown_fallback", str(exc))
         await self._app.bot.send_message(
             chat_id=source.chat_id, text=text, reply_markup=keyboard, **kwargs
         )
+        self._note_posted(source.chat_id)
 
     async def send_document(self, source: SessionSource, filename: str,
                             content: str) -> None:
@@ -404,6 +419,10 @@ class TelegramAdapter(BasePlatformAdapter):
             document=InputFile(content.encode("utf-8"), filename=filename),
             **kwargs,
         )
+        self._note_posted(source.chat_id)
+
+    def _note_posted(self, chat_id: str) -> None:
+        self._posted[chat_id] = self._posted.get(chat_id, 0) + 1
 
     async def _send_chunk(self, chat_id: str, chunk: str, kwargs: dict) -> None:
         """Deliver one <=4096-char chunk, rendering Markdown when enabled.
@@ -541,6 +560,7 @@ class _StreamSink:
         self._loop = loop
         self._buf = ""
         self._message = None          # telegram Message, once created
+        self._posted_mark = 0         # adapter._posted when it was created
         self._last_edit = 0.0
         self._lock = asyncio.Lock()   # serialises edits; orders interim vs final
         self._done = False
@@ -562,9 +582,12 @@ class _StreamSink:
         async with self._lock:
             if self._done or not self._adapter._app:
                 return
+            created = self._message is None
             self._message = await self._adapter._stream_render(
                 self._source, self._message, snapshot
             )
+            if created and self._message is not None:
+                self._posted_mark = self._adapter._posted.get(self._source.chat_id, 0)
 
     async def finalize(self, reply: str) -> None:
         """Commit the final reply. ``reply`` is the agent's return value; the
@@ -578,6 +601,14 @@ class _StreamSink:
                 # rather than committing an empty message Telegram would reject.
                 await self._delete_message()
                 return
+            if (self._message is not None and self._posted_mark
+                    != self._adapter._posted.get(self._source.chat_id, 0)):
+                # Something (typically approval prompts) was posted after the
+                # placeholder, burying it up the chat. Editing the answer into it
+                # would deliver it silently, out of sight — so move it to the
+                # bottom as a fresh message, which also notifies the owner.
+                await self._delete_message()
+                self._message = None
             await self._adapter._stream_finalize(self._source, self._message, text)
 
     async def discard(self) -> None:

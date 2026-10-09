@@ -461,6 +461,30 @@ def test_llm_stream_reassembles_tool_calls(monkeypatch):
     assert block.name == "recall" and block.input == {"q": "x"}
 
 
+def test_llm_stream_splits_parallel_calls_sharing_an_index(monkeypatch):
+    from types import SimpleNamespace as NS
+
+    import paulus.llm as llm
+
+    def chunk(tool=None, finish=None):
+        return NS(choices=[NS(delta=NS(content=None, tool_calls=tool), finish_reason=finish)])
+
+    # LiteLLM's ollama_chat streams each complete call at index 0, each with its
+    # own id. They must stay separate calls, not merge into one.
+    a = NS(index=0, id="id-a", function=NS(name="run_command", arguments='{"command": "ls"}'))
+    b = NS(index=0, id="id-b", function=NS(name="write_local_file",
+                                           arguments='{"path": "x.py", "content": "y"}'))
+    fake = [chunk(tool=[a]), chunk(tool=[b], finish="tool_calls")]
+    monkeypatch.setattr(llm.litellm, "completion", lambda **kw: iter(fake))
+
+    resp = llm.stream("sys", [{"role": "user", "content": "hi"}])
+
+    assert [(b.id, b.name, b.input) for b in resp.content] == [
+        ("id-a", "run_command", {"command": "ls"}),
+        ("id-b", "write_local_file", {"path": "x.py", "content": "y"}),
+    ]
+
+
 def _approval_adapter(monkeypatch, allowed="", trusted="7"):
     tg = _telegram_module()
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
@@ -719,6 +743,38 @@ def test_streaming_keeps_preamble_when_final_text_empty(monkeypatch):
     assert any(kind == "send" for kind, _, _ in events)
     assert all(kind != "delete" for kind, _, _ in events)
     assert events[-1][1] == "Working on it…"
+
+
+def test_streaming_reply_moves_below_a_prompt_posted_meanwhile(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+    source = SessionSource("telegram", "c", "u")
+
+    async def main():
+        loop = asyncio.get_running_loop()
+
+        def on_loop(coro):
+            return asyncio.run_coroutine_threadsafe(coro, loop).result()
+
+        def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None):
+            on_delta("Checking. ")
+            on_loop(asyncio.sleep(0.05))          # let the placeholder land
+            on_loop(adapter.request_approval(source, "a1", "Approve?"))
+            on_delta("Done.")
+            return "Done."
+
+        monkeypatch.setattr(agent, "respond", fake_respond)
+        await runner.handle_inbound(source, "hi")
+
+    asyncio.run(main())
+
+    # The placeholder sits above the approval prompt, so the answer is not
+    # edited into it out of sight: it's deleted and the reply sent fresh below.
+    kinds = [kind for kind, _, _ in events]
+    assert kinds[:2] == ["send", "send"]          # placeholder, then the prompt
+    assert events[1][1] == "Approve?"
+    assert kinds[-2:] == ["delete", "send"]
+    assert events[-1][1] == "Checking. Done."
 
 
 def test_streaming_finalizes_with_markdown(monkeypatch):
@@ -1074,3 +1130,14 @@ def test_inbound_agent_error_on_image_sends_note(monkeypatch):
     # The streamed placeholder is dropped and a vision-specific note is delivered.
     assert any(kind == "delete" for kind, _, _ in events)
     assert any(kind == "send" and "vision-capable" in text for kind, text, _ in events)
+
+
+def test_approval_prompt_clips_oversized_detail():
+    from paulus.gateway.runner import _APPROVAL_DETAIL_LIMIT, _approval_prompt
+    command = "cat > big.py <<'PY'\n" + "x" * 9000 + "\nPY"
+    prompt = _approval_prompt("run_command", {"command": command}, concern="risky")
+    # Fits one Telegram message (an over-long prompt fails to send, which
+    # denies the action), says what was hidden, and keeps the concern.
+    assert len(prompt) < 4096
+    assert f"+{len(command) - _APPROVAL_DETAIL_LIMIT} more chars not shown" in prompt
+    assert "risky" in prompt

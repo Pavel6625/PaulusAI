@@ -307,7 +307,8 @@ def stream(system, messages, tools=None, on_delta=None, model=None):
     )
 
     text_parts: list[str] = []
-    tool_calls: dict[int, dict] = {}   # call index -> {id, name, args}
+    tool_calls: list[dict] = []        # [{id, name, args}] in arrival order
+    by_index: dict = {}                # call index -> its slot in tool_calls
     finish = None
 
     for chunk in chunks:
@@ -323,7 +324,16 @@ def stream(system, messages, tools=None, on_delta=None, model=None):
                 on_delta(piece)
 
         for tc in getattr(delta, "tool_calls", None) or []:
-            slot = tool_calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+            # A call's fragments share its index — but some providers (LiteLLM's
+            # ollama_chat) send every parallel call at index 0, each with its own
+            # fresh id. Keyed by index alone, those calls merged into one: args
+            # concatenated, the last call's name paired with the first's args.
+            # So a new id at a taken index starts a new call.
+            slot = by_index.get(tc.index)
+            if slot is None or (tc.id and slot["id"] and tc.id != slot["id"]):
+                slot = {"id": "", "name": "", "args": ""}
+                tool_calls.append(slot)
+                by_index[tc.index] = slot
             if tc.id:
                 slot["id"] = tc.id
             fn = getattr(tc, "function", None)
@@ -340,7 +350,7 @@ def stream(system, messages, tools=None, on_delta=None, model=None):
     text = "".join(text_parts)
     if text:
         content.append(_TextBlock(text=text))
-    for _, slot in sorted(tool_calls.items()):
+    for slot in tool_calls:
         content.append(_ToolUseBlock(
             id=slot["id"],
             name=slot["name"],

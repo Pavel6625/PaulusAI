@@ -12,6 +12,10 @@ from .session_store import SessionStore
 
 _instance: GatewayRunner | None = None
 
+# Leaves room for the prompt's framing and an auto-review concern within
+# Telegram's 4096-char message limit.
+_APPROVAL_DETAIL_LIMIT = 3000
+
 
 def get_runner() -> GatewayRunner | None:
     return _instance
@@ -40,6 +44,12 @@ def _approval_prompt(tool_name: str, tool_input, concern: str | None = None) -> 
             detail = str(tool_input)
     else:
         detail = str(tool_input)
+    # Platforms cap message length (Telegram: 4096). A prompt over the cap fails
+    # to send, which denies the action outright — e.g. a heredoc that writes a
+    # whole file. Show the head and say how much is hidden instead.
+    if len(detail) > _APPROVAL_DETAIL_LIMIT:
+        hidden = len(detail) - _APPROVAL_DETAIL_LIMIT
+        detail = f"{detail[:_APPROVAL_DETAIL_LIMIT]}… [+{hidden} more chars not shown]"
     flagged = f"Auto-review flagged: {concern}\n" if concern else ""
     return (
         "⚠️ Approval needed for a high-impact action.\n"

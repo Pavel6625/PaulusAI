@@ -609,7 +609,7 @@ def test_telegram_command_routes_to_runner(monkeypatch):
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
     captured: dict = {}
 
-    async def fake_handle(source, command):
+    async def fake_handle(source, command, args=""):
         captured["cmd"] = command
         captured["uid"] = source.user_id
         return "result text"
@@ -630,7 +630,7 @@ def test_telegram_command_rejects_unauthorized(monkeypatch):
 
     called = {"n": 0}
 
-    async def fake_handle(source, command):
+    async def fake_handle(source, command, args=""):
         called["n"] += 1
         return "should not happen"
 

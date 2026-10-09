@@ -117,7 +117,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app.add_handler(CommandHandler("reset", self._on_reset))
         # The terminal CLI's in-chat commands, mirrored over Telegram. Routed
         # to the runner so the behaviour stays identical across surfaces.
-        for cmd in ("sleep", "mood", "memory", "skills"):
+        for cmd in ("sleep", "mood", "memory", "skills", "bg", "tasks", "cancel"):
             self._app.add_handler(CommandHandler(cmd, self._on_command))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
         await self._app.initialize()
@@ -280,7 +280,8 @@ class TelegramAdapter(BasePlatformAdapter):
         security.audit("gateway_session_reset", source.key())
 
     async def _on_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle the CLI-parity commands (/sleep, /mood, /memory, /skills)."""
+        """Handle the CLI-parity commands (/sleep, /mood, /memory, /skills,
+        /bg <request>, /tasks, /cancel <n>)."""
         if not update.message or not update.effective_user or not update.effective_chat:
             return
         source = self._source_from(update)
@@ -288,10 +289,12 @@ class TelegramAdapter(BasePlatformAdapter):
             await update.message.reply_text("Unauthorized.")
             return
         # Strip the leading slash and any "@botname" suffix Telegram appends in
-        # group chats, leaving the bare command name.
-        cmd = (update.message.text or "").lstrip("/").split()[0].split("@", 1)[0].lower()
+        # group chats, leaving the bare command name; the rest is its argument.
+        parts = (update.message.text or "").lstrip("/").split(maxsplit=1)
+        cmd = parts[0].split("@", 1)[0].lower()
+        args = parts[1].strip() if len(parts) > 1 else ""
         await self.send_typing(source)
-        reply = await self._runner.handle_command(source, cmd)
+        reply = await self._runner.handle_command(source, cmd, args)
         await self.send(source, reply)   # send() splits long output (e.g. /memory)
 
     # ------------------------------------------------------------------

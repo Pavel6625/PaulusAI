@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import itertools
 import time
 
 from .. import billing, config, grants, security
@@ -22,7 +23,7 @@ def get_runner() -> GatewayRunner | None:
 
 
 def _approval_prompt(tool_name: str, tool_input, concern: str | None = None,
-                     grantable: bool = False) -> str:
+                     origin: str | None = None, grantable: bool = False) -> str:
     """A concise, human-readable description of the action awaiting approval."""
     if isinstance(tool_input, dict):
         if tool_name == "run_command":
@@ -51,6 +52,7 @@ def _approval_prompt(tool_name: str, tool_input, concern: str | None = None,
     if len(detail) > _APPROVAL_DETAIL_LIMIT:
         hidden = len(detail) - _APPROVAL_DETAIL_LIMIT
         detail = f"{detail[:_APPROVAL_DETAIL_LIMIT]}… [+{hidden} more chars not shown]"
+    source = f"From: {origin}\n" if origin else ""
     flagged = f"Auto-review flagged: {concern}\n" if concern else ""
     scope = ""
     if grantable:
@@ -59,6 +61,7 @@ def _approval_prompt(tool_name: str, tool_input, concern: str | None = None,
                  "until this task ends.")
     return (
         "⚠️ Approval needed for a high-impact action.\n"
+        f"{source}"
         f"Action: {tool_name}\n"
         f"Details: {detail}\n"
         f"{flagged}\n"
@@ -76,7 +79,9 @@ class GatewayRunner:
         self._adapters: dict[str, BasePlatformAdapter] = {}
         self._sessions = SessionStore()
         self._presence = PresenceStore(config.PRESENCE_FILE)
-        # Serialize agent calls: PaulusAI's memory modules are not thread-safe.
+        # Serialize conversation turns, so each one sees the last one's reply.
+        # Background tasks (tasks.py) run beside them, outside this lock; the
+        # memory stores lock themselves.
         self._agent_lock = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
         # The gateway event loop, captured once it is running, so the agent's
@@ -85,8 +90,12 @@ class GatewayRunner:
         # Pending high-impact approvals awaiting a user's Approve/Deny, keyed by
         # a short id carried in the prompt's callback.
         self._pending_approvals: dict[str, concurrent.futures.Future] = {}
-        self._approval_seq = 0
+        # Prompts are requested from several threads at once (subagents,
+        # background tasks); next() on a count is atomic, += is not.
+        self._approval_seq = itertools.count(1)
         _instance = self
+        from .. import tasks
+        tasks.set_notifier(self.notify_user)
 
     def register(self, name: str, adapter: BasePlatformAdapter) -> None:
         self._adapters[name] = adapter
@@ -196,13 +205,28 @@ class GatewayRunner:
                 security.audit("gateway_send_error", str(exc))
                 adapter._on_failure()
 
-    async def handle_command(self, source: SessionSource, command: str) -> str:
+    async def handle_command(self, source: SessionSource, command: str,
+                             args: str = "") -> str:
         """Run an in-chat slash command and return the reply text. Mirrors the
-        terminal CLI's /sleep, /mood, /memory and /skills, but scoped to the
-        calling user (per-user episodic/semantic memory; skills and mood are
-        global). Called by adapters that register command handlers."""
-        from .. import affect, memory, skills
+        terminal CLI's /sleep, /mood, /memory, /skills, /bg, /tasks and
+        /cancel, but scoped to the calling user (per-user episodic/semantic
+        memory and tasks; skills and mood are global). Called by adapters that
+        register command handlers."""
+        from .. import affect, memory, skills, tasks
         user_id = str(source.user_id)
+
+        if command == "bg":
+            # Starting a task is quick (routing + a thread), but it reads and
+            # writes memory, so it takes the same path as a turn.
+            self._presence.touch(source)
+            async with self._agent_lock:
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(
+                    None, lambda: tasks.start_from_owner(args, user_id=user_id))
+        if command == "tasks":
+            return tasks.status(user_id)
+        if command == "cancel":
+            return tasks.cancel(user_id, args.strip())
 
         if command == "sleep":
             # Consolidation hits the model and writes memory, so it runs under
@@ -222,6 +246,22 @@ class GatewayRunner:
         if command == "skills":
             return skills.describe()
         return f"Unknown command: /{command}"
+
+    def notify_user(self, user_id, text: str) -> None:
+        """Deliver *text* to *user_id*'s most recent chat. Called from a
+        background task's thread when it finishes; blocks until sent."""
+        source, error = self._resolve_destination("", user_id)
+        if error is not None or self._loop is None:
+            security.audit("notify_skip", f"{user_id}: {error or 'loop not running'}")
+            return
+        adapter = self._adapters[source.platform]
+        try:
+            asyncio.run_coroutine_threadsafe(
+                adapter.send(source, text), self._loop).result(timeout=60)
+            adapter._on_success()
+        except Exception as exc:
+            security.audit("notify_error", f"{user_id}: {exc}")
+            adapter._on_failure()
 
     def _resolve_target(self, to: str) -> tuple[str | None, str, str | None]:
         """Resolve a 'to' spec into (platform_name, chat_id, error).
@@ -314,7 +354,7 @@ class GatewayRunner:
     # ------------------------------------------------------------------
 
     def request_approval(self, user_id: str, tool_name: str, tool_input,
-                         concern: str | None = None,
+                         concern: str | None = None, origin: str | None = None,
                          grantable: bool = False) -> bool | str | None:
         """Ask a reachable user to approve a single high-impact action.
 
@@ -326,7 +366,7 @@ class GatewayRunner:
         Telegram button), bypassing the agent lock, and resolves the future.
 
         *grantable* offers the "allow for this task" answer, on adapters that
-        support it.
+        support it; *origin* names who is asking (a subagent, a background task).
         """
         reason = self._approval_unavailable_reason(user_id)
         if reason is not None:
@@ -337,13 +377,12 @@ class GatewayRunner:
 
         source = self._presence._users[str(user_id)].last_source
         adapter = self._adapters[source.platform]
-        self._approval_seq += 1
-        approval_id = f"{int(time.time())}-{self._approval_seq}"
+        approval_id = f"{int(time.time())}-{next(self._approval_seq)}"
         fut: concurrent.futures.Future = concurrent.futures.Future()
         self._pending_approvals[approval_id] = fut
 
         grantable = grantable and getattr(adapter, "supports_grants", False)
-        prompt = _approval_prompt(tool_name, tool_input, concern, grantable)
+        prompt = _approval_prompt(tool_name, tool_input, concern, origin, grantable)
         security.audit("approval_request", f"{user_id} {tool_name} {tool_input}")
         extra = {"grantable": True} if grantable else {}
         cf = asyncio.run_coroutine_threadsafe(
@@ -422,6 +461,8 @@ class GatewayRunner:
             security.audit("idle_loop_disabled", "DP_IDLE_CHECK<=0")
 
     async def stop_all(self) -> None:
+        from .. import tasks
+        tasks.cancel_all()
         if self._idle_task is not None:
             self._idle_task.cancel()
             try:

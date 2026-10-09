@@ -31,6 +31,11 @@ point it at Anthropic, OpenAI, Gemini, OpenRouter, or a local Ollama model.
   the web), plus the high-impact `write_local_file`, `run_command`,
   `send_message`, `send_document` and `send_email_agentmail` which require
   explicit approval.
+- **Subagents** — the agent can `delegate` self-contained subtasks to focused
+  `researcher` / `worker` subagents that run in parallel, each with a clean
+  context, a short tool list and a step budget, and report back.
+- **Background tasks** — long jobs run beside the conversation (`start_task`,
+  or `/bg` in chat) and report back as their own message when done.
 - **Pluggable sandbox** — command/file execution runs `local`, in a
   network-disabled `docker` container, or over `ssh`.
 - **Messaging gateway** — a Hermes-style gateway with a Telegram adapter
@@ -117,6 +122,14 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `TYPESAFE_API_KEY`      | —                              | TypeSafe API key, for Jev direct (`typesafe/jev-latest`)       |
 | `DP_JEV_THRESHOLD`      | `0.9`                          | How sure Jev must be (requested, and not risky) to auto-approve |
 | `DP_AUTO_TIMEOUT`       | `10`                           | Seconds to wait for the Jev reviewer before prompting instead  |
+| `DP_SUBAGENTS`          | `1`                            | Offer the `delegate` tool (see [Subagents](#subagents-and-background-tasks)); `0` disables |
+| `DP_SUBAGENT_MODEL`     | (unset = the turn's model)     | Model the subagents run on                                     |
+| `DP_SUBAGENT_MAX_STEPS` | `15`                           | Tool rounds a subagent gets before it must report              |
+| `DP_TASKS`              | `1`                            | Offer background tasks (`start_task`, `/bg`); `0` disables      |
+| `DP_TASK_MODEL`         | (unset = the turn's model)     | Model background tasks run on                                  |
+| `DP_TASK_MAX_STEPS`     | `40`                           | Tool rounds a background task gets before it must report       |
+| `DP_TASK_MAX_MINUTES`   | `30`                           | Wall-clock limit per background task                           |
+| `DP_MAX_TASKS_PER_USER` | `3`                            | Background tasks one user may have running at once             |
 | `TELEGRAM_BOT_TOKEN`    | —                              | Required for `paulus-gateway`                                  |
 | `TELEGRAM_ALLOWED_USERS`| (all)                          | Numeric Telegram user IDs allowed to **chat**; empty = everyone |
 | `TELEGRAM_TRUSTED_USERS`| (= allowed)                    | IDs allowed to **approve** high-impact actions; empty = nobody  |
@@ -159,6 +172,9 @@ In-chat commands:
 | `/route X`| Show which model tier the text `X` routes to, and why (tuning) |
 | `/routes` | Show recent routing decisions, their outcomes, and what was learned |
 | `/auto`   | Toggle [auto mode](#auto-mode) for this session               |
+| `/bg X`   | Run `X` as a [background task](#subagents-and-background-tasks) |
+| `/tasks`  | List background tasks and their progress                       |
+| `/cancel N` | Cancel background task `N`                                   |
 | `/quit`   | Consolidate and exit                                          |
 
 When the agent proposes a **high-impact action** (writing a file, running a
@@ -183,7 +199,8 @@ actions of the same kind run without asking until the task ends:
 - what it covers is narrow: running the same program (`pytest`, or `git status`
   as distinct from `git push`), writing files in the workspace, or sending to
   the same recipient;
-- it ends with the turn it was given in, and is never stored;
+- it ends with the turn, or the background task, it was given in, and is never
+  stored;
 - it is only offered for actions that can be scoped safely. Deleting, killing,
   network clients (`curl`, `ssh`, ...), wrappers that run other programs
   (`sudo`, `sh -c`, `xargs`, ...) and commands touching paths outside the
@@ -242,6 +259,46 @@ isn't confident you asked for this (62%)`. Raising the threshold prompts more
 often; lowering it trusts Jev more. Check `auto_approve` lines in `audit.log`
 before lowering it.
 
+### Subagents and background tasks
+
+**Subagents.** For work with independent parts, or research that means
+reading many pages, the agent calls `delegate` with up to
+`DP_SUBAGENT_MAX_PARALLEL` (4) tasks. Each runs as a separate subagent, in
+parallel, starting from a clean context with only the task it was given:
+
+| Subagent     | Tools                                                                 |
+|--------------|-----------------------------------------------------------------------|
+| `researcher` | `web_search`, `fetch_url`, `recall`, `find_skill`, `read_local_file`  |
+| `worker`     | the above, plus `write_local_file` and `run_command` (gated as usual) |
+
+Subagents are told to report only what their tools showed and to say what they
+couldn't verify rather than guess. Their reports come back to the agent wrapped
+as untrusted data. They can't write memory, message anyone, delegate further
+or start tasks; those stay with the agent that talks to you.
+
+**Background tasks.** A job that will take minutes no longer holds the
+conversation. The agent calls `start_task` (or you type `/bg <request>`),
+answers right away, and the result arrives as its own message when the task
+is done. It is also logged to memory, so you can ask about it afterwards.
+`/tasks` shows progress, `/cancel N` stops a task at its next step. A task has
+the agent's tools (including `delegate`), a step budget (`DP_TASK_MAX_STEPS`)
+and a time limit (`DP_TASK_MAX_MINUTES`).
+
+Both act for you under the same gate. Their high-impact actions are cleared
+against the turn that started them (your words, never the task text the agent
+wrote), and their approval prompts say who is asking (`From: background task
+#3 (...)`). Notes:
+
+- **In the terminal, a background task can't prompt you**, because the console
+  belongs to the conversation. An action it needs approved is denied unless
+  auto mode or an [Allow for this task](#allow-for-this-task) grant from the
+  turn that started it covers it. On Telegram, prompts reach the chat as usual.
+- **Tasks live in memory.** A restart drops running ones. Each start and finish
+  is in `audit.log` (`task_start`, `task_done`, ...).
+- **Billing:** `/bg` is pay-gated like a message. A task started by the agent
+  belongs to the turn that started it, so it isn't gated again. Watch
+  `DP_TASK_MAX_STEPS` if usage is metered per message.
+
 ### Telegram bot
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
@@ -253,8 +310,8 @@ paulus-gateway
 ```
 
 Message the bot on Telegram. The in-chat commands work here too — `/sleep`,
-`/mood`, `/memory` and `/skills` (each scoped to your own per-user memory) — plus
-`/reset` to start a fresh session.
+`/mood`, `/memory`, `/skills`, `/bg`, `/tasks` and `/cancel` (each scoped to
+your own memory and tasks) — plus `/reset` to start a fresh session.
 
 Replies are rendered as Markdown (bold, code blocks, lists, links) — the
 model's CommonMark is converted to Telegram's MarkdownV2 dialect, falling back
@@ -363,7 +420,8 @@ The trust boundaries are deliberately small and explicit (see [src/paulus/securi
    `DP_UNATTENDED_POLICY` (**deny** by default). In [auto mode](#auto-mode) a
    reviewer model answers the prompt for actions you clearly asked for, and
    an [Allow for this task](#allow-for-this-task) grant widens one approval
-   to similar actions until the task ends.
+   to similar actions until the task ends. Subagents and background tasks go
+   through the same gate.
 3. **Everything is audited.** Every tool call is appended to `audit.log`.
 4. **Execution is sandboxed.** File ops are confined to `workspace/`; commands
    run via the configured backend — use `docker` (network-disabled) or `ssh`
@@ -407,6 +465,8 @@ src/paulus/
 ├── security.py       # untrusted-data wrapping, approval gate, audit log
 ├── automode.py       # auto mode: model reviewer that answers approval prompts
 ├── grants.py         # "allow for this task": what one approval may cover
+├── subagents.py      # parallel researcher/worker subagents (`delegate`)
+├── tasks.py          # background tasks (`start_task`, /bg, /tasks, /cancel)
 ├── billing.py        # usage pay gate (external balance/pricing service)
 ├── sandbox.py        # local / docker / ssh execution backends
 ├── config.py         # env-driven configuration + data-dir resolution

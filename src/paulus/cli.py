@@ -12,9 +12,12 @@ Commands:
   /routes   show recent routing decisions, their outcomes, and what was learned
   /auto     toggle auto mode: a reviewer model approves high-impact actions
             you clearly asked for; anything else still prompts you
+  /bg X     run X as a background task; its result is printed when done
+  /tasks    list background tasks
+  /cancel N cancel background task N
   /quit     consolidate and exit
 """
-from . import affect, agent, config, memory, router, skills, vectorstore
+from . import affect, agent, config, memory, router, skills, tasks, vectorstore
 
 
 def _routes_report(user_id=None, limit=15):
@@ -88,6 +91,15 @@ def main():
         if text == "/auto":
             config.PERMISSION_MODE = "ask" if config.PERMISSION_MODE == "auto" else "auto"
             print(f"permission mode: {config.PERMISSION_MODE}")
+            continue
+        if text == "/bg" or text.startswith("/bg "):
+            print(tasks.start_from_owner(text[len("/bg"):]))
+            continue
+        if text == "/tasks":
+            print(tasks.status(None))
+            continue
+        if text == "/cancel" or text.startswith("/cancel "):
+            print(tasks.cancel(None, text[len("/cancel"):].strip()))
             continue
 
         print(f"\ndp> {agent.respond(text)}\n")

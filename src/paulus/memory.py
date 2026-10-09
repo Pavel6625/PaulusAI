@@ -16,13 +16,28 @@ passes ``user_id=None``, which falls back to the original global paths so
 existing installations are unaffected.
 """
 import datetime
+import functools
 import json
 import os
 import re
+import threading
 import uuid
 from pathlib import Path
 
 from . import config, llm, security, vectorstore
+
+# Background tasks and subagents use these stores from their own threads, beside
+# the conversation, and a JSON file rewritten in place can be read half-written.
+# One re-entrant lock per store keeps every read and read-modify-write whole.
+_lock = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 def _safe_uid(user_id: str) -> str:
@@ -97,6 +112,7 @@ def _trim_episodic(path):
     tmp.replace(path)
 
 
+@_locked
 def log_episode(role, text, trust="trusted", user_id=None):
     config.ensure_dirs()
     _ensure_user_dir(user_id)
@@ -110,6 +126,7 @@ def log_episode(role, text, trust="trusted", user_id=None):
     _trim_episodic(path)
 
 
+@_locked
 def recent_episodes(n=None, user_id=None):
     n = n or config.RECENT_EPISODES
     path = _episodic_log(user_id)
@@ -150,6 +167,7 @@ def _quarantine(records, user_id):
     return good
 
 
+@_locked
 def semantic_text(user_id=None) -> str:
     """The human-readable semantic-memory view (semantic.md), or a placeholder
     when nothing has been learned yet. Used by the /memory command on the CLI
@@ -280,6 +298,7 @@ def _reconcile(new_fact, facts, confidence, provenance, user_id):
     return None
 
 
+@_locked
 def add_fact(fact, confidence=0.7, provenance=None, user_id=None):
     # Every reader assumes a fact's text is a non-empty string, and none of them
     # check. Enforce it at the only door in: a stored non-string used to raise
@@ -348,6 +367,7 @@ def _ensure_index(facts, user_id=None):
         print(f"[memory] reindex failed: {e}")
 
 
+@_locked
 def search_facts(query, k=None, user_id=None):
     k = k or config.TOP_FACTS
     facts = _load_facts(user_id)
@@ -370,6 +390,7 @@ def search_facts(query, k=None, user_id=None):
 # Consolidation                                                                #
 # --------------------------------------------------------------------------- #
 
+@_locked
 def decay(user_id=None):
     """Fade salience and forget what has faded below the floor. Evicted facts
     are dropped from facts.json (and semantic.md, via _save_facts) and from the

@@ -160,14 +160,21 @@ class ReviewContext:
     """The slice of a task the reviewer may see. Built by the agent from the
     owner's own words only; the actions list grows as the task's tools run.
 
-    It is also the task's scope: *grants* holds what the owner allowed "for
-    this task" (grants.py), and ends with it."""
+    It is also the task's scope: subagents share it, and a background task
+    starts from a copy of the turn that launched it. *grants* holds what the
+    owner allowed "for this task" (grants.py)."""
     request: str                                  # this turn's owner message
     earlier: list = field(default_factory=list)   # prior owner messages, oldest first
     # (name, input, cleared) already run this task; *cleared* is how the gate
     # cleared it (security.clearance), or None for a tool that needs no approval
     actions: list = field(default_factory=list)
     grants: set = field(default_factory=set)
+
+    def fork(self):
+        """A copy for a background task, so its actions and grants stop
+        flowing back into the turn that started it once that turn has ended."""
+        return ReviewContext(request=self.request, earlier=list(self.earlier),
+                             actions=list(self.actions), grants=set(self.grants))
 
 
 # How each clearance reads to the reviewer. Written by us, outside the JSON the

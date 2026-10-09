@@ -9,9 +9,24 @@ Still functional, still legible: describe() reports the mood and the last
 emotion felt, and feel() returns the emotions so the caller can log *why*.
 This is expressive, explainable emotional behaviour — not a claim of feeling.
 """
+import functools
 import json
+import threading
 
 from . import appraisal, config
+
+# Background tasks and subagents use these stores from their own threads, beside
+# the conversation, and a JSON file rewritten in place can be read half-written.
+# One re-entrant lock per store keeps every read and read-modify-write whole.
+_lock = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 # Stable traits (Big Five subset). 0..1.
 PERSONALITY = {
@@ -64,6 +79,7 @@ def _clip(x):
     return max(-1.0, min(1.0, x))
 
 
+@_locked
 def feel(event):
     """Appraise an event, fold the resulting emotions into the mood, persist,
     and return the {emotion: intensity} dict (for logging the 'why')."""
@@ -85,6 +101,7 @@ def feel(event):
     return emotions
 
 
+@_locked
 def decay(s=None):
     """Mood drifts back toward the personality baseline each turn."""
     s = s or _load()
@@ -95,6 +112,7 @@ def decay(s=None):
     return s
 
 
+@_locked
 def describe(s=None):
     s = s or _load()
     p, a = s["pleasure"], s["arousal"]

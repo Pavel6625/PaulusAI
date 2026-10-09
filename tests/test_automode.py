@@ -75,7 +75,7 @@ class _Runner:
     def can_request_approval(self, user_id):
         return self.reachable
 
-    def request_approval(self, user_id, tool_name, tool_input, concern=None):
+    def request_approval(self, user_id, tool_name, tool_input, concern=None, **kw):
         self.asked.append(concern)
         return self.decision
 
@@ -180,9 +180,9 @@ def _tool_then_text(name, tool_input):
 def test_respond_reviews_with_owner_words_only(monkeypatch):
     memory.log_episode("owner", "earlier ask", trust="trusted", user_id="u1")
     seen = []
-    monkeypatch.setattr(security, "confirm",
+    monkeypatch.setattr(security, "clearance",
                         lambda name, inp, user_id=None, context=None:
-                        seen.append(context) or False)
+                        seen.append(context) or None)
     monkeypatch.setattr(llm, "complete",
                         _tool_then_text("run_command", {"command": "ls"}))
 
@@ -197,22 +197,23 @@ def test_respond_reviews_with_owner_words_only(monkeypatch):
 
 def test_ran_actions_are_shown_to_later_reviews(monkeypatch):
     seen = []
-    monkeypatch.setattr(security, "confirm",
+    monkeypatch.setattr(security, "clearance",
                         lambda name, inp, user_id=None, context=None:
-                        seen.append(context) or True)
+                        seen.append(context) or "owner")
     monkeypatch.setattr(llm, "complete",
                         _tool_then_text("write_local_file", {"path": "a.txt", "content": "hi"}))
 
     agent.respond("save hi to a.txt", user_id="u1")
 
-    assert seen[0].actions == [("write_local_file", {"path": "a.txt", "content": "hi"})]
+    assert seen[0].actions == [("write_local_file", {"path": "a.txt", "content": "hi"},
+                                "owner")]
 
 
 def test_proactive_turns_are_never_reviewed(monkeypatch):
     seen = []
-    monkeypatch.setattr(security, "confirm",
+    monkeypatch.setattr(security, "clearance",
                         lambda name, inp, user_id=None, context=None:
-                        seen.append(context) or False)
+                        seen.append(context) or None)
     monkeypatch.setattr(llm, "complete",
                         _tool_then_text("send_message", {"to": "x", "body": "hi"}))
 

@@ -34,7 +34,7 @@ class _FakeRunner:
     def can_request_approval(self, user_id):
         return self.reachable
 
-    def request_approval(self, user_id, tool_name, tool_input, concern=None):
+    def request_approval(self, user_id, tool_name, tool_input, concern=None, **kw):
         self.calls.append((user_id, tool_name, tool_input))
         self.concerns.append(concern)
         return self.decision

@@ -12,12 +12,17 @@ import datetime
 import re
 import sys
 
-from . import config
+from . import config, grants
 
 # Tools whose effects are irreversible or reach outside the machine.
-# These ALWAYS require per-action owner confirmation. Never generalise a yes.
+# These ALWAYS require owner confirmation. A yes covers one action, unless the
+# owner explicitly widens it to "similar actions for this task" (grants.py).
 HIGH_IMPACT_TOOLS = {"write_local_file", "send_message", "send_document", "run_command",
                      "send_email_agentmail"}
+
+# The owner's answer that approves this action AND grants similar ones for the
+# rest of the task. Truthy, so code that only asks "approved?" still works.
+GRANT = "grant"
 
 
 def is_high_impact(tool_name):
@@ -57,6 +62,15 @@ def _interactive() -> bool:
 
 def confirm(tool_name, tool_input, user_id=None, context=None):
     """Human-in-the-loop gate. Returns True only on explicit approval.
+    See clearance(), which also says how the action was cleared."""
+    return clearance(tool_name, tool_input, user_id, context) is not None
+
+
+def clearance(tool_name, tool_input, user_id=None, context=None):
+    """Human-in-the-loop gate. Returns how the action was cleared, or None
+    when it wasn't: "grant" (the owner allowed similar actions earlier in this
+    task), "auto" (auto mode's reviewer), "owner" (the owner answered the
+    prompt) or "unattended" (DP_UNATTENDED_POLICY=approve).
 
     Approval is sought from whoever can actually answer. The request is routed
     to the channel it CAME from, so a gateway request is never hijacked by a
@@ -71,25 +85,42 @@ def confirm(tool_name, tool_input, user_id=None, context=None):
     In auto mode, a reviewer model answers first on the owner's behalf (see
     automode.py). *context* is what it may see of the turn; ``None`` means the
     turn was not the owner's request (e.g. an idle nudge) and is never reviewed.
+    It also carries the task's grants: whatever the owner allowed "for this
+    task" runs without review or prompt.
     """
+    if context is not None and grants.covers(context.grants, tool_name, tool_input):
+        audit("grant_approve", f"{tool_name} {tool_input}")
+        return "grant"
+    grantable = context is not None and grants.keys(tool_name, tool_input) is not None
+
     if context is not None and config.PERMISSION_MODE == "auto" \
             and _can_ask(user_id):
         verdict = _auto_review(tool_name, tool_input, context)
         if verdict is not None and verdict.allow:
-            return True
+            return "auto"
         if verdict is not None:
             # A flagged action goes to the owner and nowhere else: if they've
             # become unreachable, DP_UNATTENDED_POLICY=approve must not wave
             # through what the reviewer just flagged.
-            decision = _ask(tool_name, tool_input, user_id, concern=verdict.reason)
+            decision = _ask(tool_name, tool_input, user_id, concern=verdict.reason,
+                            grantable=grantable)
             if decision is None:
                 audit("auto_block_unanswered", f"{tool_name} {tool_input}")
-            return bool(decision)
+            return _settle(decision, tool_name, tool_input, context)
 
-    decision = _ask(tool_name, tool_input, user_id)
+    decision = _ask(tool_name, tool_input, user_id, grantable=grantable)
     if decision is None:
-        return _unattended(tool_name, tool_input)
-    return decision
+        return "unattended" if _unattended(tool_name, tool_input) else None
+    return _settle(decision, tool_name, tool_input, context)
+
+
+def _settle(decision, tool_name, tool_input, context):
+    """The owner's answer as a clearance, recording a grant if they gave one."""
+    if decision == GRANT and context is not None:
+        needed = grants.keys(tool_name, tool_input) or frozenset()
+        context.grants.update(needed)
+        audit("grant", f"{tool_name} {sorted(needed)}")
+    return "owner" if decision else None
 
 
 def _can_ask(user_id):
@@ -123,16 +154,17 @@ def _auto_review(tool_name, tool_input, context):
     return verdict
 
 
-def _ask(tool_name, tool_input, user_id, concern=None):
-    """Prompt whoever can answer: True/False, or None if nobody can."""
+def _ask(tool_name, tool_input, user_id, concern=None, grantable=False):
+    """Prompt whoever can answer: True, False or GRANT, or None if nobody can."""
     if user_id is not None:
-        decision = _gateway_confirm(tool_name, tool_input, user_id, concern)
+        decision = _gateway_confirm(tool_name, tool_input, user_id, concern, grantable)
         if decision is not None:
-            audit("gateway_" + ("approve" if decision else "deny"),
-                  f"{tool_name} {tool_input}")
+            verb = ("grant" if decision == GRANT
+                    else "approve" if decision else "deny")
+            audit(f"gateway_{verb}", f"{tool_name} {tool_input}")
         return decision
     if _interactive():
-        return _console_confirm(tool_name, tool_input, concern)
+        return _console_confirm(tool_name, tool_input, concern, grantable)
     return None
 
 
@@ -143,25 +175,33 @@ def _unattended(tool_name, tool_input):
     return approved
 
 
-def _console_confirm(tool_name, tool_input, concern=None):
+def _console_confirm(tool_name, tool_input, concern=None, grantable=False):
     print("\n" + "=" * 60)
     print(f"  CONFIRMATION REQUIRED — high-impact action: {tool_name}")
     print(f"  details: {tool_input}")
     if concern:
         print(f"  auto-review flagged: {concern}")
+    choices = "[y/N]"
+    if grantable:
+        scope = grants.describe(grants.keys(tool_name, tool_input))
+        print(f"  a = approve, and allow {scope} for the rest of this task")
+        choices = "[y/N/a]"
     print("=" * 60)
     try:
-        answer = input("  Approve this single action? [y/N] ").strip().lower()
+        answer = input(f"  Approve this single action? {choices} ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         return False
+    if answer == "a" and grantable:
+        return GRANT
     return answer == "y"
 
 
-def _gateway_confirm(tool_name, tool_input, user_id, concern=None):
+def _gateway_confirm(tool_name, tool_input, user_id, concern=None, grantable=False):
     """Ask the requesting user to approve via the chat gateway. Returns True
-    (approved), False (denied or timed out), or ``None`` when no interactive
-    gateway channel is available — so the caller falls back to the unattended
-    policy. The gateway is imported lazily to keep this module dependency-free."""
+    (approved), GRANT (approved for the task), False (denied or timed out), or
+    ``None`` when no interactive gateway channel is available — so the caller
+    falls back to the unattended policy. The gateway is imported lazily to keep
+    this module dependency-free."""
     if not config.GATEWAY_APPROVALS or user_id is None:
         return None
     try:
@@ -171,7 +211,8 @@ def _gateway_confirm(tool_name, tool_input, user_id, concern=None):
     runner = get_runner()
     if runner is None:
         return None
-    return runner.request_approval(user_id, tool_name, tool_input, concern=concern)
+    return runner.request_approval(user_id, tool_name, tool_input, concern=concern,
+                                   grantable=grantable)
 
 
 def audit(event, detail):

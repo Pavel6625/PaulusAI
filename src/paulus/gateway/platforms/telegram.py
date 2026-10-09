@@ -44,6 +44,7 @@ class TelegramAdapter(BasePlatformAdapter):
     """
     supports_typing_indicator = True
     supports_approvals = True   # high-impact actions can be approved via buttons
+    supports_grants = True      # ...including "allow for this task" (grants.py)
     supports_images = True      # photos / image documents are routed to the agent
     supports_documents = True   # text documents are read in and can be sent back
 
@@ -302,15 +303,20 @@ class TelegramAdapter(BasePlatformAdapter):
         return str(user_id) in self._trusted
 
     async def request_approval(self, source: SessionSource, approval_id: str,
-                               prompt: str) -> None:
-        """Send an Approve/Deny prompt for a high-impact action. Runs on the
-        gateway loop; the agent thread is blocked waiting for the answer."""
+                               prompt: str, grantable: bool = False) -> None:
+        """Send an Approve/Deny prompt for a high-impact action, plus "Allow for
+        this task" when the action can be granted. Runs on the gateway loop;
+        the agent thread is blocked waiting for the answer."""
         if not self._app:
             return
-        keyboard = InlineKeyboardMarkup([[
+        rows = [[
             InlineKeyboardButton("✅ Approve", callback_data=f"dpok:{approval_id}"),
             InlineKeyboardButton("🚫 Deny", callback_data=f"dpno:{approval_id}"),
-        ]])
+        ]]
+        if grantable:
+            rows.append([InlineKeyboardButton(
+                "✅ Allow for this task", callback_data=f"dpall:{approval_id}")])
+        keyboard = InlineKeyboardMarkup(rows)
         kwargs: dict = {}
         if source.thread_id:
             kwargs["message_thread_id"] = int(source.thread_id)
@@ -339,7 +345,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if query is None or not query.data or ":" not in query.data:
             return
         action, approval_id = query.data.split(":", 1)
-        if action not in ("dpok", "dpno"):
+        if action not in ("dpok", "dpno", "dpall"):
             return
 
         # Only a trusted user may approve, even if they can press the button.
@@ -351,12 +357,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await query.answer()
 
-        approved = action == "dpok"
+        approved = {"dpok": True, "dpno": False, "dpall": security.GRANT}[action]
         settled = self._runner.resolve_approval(approval_id, approved)
         self._approval_msgs.pop(approval_id, None)
 
         if not settled:
             verdict = "⏲️ This request already expired."
+        elif approved == security.GRANT:
+            verdict = "✅ Approved, and allowed for the rest of this task."
         else:
             verdict = "✅ Approved." if approved else "🚫 Denied."
         base = query.message.text if query.message else ""

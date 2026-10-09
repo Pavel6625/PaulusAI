@@ -5,7 +5,7 @@ import asyncio
 import concurrent.futures
 import time
 
-from .. import billing, config, security
+from .. import billing, config, grants, security
 from .base import SILENCE_TOKENS, AdapterState, BasePlatformAdapter, SessionSource
 from .presence import PresenceStore
 from .session_store import SessionStore
@@ -21,7 +21,8 @@ def get_runner() -> GatewayRunner | None:
     return _instance
 
 
-def _approval_prompt(tool_name: str, tool_input, concern: str | None = None) -> str:
+def _approval_prompt(tool_name: str, tool_input, concern: str | None = None,
+                     grantable: bool = False) -> str:
     """A concise, human-readable description of the action awaiting approval."""
     if isinstance(tool_input, dict):
         if tool_name == "run_command":
@@ -51,12 +52,17 @@ def _approval_prompt(tool_name: str, tool_input, concern: str | None = None) -> 
         hidden = len(detail) - _APPROVAL_DETAIL_LIMIT
         detail = f"{detail[:_APPROVAL_DETAIL_LIMIT]}… [+{hidden} more chars not shown]"
     flagged = f"Auto-review flagged: {concern}\n" if concern else ""
+    scope = ""
+    if grantable:
+        scope = ("\n“Allow for this task” also allows "
+                 f"{grants.describe(grants.keys(tool_name, tool_input))} "
+                 "until this task ends.")
     return (
         "⚠️ Approval needed for a high-impact action.\n"
         f"Action: {tool_name}\n"
         f"Details: {detail}\n"
         f"{flagged}\n"
-        "Approve this single action?"
+        f"Approve this single action?{scope}"
     )
 
 
@@ -308,14 +314,19 @@ class GatewayRunner:
     # ------------------------------------------------------------------
 
     def request_approval(self, user_id: str, tool_name: str, tool_input,
-                         concern: str | None = None) -> bool | None:
+                         concern: str | None = None,
+                         grantable: bool = False) -> bool | str | None:
         """Ask a reachable user to approve a single high-impact action.
 
         Called synchronously from the agent's worker thread (the gate blocks
-        there). Returns True (approved), False (denied or timed out), or None
-        when the user has no interactive channel — so the caller falls back to
-        the unattended policy. The Approve/Deny answer arrives out-of-band (e.g.
-        a Telegram button), bypassing the agent lock, and resolves the future.
+        there). Returns True (approved), security.GRANT (approved, and similar
+        actions allowed for the rest of the task), False (denied or timed out),
+        or None when the user has no interactive channel — so the caller falls
+        back to the unattended policy. The answer arrives out-of-band (e.g. a
+        Telegram button), bypassing the agent lock, and resolves the future.
+
+        *grantable* offers the "allow for this task" answer, on adapters that
+        support it.
         """
         reason = self._approval_unavailable_reason(user_id)
         if reason is not None:
@@ -331,10 +342,12 @@ class GatewayRunner:
         fut: concurrent.futures.Future = concurrent.futures.Future()
         self._pending_approvals[approval_id] = fut
 
-        prompt = _approval_prompt(tool_name, tool_input, concern)
+        grantable = grantable and getattr(adapter, "supports_grants", False)
+        prompt = _approval_prompt(tool_name, tool_input, concern, grantable)
         security.audit("approval_request", f"{user_id} {tool_name} {tool_input}")
+        extra = {"grantable": True} if grantable else {}
         cf = asyncio.run_coroutine_threadsafe(
-            adapter.request_approval(source, approval_id, prompt), self._loop
+            adapter.request_approval(source, approval_id, prompt, **extra), self._loop
         )
         # If sending the prompt itself fails, surface it and deny immediately
         # rather than leaving the agent blocked until the timeout.
@@ -377,10 +390,10 @@ class GatewayRunner:
             security.audit("approval_send_error", f"{approval_id}: {exc}")
             self.resolve_approval(approval_id, False)
 
-    def resolve_approval(self, approval_id: str, approved: bool) -> bool:
-        """Settle a pending approval. Called on the gateway loop by an adapter
-        when the user answers. Returns False if the id is unknown or already
-        settled (e.g. it had timed out)."""
+    def resolve_approval(self, approval_id: str, approved: bool | str) -> bool:
+        """Settle a pending approval with True, False or security.GRANT. Called
+        on the gateway loop by an adapter when the user answers. Returns False
+        if the id is unknown or already settled (e.g. it had timed out)."""
         fut = self._pending_approvals.get(approval_id)
         if fut is None or fut.done():
             return False

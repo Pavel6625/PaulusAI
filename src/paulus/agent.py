@@ -101,8 +101,10 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
     started it.
 
     *review* is the auto-mode reviewer's view of the turn (see automode.py),
-    passed to the gate and extended with each action that runs. ``None`` means
-    the owner didn't ask for this turn, so nothing in it is auto-approved."""
+    passed to the gate and extended with each action that runs, labelled with
+    how it was cleared. It also carries the owner's grants for the turn.
+    ``None`` means the owner didn't ask for this turn, so nothing in it is
+    auto-approved or granted."""
     while True:
         if on_delta is not None:
             resp = llm.stream(system, messages, tools=tools.TOOL_SPECS,
@@ -120,9 +122,11 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
                 continue
 
             # --- SAFETY GATE -------------------------------------------------
+            cleared = None
             if security.is_high_impact(b.name):
-                if not security.confirm(b.name, b.input, user_id=user_id,
-                                        context=review):
+                cleared = security.clearance(b.name, b.input, user_id=user_id,
+                                             context=review)
+                if cleared is None:
                     security.audit("declined", f"{b.name} {b.input}")
                     affect.feel("action_declined")
                     tool_results.append({
@@ -137,7 +141,7 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
 
             result, is_error = tools.execute(b.name, b.input, user_id=user_id)
             if review is not None:
-                review.actions.append((b.name, b.input))
+                review.actions.append((b.name, b.input, cleared))
             if tools_used is not None:
                 tools_used.append(b.name)   # ran (error or not); a declined
                                             # action never reached the world

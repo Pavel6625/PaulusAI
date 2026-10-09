@@ -168,9 +168,29 @@ command, sending a message), you are prompted to approve that single action:
 ============================================================
   CONFIRMATION REQUIRED — high-impact action: run_command
   details: {'command': 'ls -la'}
+  a = approve, and allow running `ls` for the rest of this task
 ============================================================
-  Approve this single action? [y/N]
+  Approve this single action? [y/N/a]
 ```
+
+#### Allow for this task
+
+Multi-step work (write a script, run it, fix it, run it again) would otherwise
+mean one prompt per step. Answering **a** at the terminal, or tapping
+**✅ Allow for this task** on Telegram, approves the action *and* lets later
+actions of the same kind run without asking until the task ends:
+
+- what it covers is narrow: running the same program (`pytest`, or `git status`
+  as distinct from `git push`), writing files in the workspace, or sending to
+  the same recipient;
+- it ends with the turn it was given in, and is never stored;
+- it is only offered for actions that can be scoped safely. Deleting, killing,
+  network clients (`curl`, `ssh`, ...), wrappers that run other programs
+  (`sudo`, `sh -c`, `xargs`, ...) and commands touching paths outside the
+  workspace (absolute, `~`, `..`, `$VAR`) always ask, one at a time.
+
+Grants work in both permission modes, and every use is audited (`grant`,
+`grant_approve`).
 
 ### Auto mode
 
@@ -194,6 +214,11 @@ Guarantees:
   auto-approvals.
 - **Turns you didn't start are never reviewed.** Idle nudges always go to the
   normal prompt.
+- **It knows what you already approved.** Each earlier action in the task is
+  shown with how it was cleared (`[owner approved]`, `[owner allowed for this
+  task]`, `[auto-approved]`, ...). Those labels are written by the gate, not
+  the agent, and the reviewer treats a routine follow-up of something you
+  approved as requested, so chained steps stop bouncing back to you.
 - **It fails safe.** A reviewer error falls back to the normal prompt. A
   flagged action is never handed to `DP_UNATTENDED_POLICY`: if nobody answers,
   it's denied.
@@ -336,7 +361,9 @@ The trust boundaries are deliberately small and explicit (see [src/paulus/securi
    gateway (only allow-listed users can approve; unanswered prompts time out to
    a deny). When no one is reachable to approve, they fall back to
    `DP_UNATTENDED_POLICY` (**deny** by default). In [auto mode](#auto-mode) a
-   reviewer model answers the prompt for actions you clearly asked for.
+   reviewer model answers the prompt for actions you clearly asked for, and
+   an [Allow for this task](#allow-for-this-task) grant widens one approval
+   to similar actions until the task ends.
 3. **Everything is audited.** Every tool call is appended to `audit.log`.
 4. **Execution is sandboxed.** File ops are confined to `workspace/`; commands
    run via the configured backend — use `docker` (network-disabled) or `ssh`
@@ -379,6 +406,7 @@ src/paulus/
 ├── tools.py          # tool schemas + dispatch
 ├── security.py       # untrusted-data wrapping, approval gate, audit log
 ├── automode.py       # auto mode: model reviewer that answers approval prompts
+├── grants.py         # "allow for this task": what one approval may cover
 ├── billing.py        # usage pay gate (external balance/pricing service)
 ├── sandbox.py        # local / docker / ssh execution backends
 ├── config.py         # env-driven configuration + data-dir resolution

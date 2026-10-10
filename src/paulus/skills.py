@@ -8,10 +8,25 @@ loop) — the design doc's reflection-review gate: an unverified skill is a
 A skill becomes 'verified' once it's been used successfully.
 """
 import datetime
+import functools
 import json
 import re
+import threading
 
 from . import config
+
+# Background tasks and subagents use these stores from their own threads, beside
+# the conversation, and a JSON file rewritten in place can be read half-written.
+# One re-entrant lock per store keeps every read and read-modify-write whole.
+_lock = threading.RLock()
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 _WORD = re.compile(r"[a-z0-9]+")
 
@@ -26,6 +41,7 @@ def _save(skills):
     config.SKILLS_FILE.write_text(json.dumps(skills, indent=2), encoding="utf-8")
 
 
+@_locked
 def add_skill(name, when_to_use, steps, status="unverified", source="experience"):
     skills = _load()
     for s in skills:
@@ -46,6 +62,7 @@ def add_skill(name, when_to_use, steps, status="unverified", source="experience"
     return f"saved {status} skill '{name}'"
 
 
+@_locked
 def mark_used(name, success=True):
     skills = _load()
     for s in skills:
@@ -58,6 +75,7 @@ def mark_used(name, success=True):
     return
 
 
+@_locked
 def describe() -> str:
     """A human-readable listing of every skill and its status. Used by the
     /skills command on the CLI and the chat gateway."""
@@ -70,6 +88,7 @@ def describe() -> str:
     )
 
 
+@_locked
 def find_skills(query, k=3):
     skills = _load()
     q = set(_WORD.findall(query.lower()))

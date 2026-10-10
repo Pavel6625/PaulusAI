@@ -282,6 +282,27 @@ OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 JEV_THRESHOLD = float(os.environ.get("DP_JEV_THRESHOLD", "0.9"))
 AUTO_TIMEOUT = int(os.environ.get("DP_AUTO_TIMEOUT", "10"))
 
+# --- Subagents & background tasks ---------------------------------------------
+# Subagents (subagents.py): the agent hands self-contained subtasks to focused
+# workers that run in parallel and report back (the `delegate` tool). Each
+# starts with a clean context, a short tool list and a step budget.
+SUBAGENTS = (os.environ.get("DP_SUBAGENTS", "1").strip().lower()
+             not in ("", "0", "off", "false", "no"))
+# Their model. Unset = the model the current turn was routed to.
+SUBAGENT_MODEL = os.environ.get("DP_SUBAGENT_MODEL", "").strip()
+SUBAGENT_MAX_STEPS = int(os.environ.get("DP_SUBAGENT_MAX_STEPS", "15"))
+SUBAGENT_MAX_PARALLEL = int(os.environ.get("DP_SUBAGENT_MAX_PARALLEL", "4"))
+
+# Background tasks (tasks.py): long jobs run beside the conversation and report
+# back as their own message (the `start_task` tool, or /bg in chat).
+TASKS = (os.environ.get("DP_TASKS", "1").strip().lower()
+         not in ("", "0", "off", "false", "no"))
+# Their model. Unset = the model the turn that started the task was routed to.
+TASK_MODEL = os.environ.get("DP_TASK_MODEL", "").strip()
+TASK_MAX_STEPS = int(os.environ.get("DP_TASK_MAX_STEPS", "40"))
+TASK_MAX_MINUTES = float(os.environ.get("DP_TASK_MAX_MINUTES", "30"))
+MAX_TASKS_PER_USER = int(os.environ.get("DP_MAX_TASKS_PER_USER", "3"))
+
 # --- Gateway (Hermes) -------------------------------------------------------
 # TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USERS are read by the adapter itself.
 GATEWAY_IDLE_TIMEOUT = int(os.environ.get("DP_GATEWAY_IDLE_TIMEOUT", "3600"))

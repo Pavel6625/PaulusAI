@@ -8,7 +8,7 @@ same kind in the same task run without asking again.
 
 A grant is deliberately narrow and short-lived:
   - it lives on the task's ReviewContext (automode.py), so it ends with the
-    turn it was given in, and is never stored;
+    turn or background task it was given in, and is never stored;
   - it covers one kind of action: writing workspace files, running one
     program (or one subcommand of a multiplexer like git), or sending to one
     recipient. Never "anything";

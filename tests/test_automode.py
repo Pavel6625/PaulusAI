@@ -181,7 +181,7 @@ def test_respond_reviews_with_owner_words_only(monkeypatch):
     memory.log_episode("owner", "earlier ask", trust="trusted", user_id="u1")
     seen = []
     monkeypatch.setattr(security, "clearance",
-                        lambda name, inp, user_id=None, context=None:
+                        lambda name, inp, user_id=None, context=None, origin=None:
                         seen.append(context) or None)
     monkeypatch.setattr(llm, "complete",
                         _tool_then_text("run_command", {"command": "ls"}))
@@ -198,7 +198,7 @@ def test_respond_reviews_with_owner_words_only(monkeypatch):
 def test_ran_actions_are_shown_to_later_reviews(monkeypatch):
     seen = []
     monkeypatch.setattr(security, "clearance",
-                        lambda name, inp, user_id=None, context=None:
+                        lambda name, inp, user_id=None, context=None, origin=None:
                         seen.append(context) or "owner")
     monkeypatch.setattr(llm, "complete",
                         _tool_then_text("write_local_file", {"path": "a.txt", "content": "hi"}))
@@ -212,7 +212,7 @@ def test_ran_actions_are_shown_to_later_reviews(monkeypatch):
 def test_proactive_turns_are_never_reviewed(monkeypatch):
     seen = []
     monkeypatch.setattr(security, "clearance",
-                        lambda name, inp, user_id=None, context=None:
+                        lambda name, inp, user_id=None, context=None, origin=None:
                         seen.append(context) or None)
     monkeypatch.setattr(llm, "complete",
                         _tool_then_text("send_message", {"to": "x", "body": "hi"}))

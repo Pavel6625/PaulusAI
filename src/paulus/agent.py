@@ -345,7 +345,7 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     elif any(w in low for w in ("wrong", "no,", "frustrat", "annoy", "bad")):
         affect.feel("owner_frustrated")
 
-    specs = tools.agent_specs()
+    specs = tools.agent_specs(user_id=user_id)
     system = _build_system(user_id, specs)
     messages = _history_to_messages(user_id)
     _attach_images(messages, images)

@@ -303,6 +303,14 @@ TASK_MAX_STEPS = int(os.environ.get("DP_TASK_MAX_STEPS", "40"))
 TASK_MAX_MINUTES = float(os.environ.get("DP_TASK_MAX_MINUTES", "30"))
 MAX_TASKS_PER_USER = int(os.environ.get("DP_MAX_TASKS_PER_USER", "3"))
 
+# --- MCP servers (mcp_client.py) ----------------------------------------------
+# External Model Context Protocol servers whose tools the agent may use. The
+# file is optional: absent = no MCP tools. Needs the `mcp` extra.
+MCP_CONFIG = os.environ.get("DP_MCP_CONFIG", "").strip() or str(DATA_DIR / "mcp.json")
+MCP_CONNECT_TIMEOUT = float(os.environ.get("DP_MCP_CONNECT_TIMEOUT", "30"))
+MCP_CALL_TIMEOUT = float(os.environ.get("DP_MCP_CALL_TIMEOUT", "60"))   # per-server "timeout" overrides
+MCP_MAX_CHARS = int(os.environ.get("DP_MCP_MAX_CHARS", "12000"))        # per tool result
+
 # --- Gateway (Hermes) -------------------------------------------------------
 # TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USERS are read by the adapter itself.
 GATEWAY_IDLE_TIMEOUT = int(os.environ.get("DP_GATEWAY_IDLE_TIMEOUT", "3600"))

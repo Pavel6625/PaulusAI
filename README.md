@@ -36,6 +36,9 @@ point it at Anthropic, OpenAI, Gemini, OpenRouter, or a local Ollama model.
   context, a short tool list and a step budget, and report back.
 - **Background tasks** — long jobs run beside the conversation (`start_task`,
   or `/bg` in chat) and report back as their own message when done.
+- **MCP client** — connect any [Model Context Protocol](https://modelcontextprotocol.io)
+  server (stdio or HTTP) and its tools join the agent's own, behind the same
+  approval gate and audit log.
 - **Pluggable sandbox** — command/file execution runs `local`, in a
   network-disabled `docker` container, or over `ssh`.
 - **Messaging gateway** — a Hermes-style gateway with a Telegram adapter
@@ -87,6 +90,7 @@ This puts two commands on your `PATH`:
 | `vectors`    | `chromadb` semantic memory    | Falls back to keyword search            |
 | `telegram`   | `python-telegram-bot`         | `paulus-gateway` has no adapter to run  |
 | `web`        | `beautifulsoup4` (clean scrape)| `fetch_url` falls back to a stdlib stripper |
+| `mcp`        | `mcp` (MCP client SDK)        | Configured MCP servers are skipped      |
 | `all`        | all of the above              | —                                       |
 | `dev`        | `pytest`, `ruff`              | —                                       |
 
@@ -130,6 +134,10 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `DP_TASK_MAX_STEPS`     | `40`                           | Tool rounds a background task gets before it must report       |
 | `DP_TASK_MAX_MINUTES`   | `30`                           | Wall-clock limit per background task                           |
 | `DP_MAX_TASKS_PER_USER` | `3`                            | Background tasks one user may have running at once             |
+| `DP_MCP_CONFIG`         | `$DP_DATA_DIR/mcp.json`        | [MCP servers](#mcp-servers) to connect; absent = no MCP tools  |
+| `DP_MCP_CONNECT_TIMEOUT`| `30`                           | Seconds to wait for each MCP server to start                   |
+| `DP_MCP_CALL_TIMEOUT`   | `60`                           | Seconds per MCP tool call (a server's `timeout` overrides it)  |
+| `DP_MCP_MAX_CHARS`      | `12000`                        | Longest MCP tool result passed to the model                    |
 | `TELEGRAM_BOT_TOKEN`    | —                              | Required for `paulus-gateway`                                  |
 | `TELEGRAM_ALLOWED_USERS`| (all)                          | Numeric Telegram user IDs allowed to **chat**; empty = everyone |
 | `TELEGRAM_TRUSTED_USERS`| (= allowed)                    | IDs allowed to **approve** high-impact actions; empty = nobody  |
@@ -175,6 +183,7 @@ In-chat commands:
 | `/bg X`   | Run `X` as a [background task](#subagents-and-background-tasks) |
 | `/tasks`  | List background tasks and their progress                       |
 | `/cancel N` | Cancel background task `N`                                   |
+| `/mcp`    | List [MCP servers](#mcp-servers), their tools and which need approval |
 | `/quit`   | Consolidate and exit                                          |
 
 When the agent proposes a **high-impact action** (writing a file, running a
@@ -299,6 +308,63 @@ wrote), and their approval prompts say who is asking (`From: background task
   belongs to the turn that started it, so it isn't gated again. Watch
   `DP_TASK_MAX_STEPS` if usage is metered per message.
 
+### MCP servers
+
+PaulusAI is an [MCP](https://modelcontextprotocol.io) client: any MCP server's
+tools can be added to the agent's own. Install the extra (`pip install
+".[mcp]"`, included in `[all]`) and list servers in `$DP_DATA_DIR/mcp.json`
+(or the file `DP_MCP_CONFIG` points to). The format is the `mcpServers` one
+Claude Desktop and Claude Code use, so existing entries can be copied over:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"},
+      "auto_approve": ["get_*", "list_*", "search_*"]
+    },
+    "docs": {
+      "url": "https://example.com/mcp",
+      "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"},
+      "users": ["123456789"]
+    }
+  }
+}
+```
+
+A server has a `command` (+ `args`, `env`, `cwd`) to run over stdio, or a
+`url` (+ `headers`) for Streamable HTTP (`"type": "sse"` for legacy SSE
+servers). Its tools appear to the model as `mcp__<server>__<tool>`. Servers
+connect at startup; one that fails is reported and skipped. `/mcp` shows the
+status of each one. PaulusAI-specific keys:
+
+| Key            | Meaning                                                                 |
+|----------------|-------------------------------------------------------------------------|
+| `auto_approve` | Tools that run **without** approval: names or patterns (`list_*`, `*`)  |
+| `users`        | Gateway user IDs offered this server (`"*"` = everyone). See below     |
+| `timeout`      | Seconds per tool call                                                   |
+| `disabled`     | `true` to skip the server                                               |
+
+How MCP fits the [security model](#security-model):
+
+- **Every MCP tool needs approval** unless `auto_approve` names it. Tool
+  annotations such as `readOnlyHint` come from the server, so they aren't
+  trusted to make that call. [Grants](#allow-for-this-task) work per tool, and
+  auto mode reviews MCP calls like any other.
+- **Servers run with your credentials**, so by default their tools are offered
+  only in the terminal and to gateway users trusted to approve actions
+  (`TELEGRAM_TRUSTED_USERS`). If the bot is open to others, keep it that way
+  or set `users` explicitly.
+- **Results are untrusted data**, wrapped like web pages, and clipped to
+  `DP_MCP_MAX_CHARS`. Every call is in `audit.log` (`mcp_call`, ...).
+- **Secrets stay in the environment.** `${VAR}` anywhere in a server's entry is
+  read from the environment (or `.env`). A stdio server starts with a minimal
+  environment plus its own `env`, so it never sees your model API keys. Its
+  stderr goes to `memory/mcp/<server>.log`.
+- Subagents don't get MCP tools; the agent and background tasks do.
+
 ### Telegram bot
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
@@ -393,8 +459,10 @@ $DP_DATA_DIR/
 │   ├── skills.json        # procedural memory
 │   ├── affect.json        # current mood
 │   ├── audit.log          # append-only record of every action
+│   ├── mcp/               # stderr logs of stdio MCP servers
 │   └── vectorstore/       # derived Chroma index (rebuildable from facts.json)
-└── workspace/             # the ONLY directory file tools may touch
+├── workspace/             # the ONLY directory file tools may touch
+└── mcp.json               # optional MCP server list (DP_MCP_CONFIG)
 ```
 
 The vector index is *derived*; `facts.json` stays authoritative, so memory is
@@ -420,8 +488,8 @@ The trust boundaries are deliberately small and explicit (see [src/paulus/securi
    `DP_UNATTENDED_POLICY` (**deny** by default). In [auto mode](#auto-mode) a
    reviewer model answers the prompt for actions you clearly asked for, and
    an [Allow for this task](#allow-for-this-task) grant widens one approval
-   to similar actions until the task ends. Subagents and background tasks go
-   through the same gate.
+   to similar actions until the task ends. Subagents, background tasks and
+   [MCP tools](#mcp-servers) go through the same gate.
 3. **Everything is audited.** Every tool call is appended to `audit.log`.
 4. **Execution is sandboxed.** File ops are confined to `workspace/`; commands
    run via the configured backend — use `docker` (network-disabled) or `ssh`
@@ -466,6 +534,7 @@ src/paulus/
 ├── automode.py       # auto mode: model reviewer that answers approval prompts
 ├── grants.py         # "allow for this task": what one approval may cover
 ├── subagents.py      # parallel researcher/worker subagents (`delegate`)
+├── mcp_client.py     # MCP client: external servers' tools, behind the gate
 ├── tasks.py          # background tasks (`start_task`, /bg, /tasks, /cancel)
 ├── billing.py        # usage pay gate (external balance/pricing service)
 ├── sandbox.py        # local / docker / ssh execution backends

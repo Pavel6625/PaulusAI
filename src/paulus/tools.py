@@ -4,7 +4,7 @@ File and command execution route through a pluggable Sandbox (sandbox.py), so
 isolation is a config choice (local / Docker / SSH), not baked in. High-impact
 tools are declared in security.HIGH_IMPACT_TOOLS and gated by the agent loop.
 """
-from . import config, memory, sandbox, security, skills, web
+from . import config, mcp_client, memory, sandbox, security, skills, web
 
 _sbx = sandbox.get_sandbox()
 
@@ -232,11 +232,11 @@ def pick(names):
     return [s for s in TOOL_SPECS if s["name"] in names]
 
 
-def agent_specs(tasks=True):
-    """The main agent's tools: the base set plus whichever orchestration tools
-    are enabled. A background task passes ``tasks=False``: it may delegate, but
-    not start further tasks."""
-    specs = list(TOOL_SPECS)
+def agent_specs(tasks=True, user_id=None):
+    """The main agent's tools: the base set, the MCP tools *user_id* may use,
+    and whichever orchestration tools are enabled. A background task passes
+    ``tasks=False``: it may delegate, but not start further tasks."""
+    specs = list(TOOL_SPECS) + mcp_client.specs(user_id)
     if config.SUBAGENTS:
         specs.append(DELEGATE_SPEC)
     if config.TASKS:
@@ -250,6 +250,9 @@ def execute(name, tool_input, user_id=None):
     """Run a tool. Returns (result_text, is_error). Any required confirmation
     for high-impact tools is obtained by the caller BEFORE this runs."""
     try:
+        if name.startswith(mcp_client.PREFIX):
+            return mcp_client.call(name, tool_input, user_id=user_id)
+
         if name == "remember":
             res = memory.add_fact(tool_input["fact"],
                                   confidence=float(tool_input.get("confidence", 0.7)),

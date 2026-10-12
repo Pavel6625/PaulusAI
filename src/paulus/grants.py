@@ -10,8 +10,8 @@ A grant is deliberately narrow and short-lived:
   - it lives on the task's ReviewContext (automode.py), so it ends with the
     turn or background task it was given in, and is never stored;
   - it covers one kind of action: writing workspace files, running one
-    program (or one subcommand of a multiplexer like git), or sending to one
-    recipient. Never "anything";
+    program (or one subcommand of a multiplexer like git), sending to one
+    recipient, or calling one MCP tool. Never "anything";
   - some actions can't be granted at all: deleting, killing, network clients,
     and wrappers that run other programs (sudo, sh -c, xargs, ...). The owner
     sees those one at a time, always;
@@ -69,6 +69,9 @@ def keys(tool_name, tool_input):
         if not to and tool_name != "send_document":
             return None
         return frozenset({f"{tool_name}:{to}"})
+    if tool_name.startswith("mcp__"):
+        # One MCP tool, with any arguments: the server defines what it does.
+        return frozenset({tool_name})
     return None
 
 
@@ -93,6 +96,8 @@ def describe(needed):
             parts.append(f"emails to {to}")
         elif tool == "send_document":
             parts.append(f"documents to {to or 'this chat'}")
+        elif tool.startswith("mcp__"):
+            parts.append(f"calling `{tool}`")
     return "; ".join(parts)
 
 

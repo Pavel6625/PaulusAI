@@ -133,7 +133,7 @@ def _run(task, model, review):
     timer = threading.Timer(config.TASK_MAX_MINUTES * 60, _time_out, args=(task,))
     timer.daemon = True
     timer.start()
-    specs = tools.agent_specs(tasks=False)
+    specs = tools.agent_specs(tasks=False, user_id=task.user_id)
     try:
         system = agent._build_system(task.user_id, specs) + BRIEF
         messages = agent._history_to_messages(task.user_id)

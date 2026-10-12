@@ -15,9 +15,10 @@ Commands:
   /bg X     run X as a background task; its result is printed when done
   /tasks    list background tasks
   /cancel N cancel background task N
+  /mcp      list connected MCP servers and their tools
   /quit     consolidate and exit
 """
-from . import affect, agent, config, memory, router, skills, tasks, vectorstore
+from . import affect, agent, config, mcp_client, memory, router, skills, tasks, vectorstore
 
 
 def _routes_report(user_id=None, limit=15):
@@ -54,6 +55,7 @@ def main():
     config.ensure_dirs()
     vectorstore.init()  # bring up embeddings, or fall back to keyword search
     router.init()       # bring up routing, or pin every turn to the core model
+    mcp_client.init()   # connect configured MCP servers (none = no MCP tools)
     print("PaulusAI. Type a message, or /quit to exit.")
     print(f"permission mode: {config.PERMISSION_MODE}  (/auto to toggle)\n")
     while True:
@@ -100,6 +102,9 @@ def main():
             continue
         if text == "/cancel" or text.startswith("/cancel "):
             print(tasks.cancel(None, text[len("/cancel"):].strip()))
+            continue
+        if text == "/mcp":
+            print(mcp_client.status())
             continue
 
         print(f"\ndp> {agent.respond(text)}\n")

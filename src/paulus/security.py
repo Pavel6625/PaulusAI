@@ -35,7 +35,11 @@ _audit_lock = threading.Lock()
 
 
 def is_high_impact(tool_name):
-    return tool_name in HIGH_IMPACT_TOOLS
+    if tool_name in HIGH_IMPACT_TOOLS:
+        return True
+    # MCP tools are high-impact unless the owner auto-approved them by name.
+    from . import mcp_client
+    return tool_name.startswith(mcp_client.PREFIX) and mcp_client.gated(tool_name)
 
 
 # Anything in untrusted content that could pass for our own tag: a forged

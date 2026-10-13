@@ -34,6 +34,9 @@ _SPLIT_LIMIT = 3500
 # Minimum seconds between intermediate edits while streaming, to stay under
 # Telegram's per-message edit-rate limit.
 _STREAM_EDIT_INTERVAL = 1.2
+# Longest the agent waits for a finished step's message to be committed before
+# running its tools anyway.
+_SEGMENT_COMMIT_TIMEOUT = 30
 
 
 class TelegramAdapter(BasePlatformAdapter):
@@ -556,13 +559,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
 
 class _StreamSink:
-    """Renders one streamed reply as a single live-edited Telegram message.
+    """Renders one streamed reply as live-edited Telegram messages.
 
     ``feed`` is called from the agent's worker thread for every text fragment;
     it buffers the text and, on a throttle, schedules a plain-text edit on the
-    gateway loop. ``finalize`` (awaited on the loop once the reply is complete)
-    applies Markdown. A short silence sentinel is never shown: nothing is sent
-    until the buffer is clearly not a sentinel.
+    gateway loop. ``end_segment`` (also from the worker) closes the current
+    message at each tool round, so a multi-step reply arrives as one message
+    per step. ``finalize`` (awaited on the loop once the reply is complete)
+    commits the last one. Committed messages get Markdown. A short silence
+    sentinel is never shown: nothing is sent until the buffer is clearly not a
+    sentinel.
     """
 
     def __init__(self, adapter: TelegramAdapter, source: SessionSource, loop) -> None:
@@ -588,6 +594,18 @@ class _StreamSink:
             self._last_edit = now
             asyncio.run_coroutine_threadsafe(self._render(self._buf), self._loop)
 
+    def end_segment(self) -> None:
+        """The model finished a step and is about to run tools: commit what it
+        said so far as its own message, and let the next step's text start a
+        fresh one below it. Blocks until committed, so the step lands before
+        anything its tools post (e.g. an approval prompt)."""
+        text, self._buf = self._buf, ""
+        fut = asyncio.run_coroutine_threadsafe(self._close_segment(text), self._loop)
+        try:
+            fut.result(timeout=_SEGMENT_COMMIT_TIMEOUT)
+        except Exception as exc:
+            security.audit("telegram_segment_error", str(exc))
+
     # -- run on the gateway loop -------------------------------------------
     async def _render(self, snapshot: str) -> None:
         async with self._lock:
@@ -600,10 +618,20 @@ class _StreamSink:
             if created and self._message is not None:
                 self._posted_mark = self._adapter._posted.get(self._source.chat_id, 0)
 
+    async def _close_segment(self, text: str) -> None:
+        async with self._lock:
+            if self._done or not self._adapter._app:
+                return
+            if _revealable(text):
+                await self._commit(text)
+            else:
+                await self._delete_message()
+            self._message = None          # the next step starts a new message
+
     async def finalize(self, reply: str) -> None:
-        """Commit the final reply. ``reply`` is the agent's return value; the
-        streamed buffer (everything shown) is preferred when present so the
-        bubble isn't truncated to just the last turn."""
+        """Commit the final reply. ``reply`` is the agent's return value (its
+        last turn's text); the streamed buffer — everything shown since the
+        last step was committed — is preferred when present."""
         async with self._lock:
             self._done = True
             text = self._buf if self._buf.strip() else reply
@@ -612,15 +640,20 @@ class _StreamSink:
                 # rather than committing an empty message Telegram would reject.
                 await self._delete_message()
                 return
-            if (self._message is not None and self._posted_mark
-                    != self._adapter._posted.get(self._source.chat_id, 0)):
-                # Something (typically approval prompts) was posted after the
-                # placeholder, burying it up the chat. Editing the answer into it
-                # would deliver it silently, out of sight — so move it to the
-                # bottom as a fresh message, which also notifies the owner.
-                await self._delete_message()
-                self._message = None
-            await self._adapter._stream_finalize(self._source, self._message, text)
+            await self._commit(text)
+
+    async def _commit(self, text: str) -> None:
+        """Turn the current placeholder into the finished ``text`` (or send it
+        fresh if there's none). Called with the lock held."""
+        if (self._message is not None and self._posted_mark
+                != self._adapter._posted.get(self._source.chat_id, 0)):
+            # Something (typically approval prompts) was posted after the
+            # placeholder, burying it up the chat. Editing the answer into it
+            # would deliver it silently, out of sight — so move it to the
+            # bottom as a fresh message, which also notifies the owner.
+            await self._delete_message()
+            self._message = None
+        await self._adapter._stream_finalize(self._source, self._message, text)
 
     async def discard(self) -> None:
         """Drop the in-progress message (e.g. the reply turned out silent)."""

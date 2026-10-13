@@ -72,6 +72,33 @@ def test_cancel_stops_the_loop(monkeypatch):
         agent._run_tool_loop("sys", [{"role": "user", "content": "go"}], cancel=cancel)
 
 
+def test_loop_breaks_the_reply_between_steps(monkeypatch):
+    replies = iter([_call("recall", {"query": "q"}), _call("recall", {"query": "q"}),
+                    _text("done")])
+    monkeypatch.setattr(llm, "stream", lambda *a, **k: next(replies))
+    log = []
+    monkeypatch.setattr(tools, "execute", lambda name, *a, **k: log.append(name) or ("x", False))
+
+    out = agent._run_tool_loop("sys", [{"role": "user", "content": "go"}],
+                               on_delta=lambda piece: None,
+                               on_break=lambda: log.append("break"))
+
+    # Each step is closed before its tools run; the final answer isn't.
+    assert out == "done"
+    assert log == ["break", "recall", "break", "recall"]
+
+
+def test_loop_does_not_break_before_a_budget_stop(monkeypatch):
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: _call("recall", {"query": "q"}))
+    monkeypatch.setattr(tools, "execute", lambda *a, **k: ("x", False))
+    breaks = []
+    agent._run_tool_loop("sys", [{"role": "user", "content": "go"}], max_steps=1,
+                         on_break=lambda: breaks.append(1))
+    # Two steps ran their (budget-refused) tools; the third turn is the final
+    # reply, so it must not be committed once as a step and again as the reply.
+    assert len(breaks) == 2
+
+
 def test_the_conversation_offers_orchestration_but_idle_nudges_do_not(monkeypatch):
     offered = []
 

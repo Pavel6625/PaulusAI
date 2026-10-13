@@ -690,7 +690,7 @@ def test_streaming_inbound_creates_and_finalizes(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None, on_break=None):
         for piece in ("Hello ", "world"):
             on_delta(piece)
         return "Hello world"
@@ -707,7 +707,7 @@ def test_streaming_silent_reply_shows_nothing(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None, on_break=None):
         on_delta("[SILENT]")          # sentinel never gets revealed
         return "[SILENT]"
 
@@ -723,7 +723,7 @@ def test_streaming_empty_reply_sends_nothing(monkeypatch):
 
     # Model streams nothing and returns empty text (e.g. a denied high-impact
     # action with no follow-up). Must not try to send an empty Telegram message.
-    monkeypatch.setattr(agent, "respond", lambda text, user_id=None, on_delta=None, images=None, documents=None: "")
+    monkeypatch.setattr(agent, "respond", lambda text, user_id=None, on_delta=None, images=None, documents=None, on_break=None: "")
     asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
 
     assert events == []        # nothing sent, no "Message text is empty" crash
@@ -733,7 +733,7 @@ def test_streaming_keeps_preamble_when_final_text_empty(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None, on_break=None):
         on_delta("Working on it…")   # visible preamble streamed
         return ""                    # but the final turn returns no text
     monkeypatch.setattr(agent, "respond", fake_respond)
@@ -756,7 +756,7 @@ def test_streaming_reply_moves_below_a_prompt_posted_meanwhile(monkeypatch):
         def on_loop(coro):
             return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
-        def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None):
+        def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None, on_break=None):
             on_delta("Checking. ")
             on_loop(asyncio.sleep(0.05))          # let the placeholder land
             on_loop(adapter.request_approval(source, "a1", "Approve?"))
@@ -777,12 +777,81 @@ def test_streaming_reply_moves_below_a_prompt_posted_meanwhile(monkeypatch):
     assert events[-1][1] == "Checking. Done."
 
 
+def test_streaming_splits_steps_into_separate_messages(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None,
+                     on_break=None):
+        on_delta("Let me check.")
+        on_break()                         # a tool round
+        on_delta("Let me verify.")
+        on_break()
+        on_delta("Found it.")
+        return "Found it."
+
+    monkeypatch.setattr(agent, "respond", fake_respond)
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    # One message per step, each committed with its own text — never run together.
+    sends = [text for kind, text, _ in events if kind == "send"]
+    assert sends == ["Let me check.", "Let me verify.", "Found it."]
+    assert not any("check.Let" in text or "verify.Found" in text for _, text, _ in events)
+    assert events[-1][1] == "Found it."
+
+
+def test_streaming_step_lands_above_its_approval_prompt(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+    source = SessionSource("telegram", "c", "u")
+
+    async def main():
+        loop = asyncio.get_running_loop()
+
+        def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None,
+                         on_break=None):
+            on_delta("Saving the file.")
+            on_break()
+            asyncio.run_coroutine_threadsafe(
+                adapter.request_approval(source, "a1", "Approve?"), loop).result()
+            on_delta("Saved.")
+            return "Saved."
+
+        monkeypatch.setattr(agent, "respond", fake_respond)
+        await runner.handle_inbound(source, "hi")
+
+    asyncio.run(main())
+
+    # The step is committed before the prompt, and the answer follows below it
+    # in a fresh message: nothing is buried, so nothing has to be moved.
+    sends = [text for kind, text, _ in events if kind == "send"]
+    assert sends == ["Saving the file.", "Approve?", "Saved."]
+    assert all(kind != "delete" for kind, _, _ in events)
+
+
+def test_streaming_break_with_nothing_said_sends_nothing(monkeypatch):
+    import paulus.agent as agent
+    tg, runner, adapter, events = _streaming_runner(monkeypatch)
+
+    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None,
+                     on_break=None):
+        on_break()                         # a tool call with no narration
+        on_delta("Done.")
+        return "Done."
+
+    monkeypatch.setattr(agent, "respond", fake_respond)
+    asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
+
+    sends = [text for kind, text, _ in events if kind == "send"]
+    assert sends == ["Done."]
+
+
 def test_streaming_finalizes_with_markdown(monkeypatch):
     pytest.importorskip("telegramify_markdown")
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch, parse_mode="MarkdownV2")
 
-    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None):
+    def fake_respond(text, user_id=None, on_delta=None, images=None, documents=None, on_break=None):
         on_delta("**done**")
         return "**done**"
 
@@ -824,7 +893,7 @@ def test_streaming_pay_link_renders_button_not_finalize(monkeypatch):
     # so nothing is streamed — respond() returns the block message directly.
     monkeypatch.setattr(
         agent, "respond",
-        lambda text, user_id=None, on_delta=None, images=None, documents=None: reply,
+        lambda text, user_id=None, on_delta=None, images=None, documents=None, on_break=None: reply,
     )
     asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
 
@@ -846,7 +915,7 @@ def test_non_streaming_pay_link_renders_button(monkeypatch):
     reply = f"You're out of balance.{billing._PAY_LINK_MARKER}https://pay.example.com/topup"
     monkeypatch.setattr(
         agent, "respond",
-        lambda text, user_id=None, on_delta=None, images=None, documents=None: reply,
+        lambda text, user_id=None, on_delta=None, images=None, documents=None, on_break=None: reply,
     )
     asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
 
@@ -866,7 +935,7 @@ def test_pay_link_falls_back_to_plain_send_when_no_url(monkeypatch):
     import paulus.agent as agent
     monkeypatch.setattr(
         agent, "respond",
-        lambda text, user_id=None, on_delta=None, images=None, documents=None: "just a reply",
+        lambda text, user_id=None, on_delta=None, images=None, documents=None, on_break=None: "just a reply",
     )
     asyncio.run(runner.handle_inbound(SessionSource("telegram", "c", "u"), "hi"))
 
@@ -1118,7 +1187,7 @@ def test_inbound_agent_error_on_image_sends_note(monkeypatch):
     import paulus.agent as agent
     tg, runner, adapter, events = _streaming_runner(monkeypatch)
 
-    def boom(text, user_id=None, on_delta=None, images=None, documents=None):
+    def boom(text, user_id=None, on_delta=None, images=None, documents=None, on_break=None):
         on_delta("thinking…")              # a placeholder gets created
         raise RuntimeError("model has no vision support")
 

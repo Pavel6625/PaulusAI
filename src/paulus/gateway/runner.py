@@ -136,11 +136,13 @@ class GatewayRunner:
             loop = asyncio.get_running_loop()
             user_id = str(source.user_id)
             on_delta = sink.feed if sink else None
+            on_break = sink.end_segment if sink else None
             try:
                 reply = await loop.run_in_executor(
                     None,
                     lambda: _agent.respond(tagged, user_id=user_id, on_delta=on_delta,
-                                           images=images, documents=documents),
+                                           images=images, documents=documents,
+                                           on_break=on_break),
                 )
             except Exception as exc:        # model/tool failure mid-turn
                 error = exc

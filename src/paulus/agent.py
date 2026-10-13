@@ -155,7 +155,7 @@ def _execute(name, tool_input, user_id, model, review, cancel):
 
 def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
                    tools_used=None, review=None, specs=None, max_steps=None,
-                   cancel=None, origin=None, feel=True):
+                   cancel=None, origin=None, feel=True, on_break=None):
     """Drive the model<->tool exchange, with the safety gate between the
     model's decision and any real-world effect. Returns the final text.
 
@@ -176,7 +176,11 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
 
     When ``on_delta`` is given, each turn is streamed and text fragments are
     forwarded to it as they arrive (the gateway uses this to live-edit the
-    outgoing message); the safety gate is unchanged.
+    outgoing message); the safety gate is unchanged. ``on_break()``, when
+    given, is called each time a turn ends in tool calls, before they run: the
+    text streamed so far is one finished step ("Let me check X."), so the
+    gateway posts it as its own message rather than running the next step's
+    text on into it.
 
     *model* is fixed for the whole loop: it is chosen once per turn, so a tool
     exchange is never handed mid-flight to a different model than the one that
@@ -208,6 +212,8 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
         if over and steps > max_steps + 1:
             # Told the budget was spent, it called tools anyway: stop here.
             return text or "(Stopped: the step budget ran out before a final report.)"
+        if on_break is not None:
+            on_break()
 
         tool_results = []
         for b in resp.content:
@@ -312,7 +318,8 @@ def _review_context(owner_text, user_id=None, images=None, documents=None):
     return automode.ReviewContext(request=request, earlier=earlier)
 
 
-def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None):
+def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None,
+            on_break=None):
     # --- PAY GATE ---------------------------------------------------------
     # Checked before anything else: an exhausted balance halts the turn
     # before it ever reaches the LLM, or touches memory/the sandbox.
@@ -352,7 +359,7 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     tools_used = []
     final_text = _run_tool_loop(system, messages, user_id, on_delta=on_delta,
                                 model=model, tools_used=tools_used, review=review,
-                                specs=specs)
+                                specs=specs, on_break=on_break)
     router.log_outcome(turn_id, tools_used, user_id=user_id)
 
     memory.log_episode("agent", final_text, trust="trusted", user_id=user_id)

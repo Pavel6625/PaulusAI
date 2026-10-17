@@ -365,6 +365,41 @@ How MCP fits the [security model](#security-model):
   stderr goes to `memory/mcp/<server>.log`.
 - Subagents don't get MCP tools; the agent and background tasks do.
 
+#### Web research with Parallel Search MCP
+
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+provides free web search and page fetching without an account or API key.
+Anonymous search uses Fast mode and is intended for exploration and light use;
+higher limits require authentication (see the linked setup guide).
+
+With the `mcp` extra installed, add a `parallel` entry to your MCP config.
+For a new config, use the JSON below; for an existing one, merge the entry
+into `mcpServers` so your other servers stay configured:
+
+```json
+{
+  "mcpServers": {
+    "parallel": {
+      "url": "https://search.parallel.ai/mcp",
+      "headers": {"User-Agent": "PaulusAI (https://github.com/Pavel6625/PaulusAI)"}
+    }
+  }
+}
+```
+
+Save it as `$DP_DATA_DIR/mcp.json` (default `~/.local/share/paulus/mcp.json`),
+or set `DP_MCP_CONFIG` in `.env` to the file's path. Restart `paulus` and run
+`/mcp` to check that `parallel` connected. Its tools are
+`mcp__parallel__web_search` and `mcp__parallel__web_fetch`. For example, ask:
+
+> Use Parallel to find the latest stable Python release on python.org, fetch
+> the release page, and summarize the release date and highlights with links.
+
+Approve the MCP calls when prompted. This entry omits `auto_approve` and
+`users`, retaining the approval gate and trusted gateway-user access described
+above. It adds tools alongside the built-in `web_search` and `fetch_url`.
+Queries and fetched URLs are sent to Parallel, so avoid including secrets.
+
 ### Telegram bot
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.

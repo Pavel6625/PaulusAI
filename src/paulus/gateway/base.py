@@ -34,6 +34,20 @@ class AdapterState(Enum):
 SILENCE_TOKENS = frozenset({"[SILENT]", "NO_REPLY"})
 
 
+def revealable(text: str) -> bool:
+    """True once buffered text is clearly not a silence sentinel, so a streamed
+    ``[SILENT]`` / ``NO_REPLY`` is never momentarily shown before it's swallowed."""
+    s = text.strip()
+    if not s:
+        return False
+    return not any(tok.startswith(s) or tok in s for tok in SILENCE_TOKENS)
+
+
+def parse_ids(spec: str) -> set[str]:
+    """Parse a comma-separated list of user ids into a set, dropping blanks."""
+    return {u.strip() for u in spec.split(",") if u.strip()}
+
+
 class BasePlatformAdapter(ABC):
     """
     Abstract base for all messaging platform adapters.

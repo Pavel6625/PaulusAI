@@ -9,7 +9,7 @@
 # Status: systemctl status paulus-gateway
 
 [Unit]
-Description=PaulusAI Telegram gateway
+Description=PaulusAI gateway (Telegram + web UI)
 After=network-online.target
 Wants=network-online.target
 
@@ -19,7 +19,8 @@ User=paulus
 Group=paulus
 
 # Secrets and configuration. The file must contain ANTHROPIC_API_KEY (or the
-# key for your chosen provider) and TELEGRAM_BOT_TOKEN. Keep it 0600.
+# key for your chosen provider) and TELEGRAM_BOT_TOKEN. Keep it 0600. Add
+# WEB_PORT (and WEB_PUBLIC_URL) to also serve the web UI behind nginx.
 EnvironmentFile=/etc/paulus/paulus.env
 
 # Where runtime memory / audit log / vector index / workspace are written.

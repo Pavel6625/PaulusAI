@@ -6,6 +6,7 @@ Environment:
   ANTHROPIC_API_KEY=sk-...                       (or another provider key)
   TELEGRAM_BOT_TOKEN=...
   TELEGRAM_ALLOWED_USERS=123456789,987654321     # optional allowlist
+  WEB_PORT=8080                                  # optional: serve the web UI
 """
 import asyncio
 import os
@@ -27,10 +28,14 @@ async def _main() -> None:
         from .gateway.platforms.telegram import TelegramAdapter
         runner.register("telegram", TelegramAdapter(runner))
 
+    if os.environ.get("WEB_PORT"):
+        from .gateway.platforms.webui import WebAdapter
+        runner.register("web", WebAdapter(runner))
+
     if not runner.has_adapters():
         print(
             "No platform adapters configured.\n"
-            "Set TELEGRAM_BOT_TOKEN to enable Telegram."
+            "Set TELEGRAM_BOT_TOKEN to enable Telegram, and WEB_PORT for the web UI."
         )
         return
 

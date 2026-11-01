@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>PaulusAI</title>
+  <link rel="stylesheet" href="app.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
+          integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi"
+          crossorigin="anonymous" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"
+          integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a"
+          crossorigin="anonymous" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <section id="login" class="login" hidden>
+    <div class="login-card">
+      <div class="mark" aria-hidden="true">P</div>
+      <h1>PaulusAI</h1>
+      <p>Sign in with Telegram to continue your conversation.</p>
+      <div id="tg-login"></div>
+      <p id="login-note" class="note" role="alert"></p>
+    </div>
+  </section>
+
+  <section id="chat" class="chat" hidden>
+    <header class="bar">
+      <div class="brand"><span class="mark small" aria-hidden="true">P</span>PaulusAI</div>
+      <div class="who">
+        <span id="conn" class="conn" title="Connection"></span>
+        <span id="me"></span>
+        <button id="logout" type="button" class="link">Sign out</button>
+      </div>
+    </header>
+
+    <main id="log" class="log" aria-live="polite"></main>
+
+    <div id="status" class="status" hidden><span class="dots"><i></i><i></i><i></i></span> Paulus is thinking…</div>
+
+    <form id="composer" class="composer" autocomplete="off">
+      <div id="attachments" class="attachments"></div>
+      <div class="row">
+        <label class="attach" title="Attach an image or text file">
+          <input id="file" type="file" multiple hidden>
+          <span aria-hidden="true">＋</span><span class="sr">Attach</span>
+        </label>
+        <textarea id="input" rows="1" placeholder="Message Paulus… (try /mood, /memory, /bg)"></textarea>
+        <button id="send" type="submit" class="send">Send</button>
+      </div>
+    </form>
+  </section>
+</body>
+</html>

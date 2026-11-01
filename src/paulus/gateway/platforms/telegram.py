@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - exercised only without the extra
     telegramify_markdown = None
 
 from ... import security
-from ..base import SILENCE_TOKENS, AdapterState, BasePlatformAdapter, SessionSource
+from ..base import AdapterState, BasePlatformAdapter, SessionSource, parse_ids, revealable
 
 _TELEGRAM_MSG_LIMIT = 4096
 # Split raw text below the hard limit: MarkdownV2 escaping adds backslashes, so
@@ -57,14 +57,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if not token:
             raise ValueError("TELEGRAM_BOT_TOKEN environment variable not set.")
         self._token = token
-        self._allowed: set[str] = _parse_ids(os.environ.get("TELEGRAM_ALLOWED_USERS", ""))
+        self._allowed: set[str] = parse_ids(os.environ.get("TELEGRAM_ALLOWED_USERS", ""))
         # Who may approve high-impact actions. Distinct from _allowed so chat can
         # be open to everyone (empty allowlist) while approvals stay restricted.
         # Unset -> defaults to the chat allowlist (the common single-owner case);
         # set but empty -> nobody can approve (high-impact falls back to policy).
         trusted_env = os.environ.get("TELEGRAM_TRUSTED_USERS")
         self._trusted: set[str] = (
-            _parse_ids(trusted_env) if trusted_env is not None else set(self._allowed)
+            parse_ids(trusted_env) if trusted_env is not None else set(self._allowed)
         )
         self._app: Application | None = None
         # Live approval prompts keyed by approval_id -> (chat_id, message_id),
@@ -586,7 +586,7 @@ class _StreamSink:
         if not delta:
             return
         self._buf += delta
-        if not _revealable(self._buf):
+        if not revealable(self._buf):
             return
         now = time.monotonic()
         if self._message is None or now - self._last_edit >= _STREAM_EDIT_INTERVAL:
@@ -621,7 +621,7 @@ class _StreamSink:
         async with self._lock:
             if self._done or not self._adapter._app:
                 return
-            if _revealable(text):
+            if revealable(text):
                 await self._commit(text)
             else:
                 await self._delete_message()
@@ -672,24 +672,10 @@ class _StreamSink:
                 pass
 
 
-def _parse_ids(spec: str) -> set[str]:
-    """Parse a comma-separated list of user ids into a set, dropping blanks."""
-    return {u.strip() for u in spec.split(",") if u.strip()}
-
-
 def _clip(text: str, limit: int = _TELEGRAM_MSG_LIMIT) -> str:
     """A single Telegram message can't exceed the hard limit; clip interim
     streaming frames (the final reply is split across messages instead)."""
     return text if len(text) <= limit else text[:limit]
-
-
-def _revealable(text: str) -> bool:
-    """True once buffered text is clearly not a silence sentinel, so a streamed
-    ``[SILENT]`` / ``NO_REPLY`` is never momentarily shown before it's swallowed."""
-    s = text.strip()
-    if not s:
-        return False
-    return not any(tok.startswith(s) or tok in s for tok in SILENCE_TOKENS)
 
 
 def _split(text: str, limit: int = _SPLIT_LIMIT) -> list[str]:

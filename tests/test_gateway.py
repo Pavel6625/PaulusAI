@@ -644,11 +644,11 @@ def test_telegram_command_rejects_unauthorized(monkeypatch):
 
 
 def test_revealable_gates_silence_sentinels():
-    tg = _telegram_module()
+    from paulus.gateway.base import revealable
     for hidden in ("", "[", "[SIL", "[SILENT]", "NO_REPLY"):
-        assert not tg._revealable(hidden)
+        assert not revealable(hidden)
     for shown in ("Hello", "[note] hi"):
-        assert tg._revealable(shown)
+        assert revealable(shown)
 
 
 class _FakeMsg:

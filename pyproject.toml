@@ -36,6 +36,7 @@ telegram = [
 ]
 email = ["agentmail>=0.5,<1"]
 web = ["beautifulsoup4>=4.12,<5"]
+webui = ["aiohttp>=3.9,<4"]
 mcp = ["mcp>=2,<3"]
 all = [
     "chromadb>=0.5,<2",
@@ -43,6 +44,7 @@ all = [
     "telegramify-markdown>=1.0,<2",
     "agentmail>=0.5,<1",
     "beautifulsoup4>=4.12,<5",
+    "aiohttp>=3.9,<4",
     "mcp>=2,<3",
 ]
 dev = [
@@ -60,6 +62,10 @@ Wiki = "https://github.com/Pavel6625/PaulusAI/wiki"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The web UI's page, script and stylesheet, served by the web adapter.
+[tool.setuptools.package-data]
+"paulus.gateway.platforms" = ["webui_static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

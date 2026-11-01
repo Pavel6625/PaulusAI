@@ -2,8 +2,8 @@
 
 A long-running, autonomous digital companion with **persistent multi-store memory**,
 a **functional affective (emotional) system**, **continuous learning**, and the
-ability to **perceive and act in the world through tools**. It runs as either an
-interactive terminal chat or an always-on Telegram bot, and is provider-agnostic:
+ability to **perceive and act in the world through tools**. It runs as an
+interactive terminal chat, an always-on Telegram bot, or a web chat, and is provider-agnostic:
 point it at Anthropic, OpenAI, Gemini, OpenRouter, or a local Ollama model.
 
 > Status: working MVP. The architecture (memory, affect, skills, safety gate,
@@ -42,7 +42,8 @@ point it at Anthropic, OpenAI, Gemini, OpenRouter, or a local Ollama model.
 - **Pluggable sandbox** — command/file execution runs `local`, in a
   network-disabled `docker` container, or over `ssh`.
 - **Messaging gateway** — a Hermes-style gateway with a Telegram adapter
-  (allowlist, message batching, circuit breaker, per-chat sessions).
+  (allowlist, message batching, circuit breaker, per-chat sessions) and a
+  [web UI](#web-ui) that signs in with Telegram and shares the same memory.
 - **Provider-agnostic** — one LiteLLM boundary; switch models with one env var.
 
 ---
@@ -69,7 +70,7 @@ source .venv/bin/activate
 # Core only (keyword memory, terminal chat):
 pip install .
 
-# Recommended — everything (semantic memory + Telegram gateway):
+# Recommended — everything (semantic memory + Telegram gateway + web UI):
 pip install ".[all]"
 
 # For development (tests + linter), install editable:
@@ -81,7 +82,7 @@ This puts two commands on your `PATH`:
 | Command          | What it does                          |
 |------------------|---------------------------------------|
 | `paulus`         | Interactive terminal chat             |
-| `paulus-gateway` | Always-on Telegram bot                |
+| `paulus-gateway` | Always-on Telegram bot and web UI     |
 
 ### Optional extras
 
@@ -90,6 +91,7 @@ This puts two commands on your `PATH`:
 | `vectors`    | `chromadb` semantic memory    | Falls back to keyword search            |
 | `telegram`   | `python-telegram-bot`         | `paulus-gateway` has no adapter to run  |
 | `web`        | `beautifulsoup4` (clean scrape)| `fetch_url` falls back to a stdlib stripper |
+| `webui`      | `aiohttp` (browser chat)      | `WEB_PORT` can't be used                |
 | `mcp`        | `mcp` (MCP client SDK)        | Configured MCP servers are skipped      |
 | `all`        | all of the above              | —                                       |
 | `dev`        | `pytest`, `ruff`              | —                                       |
@@ -141,6 +143,12 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `TELEGRAM_TRUSTED_USERS`| (= allowed)                    | IDs allowed to **approve** high-impact actions; empty = nobody  |
 | `TELEGRAM_PARSE_MODE`   | `MarkdownV2`                   | Render replies as Markdown; `plain`/`none`/`off` for raw text   |
 | `TELEGRAM_STREAMING`    | `1`                            | Live-edit the reply as it streams; `0`/`off` for one-shot send  |
+| `WEB_PORT`              | (unset = web UI off)           | Serve the [web UI](#web-ui) on this port                        |
+| `WEB_HOST`              | `127.0.0.1`                    | Interface the web UI listens on (keep it behind a proxy)        |
+| `WEB_PUBLIC_URL`        | (unset = request's Host)       | Public origin, e.g. `https://paulus.example.com`; logins and sockets must come from it |
+| `TELEGRAM_BOT_USERNAME` | (unset = asked from Telegram)  | The bot's @username, for the web UI's login widget              |
+| `WEB_SESSION_DAYS`      | `30`                           | How long a web sign-in lasts                                    |
+| `WEB_SESSION_SECRET`    | (derived from bot token)       | Key that signs web session cookies                             |
 | `DP_BILLING_API_BASE`   | (unset = disabled)             | Base URL of an external billing service; enables the usage pay gate |
 | `DP_BILLING_CHECK_PATH` | `/usage/check`                 | Path appended to `DP_BILLING_API_BASE` for the check-usage call |
 | `DP_BILLING_API_KEY`    | —                              | Sent as `Authorization: Bearer <key>` to the billing service    |
@@ -396,6 +404,30 @@ Telegram's edit-rate limit), then Markdown-rendered once complete. Set
 > falls back to `DP_UNATTENDED_POLICY` (**denied by default**) and the agent
 > tells them it can't. Disable the buttons entirely with `DP_GATEWAY_APPROVALS=0`.
 
+### Web UI
+
+`paulus-gateway` can also serve a browser chat (needs the `webui` extra). It
+runs next to the Telegram bot in the same process, and people sign in with the
+**Telegram Login Widget** — so a web user *is* their Telegram account: the same
+memory, mood, background tasks and billing, and `TELEGRAM_ALLOWED_USERS` /
+`TELEGRAM_TRUSTED_USERS` decide who may chat and who may approve. Earlier
+messages from either side appear in the page's history.
+
+1. Set `WEB_PORT=8080` and `WEB_PUBLIC_URL=https://your.domain` next to
+   `TELEGRAM_BOT_TOKEN`.
+2. Put it behind a TLS reverse proxy that forwards WebSockets — see
+   [deploy/nginx-paulus-web.conf](deploy/nginx-paulus-web.conf).
+3. Link the domain to your bot once: [@BotFather](https://t.me/BotFather) →
+   `/setdomain`. Without this the login button won't appear.
+
+Replies stream in as the model writes and are rendered as Markdown; approvals
+show up as Approve / Deny / Allow-for-this-task buttons; you can attach images
+and text files (or paste them), and documents the agent sends arrive as
+downloads. The in-chat commands work as on Telegram, including `/reset`.
+Messages that arrive while no tab is open (a finished background task, an
+idle check-in) wait for the next one, though only in memory — they're lost if
+the gateway restarts, and the conversation itself is always in the history.
+
 ---
 
 ## Running as a service (systemd)
@@ -413,6 +445,7 @@ sudo -u paulus python3 -m venv /opt/paulus/venv
 sudo -u paulus /opt/paulus/venv/bin/pip install "git+https://github.com/Pavel6625/PaulusAI.git#egg=paulusai[all]"
 
 # 3. Secrets / config (0600). Must contain your provider key + TELEGRAM_BOT_TOKEN.
+#    For the web UI, add WEB_PORT / WEB_PUBLIC_URL (see "Web UI" above).
 sudo install -m 600 /dev/stdin /etc/paulus/paulus.env <<'EOF'
 DP_CORE_MODEL=anthropic/claude-sonnet-4-6
 ANTHROPIC_API_KEY=sk-...
@@ -535,9 +568,9 @@ src/paulus/
 ├── billing.py        # usage pay gate (external balance/pricing service)
 ├── sandbox.py        # local / docker / ssh execution backends
 ├── config.py         # env-driven configuration + data-dir resolution
-└── gateway/          # Hermes-style messaging gateway (Telegram adapter)
+└── gateway/          # Hermes-style messaging gateway (Telegram + web UI adapters)
 tests/                # offline pytest suite
-deploy/               # systemd unit
+deploy/               # systemd unit, nginx site for the web UI
 ```
 
 ---

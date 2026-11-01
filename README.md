@@ -145,7 +145,7 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `TELEGRAM_STREAMING`    | `1`                            | Live-edit the reply as it streams; `0`/`off` for one-shot send  |
 | `WEB_PORT`              | (unset = web UI off)           | Serve the [web UI](#web-ui) on this port                        |
 | `WEB_HOST`              | `127.0.0.1`                    | Interface the web UI listens on (keep it behind a proxy)        |
-| `WEB_PUBLIC_URL`        | (unset = request's Host)       | Public origin, e.g. `https://paulus.example.com`; logins and sockets must come from it |
+| `WEB_PUBLIC_URL`        | (unset = request's Host)       | Public address, e.g. `https://paulus.example.com` or `https://example.com/chat`; logins and sockets must come from it, and the cookie is scoped to its path |
 | `TELEGRAM_BOT_USERNAME` | (unset = asked from Telegram)  | The bot's @username, for the web UI's login widget              |
 | `WEB_SESSION_DAYS`      | `30`                           | How long a web sign-in lasts                                    |
 | `WEB_SESSION_SECRET`    | (derived from bot token)       | Key that signs web session cookies                             |
@@ -419,6 +419,11 @@ messages from either side appear in the page's history.
    [deploy/nginx-paulus-web.conf](deploy/nginx-paulus-web.conf).
 3. Link the domain to your bot once: [@BotFather](https://t.me/BotFather) →
    `/setdomain`. Without this the login button won't appear.
+
+A bot has only one login domain, so if another site on that domain already
+uses the bot's Telegram login, mount the chat under a path there instead
+(e.g. `https://example.com/chat/`) and set `WEB_PUBLIC_URL` to include the
+path; the nginx sample shows the `location` block for that.
 
 Replies stream in as the model writes and are rendered as Markdown; approvals
 show up as Approve / Deny / Allow-for-this-task buttons; you can attach images

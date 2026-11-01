@@ -70,9 +70,13 @@ class WebAdapter(BasePlatformAdapter):
         self._bot_username = os.environ.get("TELEGRAM_BOT_USERNAME", "").strip().lstrip("@")
         self._host = os.environ.get("WEB_HOST", "127.0.0.1")
         self._port = int(os.environ.get("WEB_PORT", "8080"))
-        # The public origin (e.g. https://paulus.example.com). Used to check the
-        # Origin of logins and sockets; unset -> the request's own Host.
+        # The public address (e.g. https://paulus.example.com, or .../chat when
+        # a proxy mounts the UI under a path). Used to check the Origin of
+        # logins and sockets; unset -> the request's own Host.
         self._public_url = os.environ.get("WEB_PUBLIC_URL", "").strip().rstrip("/")
+        # Scope the session cookie to that path, so a UI sharing its domain
+        # with another site never sends that site our session.
+        self._cookie_path = urlsplit(self._public_url).path.rstrip("/") + "/"
         self._session_ttl = float(os.environ.get("WEB_SESSION_DAYS", "30")) * 86400
         self._doc_max_bytes = int(os.environ.get("WEB_DOC_MAX_BYTES", "262144"))
         # Same allow/trust semantics as the Telegram adapter (see there).
@@ -187,7 +191,7 @@ class WebAdapter(BasePlatformAdapter):
         name = fields.get("first_name") or fields.get("username") or user_id
         resp = web.HTTPFound("./")
         resp.set_cookie(_COOKIE, self._issue_session(user_id, name),
-                        max_age=int(self._session_ttl), path="/", httponly=True,
+                        max_age=int(self._session_ttl), path=self._cookie_path, httponly=True,
                         samesite="Lax", secure=self._is_https(request))
         security.audit("web_login", user_id)
         raise resp
@@ -205,7 +209,7 @@ class WebAdapter(BasePlatformAdapter):
         if not self._same_origin(request):
             raise web.HTTPForbidden()
         resp = web.json_response({"ok": True})
-        resp.del_cookie(_COOKIE, path="/")
+        resp.del_cookie(_COOKIE, path=self._cookie_path)
         return resp
 
     async def _on_history(self, request: web.Request) -> web.Response:

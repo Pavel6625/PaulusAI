@@ -410,3 +410,30 @@ def test_history_item_reduces_documents_to_names():
     })
     assert item == {"role": "owner", "ts": "t", "via": "web", "text": "see this",
                     "attachments": ["a.md"]}
+
+
+def test_ui_under_a_path_keeps_its_cookie_there(monkeypatch):
+    """Mounted at /chat/ on a domain shared with another site (proxy strips the
+    prefix): the session cookie must not reach the rest of the domain."""
+    monkeypatch.setenv("WEB_PUBLIC_URL", "https://paulus.example.com/chat/")
+    _, adapter = _make()
+
+    async def go():
+        client = await _client(adapter)
+        try:
+            resp = await client.get("/auth", params=_login("42"), allow_redirects=False)
+            assert resp.headers["Location"] == "./"          # -> /chat/ in the browser
+            assert resp.cookies[webui._COOKIE]["path"] == "/chat/"
+            assert resp.cookies[webui._COOKIE]["secure"]
+            resp = await client.post("/api/logout",
+                                     headers={"Origin": "https://paulus.example.com"})
+            assert resp.status == 200
+            assert "Path=/chat/" in resp.headers["Set-Cookie"]
+            resp = await client.post("/api/logout", headers={"Origin": "https://evil.example"})
+            assert resp.status == 403
+        finally:
+            await client.close()
+
+    asyncio.run(go())
+    monkeypatch.delenv("WEB_PUBLIC_URL")
+    assert webui.WebAdapter(GatewayRunner())._cookie_path == "/"

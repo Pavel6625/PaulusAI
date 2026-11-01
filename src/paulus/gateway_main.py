@@ -10,14 +10,13 @@ Environment:
 import asyncio
 import os
 
-from . import config, mcp_client, router, vectorstore
+from . import config, mcp_client, vectorstore
 from .gateway.runner import GatewayRunner
 
 
 async def _main() -> None:
     config.ensure_dirs()
     vectorstore.init()
-    router.init()   # no-op unless DP_ROUTING is enabled
     # Blocks while servers start; fine here, before any adapter is running.
     if mcp_client.init():
         print(f"MCP servers:\n{mcp_client.status()}\n")

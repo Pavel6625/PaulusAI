@@ -86,7 +86,7 @@ def start_from_tool(tool_input, user_id=None, model=None, review=None):
 
 def start_from_owner(text, user_id=None):
     """/bg <request>: the owner's own words become the task. Returns the reply."""
-    from . import agent, billing, memory, router
+    from . import agent, billing, memory
     if not config.TASKS:
         return "Background tasks are turned off (DP_TASKS=0)."
     text = text.strip()
@@ -97,10 +97,10 @@ def start_from_owner(text, user_id=None):
     allowed, block = billing.gate(user_id)
     if not allowed:
         return block
-    model, _tier, _reason = router.route(text, user_id=user_id)
     review = agent._review_context(text, user_id)
     memory.log_episode("owner", f"/bg {text}", trust="trusted", user_id=user_id)
-    task, error = start(user_id, text[:60], text, model=model, review=review)
+    task, error = start(user_id, text[:60], text, model=config.chat_model(),
+                        review=review)
     if error:
         return error
     return f"Started background task #{task.id}. I'll message you when it's done."

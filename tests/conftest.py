@@ -14,6 +14,8 @@ os.environ["DP_DATA_DIR"] = _TMP
 os.environ.setdefault("DP_UNATTENDED_POLICY", "deny")
 os.environ.setdefault("DP_CORE_MODEL", "anthropic/claude-sonnet-4-6")
 os.environ.setdefault("DP_SANDBOX", "local")
+# A developer's .env must not route test turns through OpenRouter.
+os.environ["DP_ROUTER_MODEL"] = ""
 
 
 @pytest.fixture(autouse=True)

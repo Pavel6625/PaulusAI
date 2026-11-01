@@ -219,3 +219,105 @@ def test_normalize_plain_text_is_end_turn():
     resp = llm._normalize(fake)
     assert resp.stop_reason == "end_turn"
     assert resp.content[0].text == "hello"
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter router (DP_ROUTER_MODEL)
+# ---------------------------------------------------------------------------
+
+JEV = "openrouter/typesafe/jev-router"
+
+
+def _router(monkeypatch, model=JEV, tier="", models=(), excluded=()):
+    monkeypatch.setattr(llm.config, "CORE_MODEL", "ollama_chat/gemma4:31b-cloud")
+    monkeypatch.setattr(llm.config, "API_BASE", "https://ollama.example/v1")
+    monkeypatch.setattr(llm.config, "API_KEY", "ollama-secret")
+    monkeypatch.setattr(llm.config, "ROUTER_MODEL", model)
+    monkeypatch.setattr(llm.config, "ROUTER_COST_TIER", tier)
+    monkeypatch.setattr(llm.config, "ROUTER_MODELS", list(models))
+    monkeypatch.setattr(llm.config, "ROUTER_EXCLUDED", list(excluded))
+
+
+def test_chat_model_is_the_router_when_set(monkeypatch):
+    _router(monkeypatch)
+    assert llm.config.chat_model() == JEV
+    monkeypatch.setattr(llm.config, "ROUTER_MODEL", "")
+    assert llm.config.chat_model() == "ollama_chat/gemma4:31b-cloud"
+
+
+def test_router_settings_go_in_the_jev_plugin(monkeypatch):
+    _router(monkeypatch, tier="medium", models=["anthropic/*"],
+            excluded=["anthropic/claude-opus*"])
+    seen = _capture_completion(monkeypatch)
+
+    llm.complete("sys", [{"role": "user", "content": "hi"}], model=JEV)
+
+    assert seen["model"] == JEV
+    assert seen["extra_body"] == {"plugins": [{
+        "id": "jev-router", "cost_tier": "medium",
+        "allowed_models": ["anthropic/*"],
+        "excluded_models": ["anthropic/claude-opus*"],
+    }]}
+    # The core model's custom endpoint must not leak to OpenRouter.
+    assert seen["api_base"] is None and seen["api_key"] is None
+
+
+def test_router_without_settings_sends_no_plugin(monkeypatch):
+    # Nothing set locally: the account defaults on OpenRouter apply.
+    _router(monkeypatch)
+    seen = _capture_completion(monkeypatch)
+    llm.complete("sys", [{"role": "user", "content": "hi"}], model=JEV)
+    assert "extra_body" not in seen
+
+
+def test_router_settings_are_not_sent_to_other_models(monkeypatch):
+    _router(monkeypatch, tier="high")
+    seen = _capture_completion(monkeypatch)
+    llm.complete("sys", [{"role": "user", "content": "hi"}],
+                 model="openrouter/openai/gpt-4o")
+    assert "extra_body" not in seen
+
+
+@pytest.mark.parametrize("model, plugin_id", [
+    ("openrouter/typesafe/jev-router", "jev-router"),
+    ("openrouter/anthropic/auto", "jev-router"),
+    ("openrouter/openrouter/auto", "auto-router"),
+    ("openrouter/openai/gpt-4o", None),
+])
+def test_router_plugin_id(model, plugin_id):
+    assert llm._router_plugin_id(model) == plugin_id
+
+
+def test_router_failure_falls_back_to_core_model(monkeypatch):
+    _router(monkeypatch, tier="medium")
+    calls = []
+
+    def fake_completion(**kwargs):
+        calls.append(kwargs)
+        if kwargs["model"] == JEV:
+            raise RuntimeError("503 router unavailable")
+        return SimpleNamespace(choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(content="from core", tool_calls=None),
+        )])
+
+    monkeypatch.setattr(llm.litellm, "completion", fake_completion)
+    resp = llm.complete("sys", [{"role": "user", "content": "hi"}], model=JEV)
+
+    assert resp.content[0].text == "from core"
+    fallback = calls[1]
+    assert fallback["model"] == "ollama_chat/gemma4:31b-cloud"
+    assert fallback["api_base"] == "https://ollama.example/v1"
+    assert "extra_body" not in fallback
+
+
+def test_other_model_failures_are_not_swallowed(monkeypatch):
+    _router(monkeypatch)
+
+    def fake_completion(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(llm.litellm, "completion", fake_completion)
+    with pytest.raises(RuntimeError):
+        llm.complete("sys", [{"role": "user", "content": "hi"}],
+                     model="openrouter/openai/gpt-4o")

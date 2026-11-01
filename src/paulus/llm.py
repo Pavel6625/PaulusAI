@@ -15,8 +15,9 @@ from the environment itself. Ollama needs no key. DP_API_BASE/DP_API_KEY
 override the endpoint for the core model only — see config.model_credentials.
 
 Every entry point takes an optional ``model=`` to override the core model for
-that call, so a caller can pick a model per turn (e.g. routing) without any
-global state; omitting it keeps the configured core model.
+that call, so a caller can pick a model per turn without any global state;
+omitting it keeps the configured core model. Passing config.ROUTER_MODEL
+hands the choice to an OpenRouter router (see _router_options).
 
 agent.py is unaware of the provider — it always sees Anthropic-shaped
 response objects. All format conversion lives here.
@@ -272,6 +273,61 @@ def supports_vision(model=None):
     return info.get("supports_vision") is not False
 
 
+def _router_plugin_id(model):
+    """The OpenRouter plugin id that carries *model*'s routing settings, or
+    None when *model* isn't a router. ``<author>/auto`` aliases run Jev over
+    that author's models; ``openrouter/auto`` is the separate Auto Router."""
+    slug = model.removeprefix("openrouter/")
+    if slug == "openrouter/auto":
+        return "auto-router"
+    if slug == "typesafe/jev-router" or slug.endswith("/auto"):
+        return "jev-router"
+    return None
+
+
+def _router_options(model):
+    """Extra completion kwargs for a call to the configured router: its plugin
+    settings in the request body. Empty for any other model, and when no
+    setting is given, so the router's account defaults apply."""
+    if model != config.ROUTER_MODEL:
+        return {}
+    plugin_id = _router_plugin_id(model)
+    if plugin_id is None:
+        return {}
+    plugin = {"id": plugin_id}
+    if config.ROUTER_COST_TIER:
+        plugin["cost_tier"] = config.ROUTER_COST_TIER
+    if config.ROUTER_MODELS:
+        plugin["allowed_models"] = config.ROUTER_MODELS
+    if config.ROUTER_EXCLUDED:
+        plugin["excluded_models"] = config.ROUTER_EXCLUDED
+    if len(plugin) == 1:
+        return {}
+    return {"extra_body": {"plugins": [plugin]}}
+
+
+def _completion(model, **kwargs):
+    """litellm.completion on *model*, with its credentials and, for the router,
+    its settings.
+
+    A router failure (unreachable, or rejecting its settings) is retried once
+    on CORE_MODEL: routing is an optimisation and must never be the reason a
+    turn fails. LiteLLM sends a streaming request eagerly, so this covers
+    streams too; a stream that breaks after it started is not retried, since
+    part of the reply has already been shown."""
+    try:
+        return litellm.completion(model=model, **kwargs,
+                                  **config.model_credentials(model),
+                                  **_router_options(model))
+    except Exception as e:
+        if model != config.ROUTER_MODEL or model == config.CORE_MODEL:
+            raise
+        print(f"[llm] router {model} failed, falling back to "
+              f"{config.CORE_MODEL}: {e}", file=sys.stderr)
+        return litellm.completion(model=config.CORE_MODEL, **kwargs,
+                                  **config.model_credentials(config.CORE_MODEL))
+
+
 def complete(system, messages, tools=None, model=None):
     """One non-streaming turn. Returns an Anthropic-shaped _Response.
 
@@ -279,12 +335,11 @@ def complete(system, messages, tools=None, model=None):
     credentials are resolved per-model (see config.model_credentials)."""
     model = model or config.CORE_MODEL
     oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
-    return _normalize(litellm.completion(
-        model=model,
+    return _normalize(_completion(
+        model,
         max_tokens=config.MAX_TOKENS,
         messages=oai_messages,
         tools=_to_litellm_tools(tools) if tools else None,
-        **config.model_credentials(model),
     ))
 
 
@@ -297,13 +352,12 @@ def stream(system, messages, tools=None, on_delta=None, model=None):
     *model* overrides the configured core model for this call only."""
     model = model or config.CORE_MODEL
     oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
-    chunks = litellm.completion(
-        model=model,
+    chunks = _completion(
+        model,
         max_tokens=config.MAX_TOKENS,
         messages=oai_messages,
         tools=_to_litellm_tools(tools) if tools else None,
         stream=True,
-        **config.model_credentials(model),
     )
 
     text_parts: list[str] = []

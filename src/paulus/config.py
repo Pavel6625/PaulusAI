@@ -47,57 +47,37 @@ CORE_MODEL = os.environ.get("DP_CORE_MODEL", "anthropic/claude-sonnet-4-6")
 MAX_TOKENS = int(os.environ.get("DP_MAX_TOKENS", "2048"))
 
 # --- Model routing (optional) -----------------------------------------------
-# CORE_MODEL is the FLOOR: every turn runs on it unless the router finds
-# positive evidence that the turn needs more. Routing therefore only ever
-# escalates upward, and buys quality rather than saving cost.
+# Routing is delegated to an OpenRouter router model, which picks the model
+# (and, for Jev, the reasoning effort) per request:
 #
-#   low  -> CORE_MODEL                       (always; also the fallback)
-#   mid  -> DP_MID_MODEL, else low
-#   top  -> DP_TOP_MODEL, else mid, else low
+#   openrouter/typesafe/jev-router   Jev judges each request's difficulty
+#   openrouter/openrouter/auto       ranks by task type and market spend
 #
-# Unset tiers collapse into the one below, so a two-tier setup is just
-# DP_TOP_MODEL. DP_ROUTING=off (the default) pins everything to CORE_MODEL, so
-# routing is strictly opt-in and an existing deployment is unaffected.
-ROUTING = os.environ.get("DP_ROUTING", "off").strip().lower()
-MID_MODEL = os.environ.get("DP_MID_MODEL", "").strip()
-TOP_MODEL = os.environ.get("DP_TOP_MODEL", "").strip()
+# Unset (the default) runs every conversational turn on CORE_MODEL. When set,
+# CORE_MODEL remains the fallback for a turn the router itself fails, and the
+# model for internal jobs (see UTILITY_MODEL), which are never routed.
+ROUTER_MODEL = os.environ.get("DP_ROUTER_MODEL", "").strip()
+# low | medium | high (Jev; Auto also takes xhigh | max). Unset = the router's
+# own default policy.
+ROUTER_COST_TIER = os.environ.get("DP_ROUTER_COST_TIER", "").strip().lower()
+# Comma-separated OpenRouter slugs or patterns ("anthropic/*",
+# "~openai/gpt-luna-latest"). For Jev, ROUTER_MODELS is a preference it drops
+# when nothing in it can serve a request; ROUTER_EXCLUDED is always enforced.
+ROUTER_MODELS = [m.strip() for m in os.environ.get("DP_ROUTER_MODELS", "").split(",")
+                 if m.strip()]
+ROUTER_EXCLUDED = [m.strip() for m in os.environ.get("DP_ROUTER_EXCLUDED", "").split(",")
+                   if m.strip()]
 
-# Internal, non-conversational LLM jobs (consolidation, fact reconciliation).
-# These need reliable strict JSON but no tools and no low latency, so they are
-# pinned rather than routed. Defaults to CORE_MODEL: no behaviour change.
+# Internal, non-conversational LLM jobs (consolidation, fact reconciliation,
+# idle check-ins). These need reliable strict JSON but no tools and no low
+# latency, so they are pinned rather than routed. Defaults to CORE_MODEL: no behaviour change.
 UTILITY_MODEL = os.environ.get("DP_UTILITY_MODEL", "").strip()
 
-# Minimum cosine margin between the best and runner-up tier before an
-# escalation is trusted. Measured on all-MiniLM-L6-v2, genuinely novel hard
-# queries separate by only ~0.01-0.15, so a thin margin means "not confident"
-# and must fall back DOWN rather than spend a flagship model on a coin flip.
-ROUTE_MARGIN = float(os.environ.get("DP_ROUTE_MARGIN", "0.08"))
 
-
-# --- Routing feedback -------------------------------------------------------
-# Every routing decision is logged with its outcome, so the router's behaviour
-# is inspectable rather than a black box (CLI: /routes). Logging is cheap and
-# always on when routing is; it is the only way to tune the rest.
-MAX_ROUTE_LOG = int(os.environ.get("DP_MAX_ROUTE_LOG", "2000"))
-
-# Learning from that log is OFF by default, and deliberately so: it promotes
-# real user phrasings into the exemplar bank, and a wrong promotion drags
-# chitchat toward an escalation tier — degrading the floor it is meant to
-# protect. Inspect /routes on real traffic first, then enable.
-ROUTE_LEARNING = (os.environ.get("DP_ROUTE_LEARNING", "0").strip().lower()
-                  not in ("", "0", "off", "false", "no"))
-# Cap per tier, per user. Oldest learned exemplars are evicted first, so a bad
-# promotion ages out instead of poisoning the bank forever.
-MAX_LEARNED_EXEMPLARS = int(os.environ.get("DP_MAX_LEARNED", "40"))
-
-
-def tier_model(tier: str) -> str:
-    """Resolve a routing tier to a model string, collapsing unset tiers down."""
-    if tier == "top":
-        return TOP_MODEL or MID_MODEL or CORE_MODEL
-    if tier == "mid":
-        return MID_MODEL or CORE_MODEL
-    return CORE_MODEL
+def chat_model() -> str:
+    """The model a conversational turn is sent to: the router when one is
+    configured, else the core model."""
+    return ROUTER_MODEL or CORE_MODEL
 
 
 def utility_model() -> str:

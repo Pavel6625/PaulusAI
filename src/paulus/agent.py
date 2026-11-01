@@ -4,7 +4,7 @@ between the model's decision and any real-world effect.
 """
 import os
 
-from . import affect, automode, billing, config, llm, memory, router, security, skills, tools
+from . import affect, automode, billing, config, llm, memory, security, skills, tools
 
 SYSTEM_TEMPLATE = """You are a persistent digital companion for a single owner.
 You have long-term memory, learned skills, and a current mood. Be warm, concise,
@@ -34,19 +34,6 @@ Relevant long-term memory:
 Possibly relevant skills:
 {skill_list}
 """
-
-
-# Phrases that say the ANSWER was wrong, as opposed to affect's broader mood
-# scan below. They must be separate: affect matches a bare "bad", so "i had a
-# bad day at work" reads as frustration — harmless for a mood, but as a routing
-# label it would blame the previous turn and drag small talk up a tier.
-_COMPLAINT_PHRASES = (
-    "that's wrong", "thats wrong", "you're wrong", "youre wrong",
-    "that's not right", "thats not right", "that's incorrect",
-    "not what i asked", "not what i meant", "you misunderstood",
-    "you didn't understand", "you didnt understand", "makes no sense",
-    "that's useless", "wrong answer",
-)
 
 
 def _context_query(user_id=None):
@@ -171,8 +158,7 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
     mood alone (a subagent's errors aren't the companion's feelings).
 
     *tools_used*, when given, is filled with the names of the tools the model
-    actually ran — the router uses it as objective evidence of how much the
-    turn really needed.
+    actually ran (background tasks report it as progress).
 
     When ``on_delta`` is given, each turn is streamed and text fragments are
     forwarded to it as they arrive (the gateway uses this to live-edit the
@@ -182,9 +168,9 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
     gateway posts it as its own message rather than running the next step's
     text on into it.
 
-    *model* is fixed for the whole loop: it is chosen once per turn, so a tool
-    exchange is never handed mid-flight to a different model than the one that
-    started it.
+    *model* is fixed for the whole loop. When it is the OpenRouter router,
+    each step is routed afresh, which Jev is built for: it can keep the model,
+    adjust its effort, or switch as an agentic task progresses.
 
     *review* is the auto-mode reviewer's view of the task (see automode.py),
     passed to the gate and extended with each action that runs, labelled with
@@ -327,21 +313,6 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     if not allowed:
         return block_message
 
-    # A complaint is about the reply the owner just read, so it labels the
-    # PREVIOUS turn's routing decision. Recorded before this turn is routed,
-    # while _last_turn still points at the one being complained about.
-    if any(p in owner_text.lower() for p in _COMPLAINT_PHRASES):
-        router.log_complaint(user_id=user_id)
-
-    # Route on what the owner actually wrote, BEFORE documents are folded in:
-    # their content is untrusted, and letting it steer model selection would
-    # hand an attacker a lever on spend. That a document is present is signal
-    # enough, and is passed separately.
-    model, tier, reason = router.route(owner_text, user_id=user_id,
-                                       has_images=bool(images),
-                                       has_documents=bool(documents))
-    turn_id = router.log_decision(owner_text, tier, reason, user_id=user_id)
-
     review = _review_context(owner_text, user_id, images, documents)
     owner_text = _ingest_documents(owner_text, documents, user_id)
     memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
@@ -356,11 +327,9 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     system = _build_system(user_id, specs)
     messages = _history_to_messages(user_id)
     _attach_images(messages, images)
-    tools_used = []
     final_text = _run_tool_loop(system, messages, user_id, on_delta=on_delta,
-                                model=model, tools_used=tools_used, review=review,
+                                model=config.chat_model(), review=review,
                                 specs=specs, on_break=on_break)
-    router.log_outcome(turn_id, tools_used, user_id=user_id)
 
     memory.log_episode("agent", final_text, trust="trusted", user_id=user_id)
     affect.decay()
@@ -463,8 +432,8 @@ def sleep(user_id=None):
     reusable skills from recent episodes, then decay. Proposed skills are stored
     as 'unverified' (reflection-review gate).
 
-    Decay and routing feedback run whatever the model returned; only the storing
-    depends on a usable reply. The returned summary distinguishes an empty
+    Decay runs whatever the model returned; only the storing depends on a
+    usable reply. The returned summary distinguishes an empty
     consolidation from a failed one — they used to read identically."""
     episodes = memory.recent_episodes(20, user_id=user_id)
     if not episodes:
@@ -497,10 +466,6 @@ def sleep(user_id=None):
     if problem:
         security.audit("consolidation_parse_error", f"{user_id}: {problem}")
 
-    # Outside the parse above on purpose: routing feedback is mechanical (no
-    # model call, nothing to parse), so a model that returns unparseable JSON
-    # must not take the router's learning down with it.
-    routed = router.learn(user_id=user_id)
     forgotten = memory.decay(user_id=user_id)
 
     if problem:
@@ -509,5 +474,4 @@ def sleep(user_id=None):
         head = f"Consolidated {facts_n} fact(s), proposed {skills_n} skill(s)"
         if dropped:
             head += f", dropped {dropped} malformed"
-    learned_note = f" Routing learned {routed} example(s)." if routed else ""
-    return f"{head}; memory decayed ({forgotten} forgotten).{learned_note}"
+    return f"{head}; memory decayed ({forgotten} forgotten)."

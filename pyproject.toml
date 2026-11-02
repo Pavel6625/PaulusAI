@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paulusai"
-version = "1.4.0"
+version = "1.4.1"
 description = "A long-running, autonomous digital companion with persistent memory, a functional affective system, continuous learning, and tool use."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -55,6 +55,7 @@ dev = [
 [project.scripts]
 paulus = "paulus.cli:main"
 paulus-gateway = "paulus.gateway_main:run"
+paulus-mcp-login = "paulus.mcp_auth:main"
 
 [project.urls]
 Homepage = "https://github.com/Pavel6625/PaulusAI"

@@ -8,7 +8,11 @@ The owner lists MCP servers in a JSON file (DP_MCP_CONFIG, default
                    "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"},
                    "auto_approve": ["get_*", "list_*", "search_*"]},
         "docs":   {"url": "https://example.com/mcp",
-                   "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}}}}
+                   "headers": {"Authorization": "Bearer ${DOCS_TOKEN}"}},
+        "notion": {"url": "https://mcp.notion.com/mcp", "auth": "oauth"}}}
+
+A server with ``"auth": "oauth"`` signs in once with ``paulus-mcp-login``
+(mcp_auth.py) and keeps its tokens fresh from then on.
 
 Each server's tools join the agent's own as ``mcp__<server>__<tool>``.
 
@@ -113,6 +117,10 @@ def _check(name, conf):
     if not conf.get("command") and not conf.get("url"):
         raise ConfigError("needs 'command' (stdio) or 'url' (HTTP)")
     conf = _expand(conf)
+    if conf.get("auth") not in (None, "oauth"):
+        raise ConfigError("'auth' can only be \"oauth\"")
+    if conf.get("auth") and not conf.get("url"):
+        raise ConfigError("\"auth\": \"oauth\" needs a 'url'")
     _str_list(conf.get("auto_approve"), "auto_approve")
     try:
         float(conf.get("timeout") or 0)
@@ -242,17 +250,21 @@ async def _serve(srv):
         srv.client = None
 
 
-async def _transport(srv, stack):
+async def _transport(srv, stack, auth=None):
     conf = srv.conf
     if conf.get("url"):
         headers = conf.get("headers") or None
+        if auth is None and conf.get("auth") == "oauth":
+            from . import mcp_auth
+            auth = mcp_auth.provider(srv.name, conf)
         if conf.get("type") == "sse":
             from mcp.client.sse import sse_client
-            return sse_client(conf["url"], headers=headers)
+            return sse_client(conf["url"], headers=headers, auth=auth)
         from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
         http = None
-        if headers:
-            http = await stack.enter_async_context(create_mcp_http_client(headers=headers))
+        if headers or auth:
+            http = await stack.enter_async_context(
+                create_mcp_http_client(headers=headers, auth=auth))
         return streamable_http_client(conf["url"], http_client=http)
 
     from mcp import StdioServerParameters

@@ -350,6 +350,37 @@ status of each one. PaulusAI-specific keys:
 | `users`        | Gateway user IDs offered this server (`"*"` = everyone). See below     |
 | `timeout`      | Seconds per tool call                                                   |
 | `disabled`     | `true` to skip the server                                               |
+| `auth`         | `"oauth"` for HTTP servers that sign in with OAuth (see below)          |
+| `redirect_uri` | OAuth redirect URI (default `http://localhost:33418/callback`)         |
+
+#### Servers that sign in with OAuth (Notion)
+
+Some hosted servers, such as Notion's, take no static token: the client signs
+in with OAuth and keeps refreshing the tokens it gets. Mark those with
+`"auth": "oauth"`:
+
+```json
+"notion": {
+  "url": "https://mcp.notion.com/mcp",
+  "auth": "oauth",
+  "auto_approve": ["notion-search", "notion-fetch", "notion-get-*"]
+}
+```
+
+then sign in once, from a terminal on the machine that runs PaulusAI, with the
+same environment (so it writes to the same data dir):
+
+```bash
+paulus-mcp-login notion
+```
+
+It prints a link to open in any browser. After you approve, the browser is
+sent to the redirect URI; the page needn't load. Paste the address it shows
+back into the terminal. PaulusAI registers itself with the server, keeps the
+registration and tokens in `$DP_DATA_DIR/mcp_auth/<server>.json` (mode 0600),
+and refreshes them as they expire. When that's no longer possible (Notion's
+grants end after 180 days, or after 30 days unused), `/mcp` reports the
+server as not signed in: run `paulus-mcp-login` again and restart.
 
 How MCP fits the [security model](#security-model):
 

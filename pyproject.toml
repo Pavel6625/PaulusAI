@@ -55,6 +55,7 @@ dev = [
 [project.scripts]
 paulus = "paulus.cli:main"
 paulus-gateway = "paulus.gateway_main:run"
+paulus-mcp-login = "paulus.mcp_auth:main"
 
 [project.urls]
 Homepage = "https://github.com/Pavel6625/PaulusAI"

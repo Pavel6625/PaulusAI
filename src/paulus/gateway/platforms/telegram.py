@@ -5,9 +5,12 @@ import asyncio
 import base64
 import os
 import time
+from collections.abc import Awaitable, Callable
+from datetime import timedelta
+from typing import TypeVar
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
-from telegram.error import BadRequest
+from telegram.error import BadRequest, RetryAfter
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -37,6 +40,34 @@ _STREAM_EDIT_INTERVAL = 1.2
 # Longest the agent waits for a finished step's message to be committed before
 # running its tools anyway.
 _SEGMENT_COMMIT_TIMEOUT = 30
+# Bound each API request's recovery, leaving headroom under the segment wait.
+# This is a sleep budget, not a deadline for network I/O or a multi-chunk reply.
+_FLOOD_MAX_RETRIES = 3
+_FLOOD_MAX_WAIT = 25.0
+_T = TypeVar("_T")
+
+
+async def _retry_on_flood(call: Callable[..., Awaitable[_T]], *args, **kwargs) -> _T:
+    """Retry only requests Telegram explicitly rejected due to flood control.
+
+    Invoke the callable afresh on every attempt (never re-await a coroutine).
+    Honor the full server delay, including PTB's optional timedelta form; if
+    it exceeds the bounded budget, propagate the latest RetryAfter instead.
+    Other errors and cancellation must reach the caller unchanged.
+    """
+    waited = 0.0
+    for attempt in range(_FLOOD_MAX_RETRIES + 1):
+        try:
+            return await call(*args, **kwargs)
+        except RetryAfter as exc:
+            delay = exc.retry_after
+            seconds = delay.total_seconds() if isinstance(delay, timedelta) else float(delay)
+            seconds = max(0.0, seconds)
+            if attempt == _FLOOD_MAX_RETRIES or waited + seconds > _FLOOD_MAX_WAIT:
+                raise
+            waited += seconds
+            await asyncio.sleep(seconds)
+
 
 
 class TelegramAdapter(BasePlatformAdapter):
@@ -147,7 +178,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         source = self._source_from(update)
         if not self._runner._is_user_authorized(source, self._allowed):
-            await update.message.reply_text("Unauthorized.")
+            await _retry_on_flood(update.message.reply_text, "Unauthorized.")
             return
 
         text = (update.message.text or "").strip()
@@ -182,7 +213,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         source = self._source_from(update)
         if not self._runner._is_user_authorized(source, self._allowed):
-            await msg.reply_text("Unauthorized.")
+            await _retry_on_flood(msg.reply_text, "Unauthorized.")
             return
 
         # Don't let the API reject the request — tell the owner the model is
@@ -191,7 +222,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # can handle the request's images.
         from ... import config, llm
         if not llm.supports_vision(config.chat_model()):
-            await msg.reply_text(
+            await _retry_on_flood(
+                msg.reply_text,
                 "I can't analyse images — the configured model isn't "
                 "vision-capable. Set DP_CORE_MODEL (or DP_ROUTER_MODEL) to a "
                 "model that supports images."
@@ -200,7 +232,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         image = await self._download_image(msg)
         if image is None:
-            await msg.reply_text("Sorry, I couldn't download that image.")
+            await _retry_on_flood(msg.reply_text, "Sorry, I couldn't download that image.")
             return
 
         text = (msg.caption or "").strip() or "(image, no caption)"
@@ -239,12 +271,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
         source = self._source_from(update)
         if not self._runner._is_user_authorized(source, self._allowed):
-            await msg.reply_text("Unauthorized.")
+            await _retry_on_flood(msg.reply_text, "Unauthorized.")
             return
 
         doc = msg.document
         if doc.file_size and doc.file_size > self._doc_max_bytes:
-            await msg.reply_text(
+            await _retry_on_flood(
+                msg.reply_text,
                 f"That document is too large ({doc.file_size} bytes). "
                 f"I can read text files up to {self._doc_max_bytes} bytes."
             )
@@ -255,13 +288,13 @@ class TelegramAdapter(BasePlatformAdapter):
             raw = await tg_file.download_as_bytearray()
         except Exception as exc:
             security.audit("telegram_document_download_error", str(exc))
-            await msg.reply_text("Sorry, I couldn't download that document.")
+            await _retry_on_flood(msg.reply_text, "Sorry, I couldn't download that document.")
             return
 
         try:
             text = bytes(raw).decode("utf-8")
         except UnicodeDecodeError:
-            await msg.reply_text("I can only read text documents.")
+            await _retry_on_flood(msg.reply_text, "I can only read text documents.")
             return
 
         caption = (msg.caption or "").strip()
@@ -278,7 +311,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._runner._is_user_authorized(source, self._allowed):
             return
         self._runner._sessions.reset(source.key())
-        await update.message.reply_text("Session reset.")
+        await _retry_on_flood(update.message.reply_text, "Session reset.")
         security.audit("gateway_session_reset", source.key())
 
     async def _on_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -288,7 +321,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         source = self._source_from(update)
         if not self._runner._is_user_authorized(source, self._allowed):
-            await update.message.reply_text("Unauthorized.")
+            await _retry_on_flood(update.message.reply_text, "Unauthorized.")
             return
         # Strip the leading slash and any "@botname" suffix Telegram appends in
         # group chats, leaving the bare command name; the rest is its argument.
@@ -325,7 +358,8 @@ class TelegramAdapter(BasePlatformAdapter):
         kwargs: dict = {}
         if source.thread_id:
             kwargs["message_thread_id"] = int(source.thread_id)
-        msg = await self._app.bot.send_message(
+        msg = await _retry_on_flood(
+            self._app.bot.send_message,
             chat_id=source.chat_id, text=_clip(prompt), reply_markup=keyboard, **kwargs
         )
         self._note_posted(source.chat_id)
@@ -338,7 +372,8 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         chat_id, message_id = entry
         try:
-            await self._app.bot.edit_message_text(
+            await _retry_on_flood(
+                self._app.bot.edit_message_text,
                 chat_id=chat_id, message_id=message_id,
                 text="⏲️ Approval request timed out — action denied.",
             )
@@ -374,7 +409,7 @@ class TelegramAdapter(BasePlatformAdapter):
             verdict = "✅ Approved." if approved else "🚫 Denied."
         base = query.message.text if query.message else ""
         try:
-            await query.edit_message_text(f"{base}\n\n— {verdict}".strip())
+            await _retry_on_flood(query.edit_message_text, f"{base}\n\n— {verdict}".strip())
         except BadRequest:
             pass
 
@@ -406,7 +441,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._parse_mode and telegramify_markdown is not None:
             try:
                 body = telegramify_markdown.markdownify(text)
-                await self._app.bot.send_message(
+                await _retry_on_flood(
+                    self._app.bot.send_message,
                     chat_id=source.chat_id, text=body, parse_mode=self._parse_mode,
                     reply_markup=keyboard, **kwargs,
                 )
@@ -414,7 +450,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
             except BadRequest as exc:
                 security.audit("telegram_markdown_fallback", str(exc))
-        await self._app.bot.send_message(
+        await _retry_on_flood(
+            self._app.bot.send_message,
             chat_id=source.chat_id, text=text, reply_markup=keyboard, **kwargs
         )
         self._note_posted(source.chat_id)
@@ -427,7 +464,8 @@ class TelegramAdapter(BasePlatformAdapter):
         kwargs: dict = {}
         if source.thread_id:
             kwargs["message_thread_id"] = int(source.thread_id)
-        await self._app.bot.send_document(
+        await _retry_on_flood(
+            self._app.bot.send_document,
             chat_id=source.chat_id,
             document=InputFile(content.encode("utf-8"), filename=filename),
             **kwargs,
@@ -448,13 +486,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._parse_mode and telegramify_markdown is not None:
             try:
                 body = telegramify_markdown.markdownify(chunk)
-                await self._app.bot.send_message(
+                await _retry_on_flood(
+                    self._app.bot.send_message,
                     chat_id=chat_id, text=body, parse_mode=self._parse_mode, **kwargs
                 )
                 return
             except BadRequest as exc:
                 security.audit("telegram_markdown_fallback", str(exc))
-        await self._app.bot.send_message(chat_id=chat_id, text=chunk, **kwargs)
+        await _retry_on_flood(self._app.bot.send_message, chat_id=chat_id, text=chunk, **kwargs)
 
     # ------------------------------------------------------------------
     # Streaming
@@ -477,11 +516,13 @@ class TelegramAdapter(BasePlatformAdapter):
             kwargs: dict = {}
             if source.thread_id:
                 kwargs["message_thread_id"] = int(source.thread_id)
-            return await self._app.bot.send_message(
+            return await _retry_on_flood(
+                self._app.bot.send_message,
                 chat_id=source.chat_id, text=text, **kwargs
             )
         try:
-            await self._app.bot.edit_message_text(
+            await _retry_on_flood(
+                self._app.bot.edit_message_text,
                 chat_id=source.chat_id, message_id=message.message_id, text=text
             )
         except BadRequest as exc:
@@ -508,7 +549,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if self._parse_mode and telegramify_markdown is not None:
             body, parse_mode = telegramify_markdown.markdownify(first), self._parse_mode
         try:
-            await self._app.bot.edit_message_text(
+            await _retry_on_flood(
+                self._app.bot.edit_message_text,
                 chat_id=source.chat_id, message_id=message.message_id,
                 text=body, parse_mode=parse_mode,
             )
@@ -517,7 +559,8 @@ class TelegramAdapter(BasePlatformAdapter):
             if "not modified" not in low:
                 if parse_mode:                      # formatting rejected -> plain
                     security.audit("telegram_markdown_fallback", str(exc))
-                    await self._app.bot.edit_message_text(
+                    await _retry_on_flood(
+                        self._app.bot.edit_message_text,
                         chat_id=source.chat_id, message_id=message.message_id, text=first
                     )
                 else:
@@ -580,6 +623,7 @@ class _StreamSink:
         self._last_edit = 0.0
         self._lock = asyncio.Lock()   # serialises edits; orders interim vs final
         self._done = False
+        self._render_future = None   # coalesce deltas while an API call backs off
 
     # -- called from the worker thread -------------------------------------
     def feed(self, delta: str) -> None:
@@ -589,9 +633,15 @@ class _StreamSink:
         if not revealable(self._buf):
             return
         now = time.monotonic()
+        if self._render_future is not None and not self._render_future.done():
+            # Do not queue stale snapshots during a flood wait. The next frame
+            # (or the segment/final commit) will use the full, current buffer.
+            return
         if self._message is None or now - self._last_edit >= _STREAM_EDIT_INTERVAL:
             self._last_edit = now
-            asyncio.run_coroutine_threadsafe(self._render(self._buf), self._loop)
+            self._render_future = asyncio.run_coroutine_threadsafe(
+                self._render(self._buf), self._loop
+            )
 
     def end_segment(self) -> None:
         """The model finished a step and is about to run tools: commit what it
@@ -603,6 +653,9 @@ class _StreamSink:
         try:
             fut.result(timeout=_SEGMENT_COMMIT_TIMEOUT)
         except Exception as exc:
+            # Leave an in-flight commit serialized by _lock, even on timeout:
+            # cancelling an accepted send could lose its message id and cause
+            # a duplicate. Network I/O / several chunks can outlast the wait.
             security.audit("telegram_segment_error", str(exc))
 
     # -- run on the gateway loop -------------------------------------------
@@ -621,11 +674,13 @@ class _StreamSink:
         async with self._lock:
             if self._done or not self._adapter._app:
                 return
-            if revealable(text):
-                await self._commit(text)
-            else:
-                await self._delete_message()
-            self._message = None          # the next step starts a new message
+            try:
+                if revealable(text):
+                    await self._commit(text)
+                else:
+                    await self._delete_message()
+            finally:
+                self._message = None      # never reuse a failed segment's placeholder
 
     async def finalize(self, reply: str) -> None:
         """Commit the final reply. ``reply`` is the agent's return value (its

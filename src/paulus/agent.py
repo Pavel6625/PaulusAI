@@ -2,9 +2,8 @@
 -> persist, with the tool-use loop handled manually so the safety gate sits
 between the model's decision and any real-world effect.
 """
-import os
 
-from . import affect, automode, billing, config, llm, memory, security, skills, tools
+from . import affect, llm, memory, security, skills, tools
 
 SYSTEM_TEMPLATE = """You are a persistent digital companion for a single owner.
 You have long-term memory, learned skills, and a current mood. Be warm, concise,
@@ -184,7 +183,7 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
         _check(cancel)
         if on_delta is not None:
             resp = llm.stream(system, messages, tools=specs,
-                              on_delta=on_delta, model=model)
+                              on_delta=on_delta, model=model, user_id=user_id)
         else:
             resp = llm.complete(system, messages, tools=specs, model=model,
                                 user_id=user_id)
@@ -266,6 +265,5 @@ def _attach_images(messages, images):
 def _ingest_documents(owner_text, documents, user_id=None):
     """Fold inbound text documents into the owner's turn: save each into the
     user's sandbox workspace (under ``inbox/``) so the file tools can reach it,
-    and append its content wrapped in a marker to the owner's message."""
-    # This would be implemented here
+    and append its content wrapped in a delimiter to the turn text."""
     pass

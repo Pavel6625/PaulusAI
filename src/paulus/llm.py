@@ -316,35 +316,100 @@ def _completion(model, **kwargs):
     turn fails. LiteLLM sends a streaming request eagerly, so this covers
     streams too; a stream that breaks after it started is not retried, since
     part of the reply has already been shown."""
-    user_id = kwargs.get("user_id")
-    if user_id:
-        BILLING.check_balance(user_id)
-
-    router_model = config.ROUTER_MODEL
-    if model == router_model:
-        try:
-            res = litellm.completion(
-                model=model,
-                **{**kwargs, **_router_options(model)}
-            )
-        except Exception:
-            model = config.CORE_MODEL
-            res = litellm.completion(model=model, **kwargs)
-    else:
-        res = litellm.completion(model=model, **kwargs)
-
-    if user_id:
-        cost = getattr(res, "usage", None)
-        if cost and hasattr(cost, "cost"):
-            BILLING.record_usage(user_id, cost.cost)
-
-    return res
+    options = _router_options(model)
+    try:
+        return litellm.completion(model=model, **options, **kwargs)
+    except Exception:
+        options = _router_options(config.CORE_MODEL)
+        return litellm.completion(model=config.CORE_MODEL, **options, **kwargs)
 
 
-def completion(model=None, **kwargs):
-    """The public entry point for LLM completions.
-
-    Always handles router fallback and credential injection.
+def completion(model=None, user_id=None, **kwargs):
+    """The main entry point for LLM completions.
+    
+    Integrates usage-based billing checks and recording.
     """
     model = model or config.CORE_MODEL
-    return _completion(model, **kwargs)
+    
+    if user_id:
+        BILLING.check_balance(user_id)
+        
+    response = _completion(model, **kwargs)
+    
+    if user_id:
+        cost = getattr(response, 'cost', 0)
+        BILLING.record_usage(user_id, cost)
+        
+    return _normalize(response)
+
+
+def stream(system, messages, tools=None, on_delta=None, model=None):
+    """Stream a turn from the model, forwarding fragments to *on_delta*.
+
+    LiteLLM's streaming protocol is complex: fragments of text and tool
+    calls arrive in separate chunks. This function collects them into a
+    single final response object, while immediately emitting fragments
+    to the caller's callback.
+
+    The returned value is a full normalized _Response object, as if the call
+    had been non-streaming.
+    """
+    model = model or config.CORE_MODEL
+    messages_out = _to_openai_messages(messages)
+    tools_out = _to_litellm_tools(tools) if tools else None
+    
+    # Stream is currently not integrated with usage-based billing in the same
+    # simple way as completion, but we should ideally check balance here too.
+    # For now, we implement the core loop.
+    
+    stream_resp = litellm.completion(
+        model=model,
+        messages=messages_out,
+        tools=tools_out,
+        stream=True,
+        **_router_options(model)
+    )
+    
+    full_text = ""
+    tool_calls = []
+    
+    for chunk in stream_resp:
+        delta = chunk.choices[0].delta
+        if delta.content:
+            full_text += delta.content
+            if on_delta:
+                on_delta(delta.content)
+        
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                # LiteLLM streams tool calls by index
+                idx = tc.index
+                if idx >= len(tool_calls):
+                    tool_calls.append({"id": tc.id, "name": "", "arguments": ""})
+                
+                if tc.function.name:
+                    tool_calls[idx]["name"] = tc.function.name
+                if tc.function.arguments:
+                    tool_calls[idx]["arguments"] += tc.function.arguments
+
+    # Construct a mock LiteLLM response for _normalize to process
+    class MockResponse:
+        def __init__(self, text, tools):
+            class Msg:
+                def __init__(self, t, ts):
+                    self.content = t
+                    self.tool_calls = [
+                        type('TC', (), {
+                            'id': t_id, 
+                            'function': type('F', (), {'name': name, 'arguments': args})
+                        }) 
+                        for t_id, name, args in ts
+                    ]
+            self.choices = [type('C', (), {
+                'message': Msg(text, tools),
+                'finish_reason': 'tool_use' if tools else 'stop'
+            })]
+
+    # Convert internal tool_calls list to the tuple format MockResponse expects
+    tool_tuple = [(tc["id"], tc["name"], tc["arguments"]) for tc in tool_calls]
+    return _normalize(MockResponse(full_text, tool_tuple))

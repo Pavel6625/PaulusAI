@@ -40,7 +40,7 @@ _STREAM_EDIT_INTERVAL = 1.2
 # Longest the agent waits for a finished step's message to be committed before
 # running its tools anyway.
 _SEGMENT_COMMIT_TIMEOUT = 30
-# Bound each API request's recovery, including PTB's optional timedelta form.
+# Bound each API request's recovery, leaving headroom under the segment wait.
 # This is a sleep budget, not a deadline for network I/O or a multi-chunk reply.
 _FLOOD_MAX_RETRIES = 3
 _FLOOD_MAX_WAIT = 25.0

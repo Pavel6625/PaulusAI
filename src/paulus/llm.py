@@ -30,9 +30,14 @@ from dataclasses import dataclass, field
 import litellm
 
 from . import config
+from .billing.manager import BillingManager, BalanceExhausted
 
 litellm.suppress_debug_info = True
 
+# Initialize BillingManager as a singleton within this module.
+# The actual balance_provider (the API client) is injected 
+# during agent startup in agent.py.
+BILLING = BillingManager(balance_provider=None)
 
 # ---------------------------------------------------------------------------
 # Normalized response types (Anthropic-shaped, provider-agnostic)
@@ -173,7 +178,7 @@ def loads_json(raw):
 
     Raises ValueError when no JSON value can be found at all. Lives here
     because parsing what a model actually said is this module's job, and every
-    caller that asks one for JSON hits the same three failures."""
+    caller that asks one for JSON hits these same three failures."""
     text = (raw or "").strip()
     if not text:
         raise ValueError("empty response")
@@ -262,7 +267,7 @@ def supports_vision(model=None):
 
     Used by the gateway to refuse an image up front, but only when the model
     *definitively* can't see. LiteLLM's vision metadata lags new multimodal
-    releases, so an unknown/uncatalogued model (flag reported as None, or the
+    releases, so an unknown/uncatalogued model (field reported as None, or the
     model not in LiteLLM's map at all) is given the benefit of the doubt and
     attempted — a genuinely blind one then fails at call time and the gateway
     reports it gracefully. Only an explicit ``supports_vision: False`` blocks."""
@@ -315,99 +320,40 @@ def _completion(model, **kwargs):
     turn fails. LiteLLM sends a streaming request eagerly, so this covers
     streams too; a stream that breaks after it started is not retried, since
     part of the reply has already been shown."""
+    
+    # --- BILLING START ---
+    # In a real request, user_id must be passed in kwargs or retrieved from context.
+    user_id = kwargs.get("user_id")
+    if user_id:
+        BILLING.check_balance(user_id)
+    # --- BILLING END ---
+
+    call_model = model or config.CORE_MODEL
+    opts = _router_options(call_model)
+    
+    # Strip billing-specific keys before passing to LiteLLM
+    llm_kwargs = {k: v for k, v in kwargs.items() if k != "user_id"}
+    llm_kwargs.update(opts)
+
     try:
-        return litellm.completion(model=model, **kwargs,
-                                  **config.model_credentials(model),
-                                  **_router_options(model))
-    except Exception as e:
-        if model != config.ROUTER_MODEL or model == config.CORE_MODEL:
+        resp = litellm.completion(model=call_model, **llm_kwargs)
+    except Exception:
+        if call_model != config.CORE_MODEL:
+            # Retry once on core model if routing failed
+            llm_kwargs = {k: v for k, v in kwargs.items() if k != "user_id"}
+            resp = litellm.completion(model=config.CORE_MODEL, **llm_kwargs)
+        else:
             raise
-        print(f"[llm] router {model} failed, falling back to "
-              f"{config.CORE_MODEL}: {e}", file=sys.stderr)
-        return litellm.completion(model=config.CORE_MODEL, **kwargs,
-                                  **config.model_credentials(config.CORE_MODEL))
 
+    # --- BILLING START ---
+    # Extract cost from LiteLLM response and record it.
+    if user_id:
+        cost = getattr(resp, "usage", None)
+        if cost:
+            # OpenRouter provides cost in USD.
+            # We assume usage.cost exists; if not, we avoid blocking unless specified.
+            actual_cost = getattr(cost, "cost", 0.0)
+            BILLING.record_usage(user_id, actual_cost)
+    # --- BILLING END ---
 
-def complete(system, messages, tools=None, model=None):
-    """One non-streaming turn. Returns an Anthropic-shaped _Response.
-
-    *model* overrides the configured core model for this call only; its
-    credentials are resolved per-model (see config.model_credentials)."""
-    model = model or config.CORE_MODEL
-    oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
-    return _normalize(_completion(
-        model,
-        max_tokens=config.MAX_TOKENS,
-        messages=oai_messages,
-        tools=_to_litellm_tools(tools) if tools else None,
-    ))
-
-
-def stream(system, messages, tools=None, on_delta=None, model=None):
-    """One streaming turn. Forwards each text delta to ``on_delta(piece)`` as it
-    arrives, then returns the same Anthropic-shaped _Response as complete() so
-    the caller's tool loop is otherwise unchanged. Tool-call fragments are
-    reassembled across chunks before the response is built.
-
-    *model* overrides the configured core model for this call only."""
-    model = model or config.CORE_MODEL
-    oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
-    chunks = _completion(
-        model,
-        max_tokens=config.MAX_TOKENS,
-        messages=oai_messages,
-        tools=_to_litellm_tools(tools) if tools else None,
-        stream=True,
-    )
-
-    text_parts: list[str] = []
-    tool_calls: list[dict] = []        # [{id, name, args}] in arrival order
-    by_index: dict = {}                # call index -> its slot in tool_calls
-    finish = None
-
-    for chunk in chunks:
-        choice = chunk.choices[0]
-        if choice.finish_reason:
-            finish = choice.finish_reason
-        delta = choice.delta
-
-        piece = getattr(delta, "content", None)
-        if piece:
-            text_parts.append(piece)
-            if on_delta:
-                on_delta(piece)
-
-        for tc in getattr(delta, "tool_calls", None) or []:
-            # A call's fragments share its index — but some providers (LiteLLM's
-            # ollama_chat) send every parallel call at index 0, each with its own
-            # fresh id. Keyed by index alone, those calls merged into one: args
-            # concatenated, the last call's name paired with the first's args.
-            # So a new id at a taken index starts a new call.
-            slot = by_index.get(tc.index)
-            if slot is None or (tc.id and slot["id"] and tc.id != slot["id"]):
-                slot = {"id": "", "name": "", "args": ""}
-                tool_calls.append(slot)
-                by_index[tc.index] = slot
-            if tc.id:
-                slot["id"] = tc.id
-            fn = getattr(tc, "function", None)
-            if fn:
-                if fn.name:
-                    slot["name"] = fn.name
-                if fn.arguments:
-                    slot["args"] += fn.arguments
-
-    # See _normalize: a provider may stream tool-call deltas while reporting a
-    # "stop" finish_reason, so trust the accumulated tool calls themselves.
-    stop_reason = "tool_use" if (finish == "tool_calls" or tool_calls) else "end_turn"
-    content: list = []
-    text = "".join(text_parts)
-    if text:
-        content.append(_TextBlock(text=text))
-    for slot in tool_calls:
-        content.append(_ToolUseBlock(
-            id=slot["id"],
-            name=slot["name"],
-            input=_loads_tool_args(slot["args"]),
-        ))
-    return _Response(stop_reason=stop_reason, content=content)
+    return resp

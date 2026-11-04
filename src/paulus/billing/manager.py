@@ -1,5 +1,5 @@
 import logging
-from typing import Optional, Protocol
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +14,7 @@ class BalanceExhausted(Exception):
         super().__init__(f"User {user_id} has exhausted their balance (current: {balance:.4f})")
 
 class BillingManager:
-    def __init__(self, balance_provider: Optional[BalanceProvider] = None):
+    def __init__(self, balance_provider: BalanceProvider | None = None):
         self.balance_provider = balance_provider
 
     def check_balance(self, user_id: str):

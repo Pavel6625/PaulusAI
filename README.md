@@ -374,6 +374,13 @@ same environment (so it writes to the same data dir):
 paulus-mcp-login notion
 ```
 
+Under the [systemd unit](deploy/paulus-gateway.service), run it as the service
+user, with both the env file and the `DP_DATA_DIR` the unit sets itself:
+
+```bash
+sudo -u paulus bash -c 'set -a; . /etc/paulus/paulus.env; DP_DATA_DIR=/var/lib/paulus /opt/paulus/venv/bin/paulus-mcp-login notion'
+```
+
 It prints a link to open in any browser. After you approve, the browser is
 sent to the redirect URI; the page needn't load. Paste the address it shows
 back into the terminal. PaulusAI registers itself with the server, keeps the

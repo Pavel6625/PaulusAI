@@ -257,9 +257,12 @@ class GatewayRunner:
             security.audit("notify_skip", f"{user_id}: {error or 'loop not running'}")
             return
         adapter = self._adapters[source.platform]
+        # A task stopped for balance carries its top-up link (billing.metered).
+        text, pay_url = billing.split_pay_link(text)
+        send = (adapter.send_with_link(source, text, billing.TOPUP_BUTTON_LABEL, pay_url)
+                if pay_url else adapter.send(source, text))
         try:
-            asyncio.run_coroutine_threadsafe(
-                adapter.send(source, text), self._loop).result(timeout=60)
+            asyncio.run_coroutine_threadsafe(send, self._loop).result(timeout=60)
             adapter._on_success()
         except Exception as exc:
             security.audit("notify_error", f"{user_id}: {exc}")

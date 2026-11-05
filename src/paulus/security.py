@@ -157,9 +157,11 @@ def _can_ask(user_id):
 
 def _auto_review(tool_name, tool_input, context):
     """The reviewer's Verdict, or None if it failed (the caller then asks)."""
-    from . import automode
+    from . import automode, billing
     try:
         verdict = automode.review(tool_name, tool_input, context)
+    except billing.BalanceExhausted:
+        raise                            # the turn is over; don't ask the owner
     except Exception as exc:
         audit("auto_error", f"{tool_name}: {exc}")
         return None

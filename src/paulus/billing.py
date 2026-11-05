@@ -1,19 +1,40 @@
-"""Usage pay gate: ask an external billing service whether a gateway user may
-receive another LLM turn, and block with a user-facing message when their
-balance is exhausted or the service can't be reached.
+"""Usage-based billing: gate each gateway turn on the user's balance, then
+meter what the turn actually costs, per token, as reported by the provider.
 
-Balance, transactions and per-message pricing are all owned by that external
-service — this module only asks one question ("can this user get a reply
-right now?") via a single check-usage call, and fails CLOSED on any error, so
-a billing outage never turns into free, unmetered usage.
+Two calls to an external billing service, which owns balances, transactions,
+markup and currency:
 
-Entirely optional: leave ``DP_BILLING_API_BASE`` unset and the gate is a
-no-op, so single-owner / CLI setups (``user_id=None``) are unaffected either
-way.
+* **check** (``DP_BILLING_CHECK_PATH``) — before a turn: "may this user get a
+  reply right now?" (gate()).
+* **record** (``DP_BILLING_RECORD_PATH``) — after every LLM call made inside a
+  metered turn: the call's raw USD cost and token counts (record()). The cost
+  is OpenRouter's own ``usage.cost`` when available (llm.py extracts it), so
+  the user pays for the tokens the turn really used, not a flat per-message
+  price. A long tool loop costs more than "hi", as it should.
+
+A turn is metered by running it inside ``with metered(user_id):`` — agent
+respond() and background tasks do; bot-initiated work (idle check-ins, memory
+consolidation) does not, so it is never billed to the user. Subagent threads
+inherit the turn's meter (they run in a copy of its context).
+
+If a record reply says the balance is exhausted (``"allowed": false``), or the
+record call fails, the meter is stopped: the call that was just made is kept
+(its reply already exists), but the *next* LLM call in that turn raises
+BalanceExhausted instead of spending more. A turn can therefore overrun the
+balance by at most the calls in flight; the service settles that (e.g. to 0).
+
+Fails CLOSED throughout, so a billing outage never turns into free, unmetered
+usage. Entirely optional: leave ``DP_BILLING_API_BASE`` unset and every entry
+point is a no-op, so single-owner / CLI setups (``user_id=None``) are
+unaffected either way.
 """
+import contextlib
+import contextvars
 import json
+import threading
 import urllib.error
 import urllib.request
+from dataclasses import dataclass, field
 
 from . import config, security
 
@@ -58,11 +79,12 @@ def _topup_url(user_id) -> str | None:
     return template.replace("{user_id}", str(user_id))
 
 
-def _check_usage(user_id) -> dict:
-    """POST the usage-check request and return the parsed JSON body. Raises
-    BillingError on any transport, HTTP, or parsing failure."""
-    url = config.BILLING_API_BASE.rstrip("/") + config.BILLING_CHECK_PATH
-    body = json.dumps({"user_id": str(user_id)}).encode()
+def _post(path, payload, what) -> dict:
+    """POST *payload* as JSON to the billing service and return the parsed JSON
+    body (``{}`` for an empty 2xx body). Raises BillingError on any transport,
+    HTTP, or parsing failure. *what* names the call in error messages."""
+    url = config.BILLING_API_BASE.rstrip("/") + path
+    body = json.dumps(payload).encode()
     headers = {"Content-Type": "application/json"}
     if config.BILLING_API_KEY:
         headers["Authorization"] = f"Bearer {config.BILLING_API_KEY}"
@@ -78,18 +100,39 @@ def _check_usage(user_id) -> dict:
             data = json.loads(exc.read().decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
             data = None
-        if data is not None and "allowed" in data:
+        if isinstance(data, dict) and "allowed" in data:
             return data
-        raise BillingError(f"usage check HTTP {exc.code}: {exc.reason}") from exc
+        raise BillingError(f"{what} HTTP {exc.code}: {exc.reason}") from exc
     except (urllib.error.URLError, OSError) as exc:
-        raise BillingError(f"usage check request failed: {exc}") from exc
+        raise BillingError(f"{what} request failed: {exc}") from exc
+    if not raw.strip():
+        return {}
     try:
         data = json.loads(raw.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise BillingError(f"usage check returned invalid JSON: {exc}") from exc
+        raise BillingError(f"{what} returned invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise BillingError(f"{what} returned a non-object: {data!r}")
+    return data
+
+
+def _check_usage(user_id) -> dict:
+    """POST the usage-check request and return the parsed JSON body. Raises
+    BillingError on any transport, HTTP, or parsing failure."""
+    data = _post(config.BILLING_CHECK_PATH, {"user_id": str(user_id)}, "usage check")
     if "allowed" not in data:
         raise BillingError(f"usage check response missing 'allowed': {data!r}")
     return data
+
+
+def _block_message(user_id, data) -> str:
+    """The insufficient-balance message for a service reply, with its top-up
+    link embedded (see split_pay_link) when one is known."""
+    message = data.get("message") or INSUFFICIENT_BALANCE_MESSAGE
+    url = data.get("payment_url") or _topup_url(user_id)
+    if url:
+        message = f"{message}{_PAY_LINK_MARKER}{url}"
+    return message
 
 
 def gate(user_id) -> tuple[bool, str | None]:
@@ -114,8 +157,125 @@ def gate(user_id) -> tuple[bool, str | None]:
         return True, None
 
     security.audit("billing_blocked", f"{user_id} balance={data.get('balance')}")
-    message = data.get("message") or INSUFFICIENT_BALANCE_MESSAGE
-    url = data.get("payment_url") or _topup_url(user_id)
-    if url:
-        message = f"{message}{_PAY_LINK_MARKER}{url}"
-    return False, message
+    return False, _block_message(user_id, data)
+
+
+# ---------------------------------------------------------------------------
+# Per-token metering
+# ---------------------------------------------------------------------------
+
+class BalanceExhausted(Exception):
+    """Raised (by llm.py, via ensure_can_spend) before an LLM call in a metered
+    turn whose meter has been stopped. ``block_message`` is what gate() would
+    return — the pay link embedded — for callers that deliver it as the reply;
+    ``str(exc)`` is the clean, user-visible text."""
+
+    def __init__(self, block_message):
+        self.block_message = block_message
+        super().__init__(split_pay_link(block_message)[0])
+
+
+@dataclass
+class Meter:
+    """Running totals for one metered turn or background task. Shared by the
+    subagent threads the turn fans out to, hence the lock."""
+    user_id: str
+    kind: str = "turn"
+    calls: int = 0
+    cost_usd: float = 0.0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    block_message: str | None = None     # set once the meter is stopped
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+
+_meter: contextvars.ContextVar[Meter | None] = contextvars.ContextVar(
+    "paulus_billing_meter", default=None)
+
+
+@contextlib.contextmanager
+def metered(user_id, kind="turn"):
+    """Meter every LLM call made in this block (and in subagent threads it
+    spawns) against *user_id*. Yields the Meter, or None — a no-op — when
+    billing is off or *user_id* is None. *kind* ("turn", "task") is passed to
+    the billing service with each record."""
+    if not enabled() or user_id is None:
+        yield None
+        return
+    meter = Meter(user_id=str(user_id), kind=kind)
+    token = _meter.set(meter)
+    try:
+        yield meter
+    finally:
+        _meter.reset(token)
+        if meter.calls:
+            security.audit("billing_usage",
+                           f"{meter.user_id} {kind} calls={meter.calls} "
+                           f"tokens={meter.prompt_tokens}+{meter.completion_tokens} "
+                           f"cost_usd={meter.cost_usd:.6f}")
+
+
+def metering() -> bool:
+    """Whether the current context is inside a metered turn — llm.py asks
+    before doing any work to extract usage."""
+    return _meter.get() is not None
+
+
+def ensure_can_spend() -> None:
+    """Raise BalanceExhausted if the current turn's meter has been stopped.
+    Called by llm.py before every model call; a no-op outside a metered turn."""
+    meter = _meter.get()
+    if meter is not None and meter.block_message is not None:
+        raise BalanceExhausted(meter.block_message)
+
+
+def _stop(meter, message):
+    with meter._lock:
+        if meter.block_message is None:
+            meter.block_message = message
+
+
+def record(*, cost_usd, cost_source, prompt_tokens, completion_tokens,
+           model, request_id=None) -> None:
+    """Report one LLM call's usage to the billing service, if the current
+    context is metered. Never raises: the call has already happened.
+
+    *cost_usd* is the raw provider cost (OpenRouter's ``usage.cost``) before
+    any markup — that's the service's job. *cost_source* says where it came
+    from: ``"provider"`` (reported by the provider), ``"estimate"`` (LiteLLM's
+    price map applied to the token counts) or ``"none"`` (unpriced; only the
+    token counts are sent). *request_id* is the provider's generation id,
+    usable by the service as an idempotency key."""
+    meter = _meter.get()
+    if meter is None:
+        return
+    with meter._lock:
+        meter.calls += 1
+        meter.cost_usd += cost_usd
+        meter.prompt_tokens += prompt_tokens
+        meter.completion_tokens += completion_tokens
+    payload = {
+        "user_id": meter.user_id,
+        "kind": meter.kind,
+        "model": model,
+        "request_id": request_id,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cost_usd": cost_usd,
+        "cost_source": cost_source,
+    }
+    if cost_source == "none":
+        security.audit("billing_unpriced", f"{meter.user_id} {model} "
+                       f"tokens={prompt_tokens}+{completion_tokens}")
+    try:
+        data = _post(config.BILLING_RECORD_PATH, payload, "usage record")
+    except BillingError as exc:
+        # Unrecorded usage is free usage: keep the full payload in the audit
+        # log for reconciliation, and spend nothing more this turn.
+        security.audit("billing_record_error", f"{exc} :: {json.dumps(payload)}")
+        _stop(meter, SERVICE_UNAVAILABLE_MESSAGE)
+        return
+    if data.get("allowed") is False:
+        security.audit("billing_exhausted",
+                       f"{meter.user_id} balance={data.get('balance')}")
+        _stop(meter, _block_message(meter.user_id, data))

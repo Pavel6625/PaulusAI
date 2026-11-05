@@ -149,8 +149,9 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `TELEGRAM_BOT_USERNAME` | (unset = asked from Telegram)  | The bot's @username, for the web UI's login widget              |
 | `WEB_SESSION_DAYS`      | `30`                           | How long a web sign-in lasts                                    |
 | `WEB_SESSION_SECRET`    | (derived from bot token)       | Key that signs web session cookies                             |
-| `DP_BILLING_API_BASE`   | (unset = disabled)             | Base URL of an external billing service; enables the usage pay gate |
+| `DP_BILLING_API_BASE`   | (unset = disabled)             | Base URL of an external billing service; enables per-token billing |
 | `DP_BILLING_CHECK_PATH` | `/usage/check`                 | Path appended to `DP_BILLING_API_BASE` for the check-usage call |
+| `DP_BILLING_RECORD_PATH`| `/usage/record`                | Path for the per-LLM-call usage report (tokens + raw USD cost)  |
 | `DP_BILLING_API_KEY`    | —                              | Sent as `Authorization: Bearer <key>` to the billing service    |
 | `DP_BILLING_TIMEOUT`    | `10`                           | Seconds to wait for the billing service before failing closed   |
 | `DP_BILLING_TOPUP_URL`  | (unset)                        | Fallback top-up link (button on Telegram) if the check response has no `payment_url` |
@@ -309,8 +310,9 @@ wrote), and their approval prompts say who is asking (`From: background task
 - **Tasks live in memory.** A restart drops running ones. Each start and finish
   is in `audit.log` (`task_start`, `task_done`, ...).
 - **Billing:** `/bg` is pay-gated like a message. A task started by the agent
-  belongs to the turn that started it, so it isn't gated again. Watch
-  `DP_TASK_MAX_STEPS` if usage is metered per message.
+  belongs to the turn that started it, so it isn't gated again. Either way,
+  every token a task spends is billed, and a task whose user runs out of
+  balance stops at its next model call (`💳 ... stopped`, with a top-up link).
 
 ### MCP servers
 
@@ -559,13 +561,30 @@ The trust boundaries are deliberately small and explicit (see [src/paulus/securi
 4. **Execution is sandboxed.** File ops are confined to `workspace/`; commands
    run via the configured backend — use `docker` (network-disabled) or `ssh`
    when handling anything untrusted.
-5. **Usage is pay-gated (optional).** When `DP_BILLING_API_BASE` is set, every
-   gateway turn is checked against an external billing service first — balance,
-   transactions and per-message pricing all live there. A zero balance halts
-   the turn before it reaches the LLM and replies with a top-up link (a real
-   button on Telegram, via the response's `payment_url` or `DP_BILLING_TOPUP_URL`);
-   a billing-service outage fails **closed** (blocks) rather than granting free
-   usage. See [src/paulus/billing.py](src/paulus/billing.py).
+5. **Usage is billed per token (optional).** When `DP_BILLING_API_BASE` is set,
+   every gateway turn is checked against an external billing service first —
+   balances, transactions, markup and currency all live there. A zero balance
+   halts the turn before it reaches the LLM and replies with a top-up link (a
+   real button on Telegram, via the response's `payment_url` or
+   `DP_BILLING_TOPUP_URL`). Each LLM call the turn then makes (subagents,
+   background tasks and the auto-mode reviewer included) is reported to
+   `DP_BILLING_RECORD_PATH`:
+
+   ```json
+   {"user_id": "123", "kind": "turn", "model": "openrouter/typesafe/jev-router",
+    "request_id": "gen-...", "prompt_tokens": 1834, "completion_tokens": 212,
+    "cost_usd": 0.00731, "cost_source": "provider"}
+   ```
+
+   `cost_usd` is the raw cost OpenRouter reports (`usage.cost`), before any
+   markup; for other providers it is LiteLLM's price-map estimate
+   (`"estimate"`), or `0` with only tokens (`"none"`) for an unpriced model.
+   Reply `{"allowed": false, ...}` (any status, e.g. 402) once the balance is
+   spent, and the turn stops before its next model call with the top-up
+   message. Idle check-ins and memory consolidation are never billed. A
+   billing-service outage fails **closed** (blocks; an unrecorded call is kept
+   in `audit.log` as `billing_record_error` for reconciliation) rather than
+   granting free usage. See [src/paulus/billing.py](src/paulus/billing.py).
 
 ---
 
@@ -601,7 +620,7 @@ src/paulus/
 ├── subagents.py      # parallel researcher/worker subagents (`delegate`)
 ├── mcp_client.py     # MCP client: external servers' tools, behind the gate
 ├── tasks.py          # background tasks (`start_task`, /bg, /tasks, /cancel)
-├── billing.py        # usage pay gate (external balance/pricing service)
+├── billing.py        # per-token billing: pay gate + usage metering (external service)
 ├── sandbox.py        # local / docker / ssh execution backends
 ├── config.py         # env-driven configuration + data-dir resolution
 └── gateway/          # Hermes-style messaging gateway (Telegram + web UI adapters)

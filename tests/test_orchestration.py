@@ -383,6 +383,15 @@ def test_notify_user_sends_to_their_last_chat():
     assert adapter.sent == [("chat9", "task done")]
 
 
+def test_notify_user_renders_a_pay_link_as_a_link_not_the_marker():
+    from paulus import billing
+    runner, adapter = _gateway()
+    text = f"task stopped{billing._PAY_LINK_MARKER}https://pay.example.com/s"
+    _off_loop(runner, lambda: runner.notify_user("u1", text))
+    # _Adapter has no button, so the base send_with_link appends the URL.
+    assert adapter.sent == [("chat9", "task stopped\n\nhttps://pay.example.com/s")]
+
+
 def test_task_commands_in_chat(monkeypatch):
     monkeypatch.setattr(tasks, "_tasks", {})
     runner, _ = _gateway()

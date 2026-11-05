@@ -77,7 +77,9 @@ def test_record_posts_tokens_and_raw_cost(service):
     assert meter.calls == 2
     assert meter.cost_usd == pytest.approx(0.03)
     assert (meter.prompt_tokens, meter.completion_tokens) == (150, 25)
-    assert "billing_usage" in config.AUDIT_LOG.read_text(encoding="utf-8")
+    audit = config.AUDIT_LOG.read_text(encoding="utf-8")
+    assert "billing_usage" in audit
+    assert 'sources={"provider": 2}' in audit
     assert not billing.metering()          # the meter is gone after the block
 
 
@@ -199,6 +201,69 @@ def test_complete_records_openrouter_usage_cost(service, monkeypatch):
 def test_cost_falls_back_to_litellms_hidden_openrouter_cost(service, monkeypatch):
     usage = SimpleNamespace(prompt_tokens=10, completion_tokens=2)
     hidden = {"additional_headers": {"llm_provider-x-litellm-response-cost": 0.5}}
+    _litellm(monkeypatch, _reply(usage, hidden))
+    with billing.metered("u1"):
+        _ask()
+    assert service.records[0]["cost_usd"] == 0.5
+
+
+def test_missing_openrouter_cost_uses_generation_endpoint(service, monkeypatch):
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "openrouter-secret")
+    usage = SimpleNamespace(prompt_tokens=116756, completion_tokens=1246, cost=0.0)
+    _litellm(monkeypatch, _reply(usage))
+    seen = {}
+
+    class Response:
+        def read(self):
+            return b'{"data":{"total_cost":0.01002578}}'
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["authorization"] = req.get_header("Authorization")
+        seen["timeout"] = timeout
+        return Response()
+
+    monkeypatch.setattr("paulus.llm.urllib.request.urlopen", fake_urlopen)
+    with billing.metered("u1"):
+        _ask()
+
+    assert seen == {
+        "url": "https://openrouter.ai/api/v1/generation?id=gen-abc",
+        "authorization": "Bearer openrouter-secret",
+        "timeout": 3,
+    }
+    rec = service.records[0]
+    assert rec["cost_usd"] == pytest.approx(0.01002578)
+    assert rec["cost_source"] == "provider"
+
+
+def test_hidden_openrouter_cost_wins_over_normalized_zero(service, monkeypatch):
+    usage = SimpleNamespace(prompt_tokens=116756, completion_tokens=1246, cost=0.0)
+    hidden = {"additional_headers": {
+        "llm_provider-x-litellm-response-cost": 0.01002578,
+    }}
+    _litellm(monkeypatch, _reply(usage, hidden))
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "")
+    monkeypatch.setattr("paulus.llm.urllib.request.urlopen",
+                        lambda *a, **k: pytest.fail("generation lookup was unnecessary"))
+
+    with billing.metered("u1"):
+        _ask()
+
+    rec = service.records[0]
+    assert rec["cost_usd"] == pytest.approx(0.01002578)
+    assert rec["cost_source"] == "provider"
+
+
+def test_hidden_response_cost_can_be_an_attribute_object(service, monkeypatch):
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=2)
+    hidden = SimpleNamespace(response_cost=0.5)
     _litellm(monkeypatch, _reply(usage, hidden))
     with billing.metered("u1"):
         _ask()

@@ -30,6 +30,9 @@ billing.BalanceExhausted once the turn's meter has been stopped.
 import json
 import re
 import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 
 import litellm
@@ -375,15 +378,50 @@ def _provider_cost(usage, hidden_params=None):
     _hidden_params). With BYOK, ``cost`` is only OpenRouter's fee and the
     provider's charge is ``cost_details.upstream_inference_cost``, so the two
     are added."""
-    cost = _as_cost(_field(usage, "cost"))
+    headers = _field(hidden_params, "additional_headers") or {}
+    candidates = (
+        _as_cost(_field(headers, _HIDDEN_COST_KEY)),
+        _as_cost(_field(usage, "cost")),
+        _as_cost(_field(hidden_params, "response_cost")),
+    )
+    # LiteLLM may initialize Usage.cost to 0 even when OpenRouter's raw cost
+    # was retained separately in hidden params. Prefer any non-zero reported
+    # value before accepting an explicit zero and consulting /generation.
+    cost = next((value for value in candidates if value not in (None, 0.0)), None)
     if cost is None:
-        headers = (hidden_params or {}).get("additional_headers") or {}
-        cost = _as_cost(headers.get(_HIDDEN_COST_KEY))
+        cost = next((value for value in candidates if value is not None), None)
     if cost is not None and _field(usage, "is_byok"):
         upstream = _as_cost(_field(_field(usage, "cost_details"),
                                    "upstream_inference_cost"))
         cost += upstream or 0.0
     return cost
+
+
+def _openrouter_generation_cost(request_id):
+    """Fetch OpenRouter's authoritative total_cost for a completed generation.
+
+    LiteLLM versions/providers may preserve token usage but drop OpenRouter's
+    ``usage.cost`` from the normalized response. The generation API is the
+    reliable fallback; it requires the OpenRouter API key and a ``gen-`` id.
+    A missing key, incomplete generation record, or network error returns None
+    so billing can still report token counts and mark the call unpriced.
+    """
+    api_key = config.OPENROUTER_API_KEY
+    if not api_key or not request_id or not request_id.startswith("gen-"):
+        return None
+    query = urllib.parse.urlencode({"id": request_id})
+    req = urllib.request.Request(
+        f"https://openrouter.ai/api/v1/generation?{query}",
+        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=3) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        print(f"[llm] OpenRouter cost lookup failed for {request_id}: {exc}",
+              file=sys.stderr)
+        return None
+    return _as_cost(_field(_field(data, "data"), "total_cost"))
 
 
 def _estimate_cost(model, prompt_tokens, completion_tokens):
@@ -406,6 +444,11 @@ def _report_usage(usage, model, request_id=None, hidden_params=None):
     prompt = int(_field(usage, "prompt_tokens") or 0)
     completion = int(_field(usage, "completion_tokens") or 0)
     cost, source = _provider_cost(usage, hidden_params), "provider"
+    if model.startswith("openrouter/") and (cost is None or cost == 0) \
+            and (prompt or completion):
+        generation_cost = _openrouter_generation_cost(request_id)
+        if generation_cost is not None:
+            cost, source = generation_cost, "provider"
     if cost is None:
         cost, source = _estimate_cost(model, prompt, completion), "estimate"
     if cost is None:

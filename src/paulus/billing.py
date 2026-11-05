@@ -185,6 +185,7 @@ class Meter:
     cost_usd: float = 0.0
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cost_sources: dict = field(default_factory=dict)
     block_message: str | None = None     # set once the meter is stopped
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -212,7 +213,8 @@ def metered(user_id, kind="turn"):
             security.audit("billing_usage",
                            f"{meter.user_id} {kind} calls={meter.calls} "
                            f"tokens={meter.prompt_tokens}+{meter.completion_tokens} "
-                           f"cost_usd={meter.cost_usd:.6f}")
+                           f"cost_usd={meter.cost_usd:.6f} "
+                           f"sources={json.dumps(meter.cost_sources, sort_keys=True)}")
 
 
 def metering() -> bool:
@@ -254,6 +256,7 @@ def record(*, cost_usd, cost_source, prompt_tokens, completion_tokens,
         meter.cost_usd += cost_usd
         meter.prompt_tokens += prompt_tokens
         meter.completion_tokens += completion_tokens
+        meter.cost_sources[cost_source] = meter.cost_sources.get(cost_source, 0) + 1
     payload = {
         "user_id": meter.user_id,
         "kind": meter.kind,

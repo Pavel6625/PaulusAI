@@ -1,4 +1,4 @@
-"""Per-token billing: billing.metered / record / ensure_can_spend, llm.py's
+﻿"""Per-token billing: billing.metered / record / ensure_can_spend, llm.py's
 usage and cost extraction (OpenRouter's usage.cost), and the wiring that
 meters a turn (agent.respond) or a background task (tasks._run) but never an
 idle check-in."""
@@ -180,42 +180,32 @@ def _litellm(monkeypatch, *responses):
     return calls
 
 
-def _ask():
-    return llm.complete("sys", [{"role": "user", "content": "hi"}],
-                        model="openrouter/openai/gpt-4o")
+OPENROUTER = "openrouter/openai/gpt-4o"
+DIRECT = "openai/gpt-4o"
 
 
-def test_complete_records_openrouter_usage_cost(service, monkeypatch):
-    usage = SimpleNamespace(prompt_tokens=1200, completion_tokens=80, cost=0.0042)
-    _litellm(monkeypatch, _reply(usage))
-    with billing.metered("u1"):
-        assert _ask().content[0].text == "ok"
-
-    rec = service.records[0]
-    assert (rec["cost_usd"], rec["cost_source"]) == (0.0042, "provider")
-    assert (rec["prompt_tokens"], rec["completion_tokens"]) == (1200, 80)
-    assert rec["model"] == "openrouter/openai/gpt-4o"
-    assert rec["request_id"] == "gen-abc"
+def _ask(model=OPENROUTER):
+    return llm.complete("sys", [{"role": "user", "content": "hi"}], model=model)
 
 
-def test_cost_falls_back_to_litellms_hidden_openrouter_cost(service, monkeypatch):
-    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=2)
-    hidden = {"additional_headers": {"llm_provider-x-litellm-response-cost": 0.5}}
-    _litellm(monkeypatch, _reply(usage, hidden))
-    with billing.metered("u1"):
-        _ask()
-    assert service.records[0]["cost_usd"] == 0.5
+@pytest.fixture
+def generation(monkeypatch):
+    """A fake OpenRouter /generation endpoint. ``generation.bodies`` is what
+    each successive request returns: a dict (the JSON ``data``) or an int
+    (that HTTP error). Requests are recorded in ``generation.requests``."""
+    import io
+    import urllib.error
 
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setattr(llm, "_GENERATION_RETRY_DELAYS", (0, 0, 0))
+    state = SimpleNamespace(bodies=[{"usage": 0.012722425}], requests=[])
 
-def test_missing_openrouter_cost_uses_generation_endpoint(service, monkeypatch):
-    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "openrouter-secret")
-    usage = SimpleNamespace(prompt_tokens=116756, completion_tokens=1246, cost=0.0)
-    _litellm(monkeypatch, _reply(usage))
-    seen = {}
+    class Resp:
+        def __init__(self, body):
+            self._body = json.dumps({"data": body}).encode()
 
-    class Response:
         def read(self):
-            return b'{"data":{"total_cost":0.01002578}}'
+            return self._body
 
         def __enter__(self):
             return self
@@ -224,49 +214,116 @@ def test_missing_openrouter_cost_uses_generation_endpoint(service, monkeypatch):
             return False
 
     def fake_urlopen(req, timeout=None):
-        seen["url"] = req.full_url
-        seen["authorization"] = req.get_header("Authorization")
-        seen["timeout"] = timeout
-        return Response()
+        state.requests.append((req.full_url, req.get_header("Authorization")))
+        body = state.bodies.pop(0) if len(state.bodies) > 1 else state.bodies[0]
+        if isinstance(body, int):
+            raise urllib.error.HTTPError(req.full_url, body, "err", None, io.BytesIO(b""))
+        return Resp(body)
 
     monkeypatch.setattr("paulus.llm.urllib.request.urlopen", fake_urlopen)
+    return state
+
+
+def _billed(service):
+    billing.flush(5)
+    return service.records
+
+
+def test_openrouter_call_is_billed_from_its_generation_data(service, generation, monkeypatch):
+    """The reported bug: the response carried no cost, so the call was billed
+    $0. An OpenRouter call is now priced from OpenRouter's generation record
+    (``usage`` — what its dashboard shows), whatever the response said."""
+    _litellm(monkeypatch, _reply(SimpleNamespace(prompt_tokens=100432,
+                                                 completion_tokens=337, cost=0.0)))
+    with billing.metered("u1"):
+        assert _ask().content[0].text == "ok"
+
+    rec = _billed(service)[0]
+    assert (rec["cost_usd"], rec["cost_source"]) == (0.012722425, "provider")
+    assert (rec["prompt_tokens"], rec["completion_tokens"]) == (100432, 337)
+    assert (rec["model"], rec["request_id"]) == (OPENROUTER, "gen-abc")
+    assert generation.requests == [
+        ("https://openrouter.ai/api/v1/generation?id=gen-abc", "Bearer or-key")]
+    assert 'cost_usd=0.012722 sources={"provider": 1}' in \
+        config.AUDIT_LOG.read_text(encoding="utf-8")
+
+
+def test_generation_data_is_retried_until_openrouter_has_it(service, generation, monkeypatch):
+    generation.bodies = [404, 404, {"total_cost": 0.5}]
+    _litellm(monkeypatch, _reply(SimpleNamespace(prompt_tokens=1, completion_tokens=1)))
     with billing.metered("u1"):
         _ask()
-
-    assert seen == {
-        "url": "https://openrouter.ai/api/v1/generation?id=gen-abc",
-        "authorization": "Bearer openrouter-secret",
-        "timeout": 3,
-    }
-    rec = service.records[0]
-    assert rec["cost_usd"] == pytest.approx(0.01002578)
-    assert rec["cost_source"] == "provider"
+    assert _billed(service)[0]["cost_usd"] == 0.5
+    assert len(generation.requests) == 3
 
 
-def test_hidden_openrouter_cost_wins_over_normalized_zero(service, monkeypatch):
-    usage = SimpleNamespace(prompt_tokens=116756, completion_tokens=1246, cost=0.0)
-    hidden = {"additional_headers": {
-        "llm_provider-x-litellm-response-cost": 0.01002578,
-    }}
-    _litellm(monkeypatch, _reply(usage, hidden))
-    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "")
+def test_unavailable_generation_data_is_audited_and_billed_unpriced(
+        service, generation, monkeypatch):
+    generation.bodies = [404]
+    _litellm(monkeypatch, _reply(SimpleNamespace(prompt_tokens=7, completion_tokens=3)))
+    with billing.metered("u1"):
+        _ask()
+    rec = _billed(service)[0]
+    assert (rec["cost_usd"], rec["cost_source"]) == (0.0, "none")
+    assert (rec["prompt_tokens"], rec["completion_tokens"]) == (7, 3)
+    log = config.AUDIT_LOG.read_text(encoding="utf-8")
+    assert "billing_cost_error" in log and "HTTP 404" in log
+
+
+def test_core_model_pointed_at_openrouter_uses_its_key(service, generation, monkeypatch):
+    monkeypatch.setattr(config, "CORE_MODEL", "openai/typesafe/jev-router")
+    monkeypatch.setattr(config, "API_BASE", "https://openrouter.ai/api/v1")
+    monkeypatch.setattr(config, "API_KEY", "core-or-key")
+    _litellm(monkeypatch, _reply(SimpleNamespace(prompt_tokens=1, completion_tokens=1)))
+    with billing.metered("u1"):
+        _ask(config.CORE_MODEL)
+    assert _billed(service)[0]["cost_usd"] == 0.012722425
+    assert generation.requests[0][1] == "Bearer core-or-key"
+
+
+def test_openrouter_cost_lookup_does_not_hold_the_reply(service, monkeypatch):
+    release = threading.Event()
+
+    def slow(request_id, api_key):
+        assert release.wait(5)
+        return 0.25
+
+    monkeypatch.setattr(llm, "_openrouter_generation_cost", slow)
+    _litellm(monkeypatch, _reply(SimpleNamespace(prompt_tokens=1, completion_tokens=1)))
+    with billing.metered("u1") as meter:
+        _ask()                             # returns while the lookup waits
+    assert service.records == [] and meter.pending == 1
+    release.set()
+    assert _billed(service)[0]["cost_usd"] == 0.25
+
+
+def test_exhausted_reply_to_a_deferred_record_stops_the_turn(service, generation, monkeypatch):
+    service.reply = {"allowed": False, "balance": 0}
+    _litellm(monkeypatch, _reply(SimpleNamespace(prompt_tokens=1, completion_tokens=1)))
+    with billing.metered("u1"):
+        _ask()
+        billing.flush(5)
+        with pytest.raises(billing.BalanceExhausted):
+            billing.ensure_can_spend()
+
+
+def test_direct_call_records_the_cost_in_its_response(service, monkeypatch):
+    usage = SimpleNamespace(prompt_tokens=1200, completion_tokens=80, cost=0.0042)
+    _litellm(monkeypatch, _reply(usage))
     monkeypatch.setattr("paulus.llm.urllib.request.urlopen",
-                        lambda *a, **k: pytest.fail("generation lookup was unnecessary"))
-
+                        lambda *a, **k: pytest.fail("looked up OpenRouter"))
     with billing.metered("u1"):
-        _ask()
-
+        _ask(DIRECT)
     rec = service.records[0]
-    assert rec["cost_usd"] == pytest.approx(0.01002578)
-    assert rec["cost_source"] == "provider"
+    assert (rec["cost_usd"], rec["cost_source"]) == (0.0042, "provider")
 
 
-def test_hidden_response_cost_can_be_an_attribute_object(service, monkeypatch):
-    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=2)
-    hidden = SimpleNamespace(response_cost=0.5)
+def test_direct_call_reads_litellms_hidden_cost(service, monkeypatch):
+    usage = SimpleNamespace(prompt_tokens=10, completion_tokens=2, cost=0.0)
+    hidden = {"additional_headers": {"llm_provider-x-litellm-response-cost": 0.5}}
     _litellm(monkeypatch, _reply(usage, hidden))
     with billing.metered("u1"):
-        _ask()
+        _ask(DIRECT)
     assert service.records[0]["cost_usd"] == 0.5
 
 
@@ -275,7 +332,7 @@ def test_byok_adds_the_upstream_provider_cost(service, monkeypatch):
              "is_byok": True, "cost_details": {"upstream_inference_cost": 0.02}}
     _litellm(monkeypatch, _reply(usage))
     with billing.metered("u1"):
-        _ask()
+        _ask(DIRECT)
     assert service.records[0]["cost_usd"] == pytest.approx(0.021)
 
 
@@ -285,7 +342,7 @@ def test_cost_is_estimated_from_tokens_without_a_provider_cost(service, monkeypa
                         lambda model, prompt_tokens, completion_tokens:
                         (prompt_tokens * 1e-6, completion_tokens * 2e-6))
     with billing.metered("u1"):
-        _ask()
+        _ask(DIRECT)
     rec = service.records[0]
     assert rec["cost_source"] == "estimate"
     assert rec["cost_usd"] == pytest.approx(0.0012)
@@ -299,7 +356,7 @@ def test_unpriceable_call_still_reports_its_tokens(service, monkeypatch):
 
     monkeypatch.setattr(llm.litellm, "cost_per_token", unknown)
     with billing.metered("u1"):
-        _ask()
+        _ask(DIRECT)
     rec = service.records[0]
     assert (rec["cost_usd"], rec["cost_source"]) == (0.0, "none")
     assert (rec["prompt_tokens"], rec["completion_tokens"]) == (7, 3)
@@ -308,10 +365,9 @@ def test_unpriceable_call_still_reports_its_tokens(service, monkeypatch):
 def test_router_fallback_is_billed_as_the_model_that_answered(service, monkeypatch):
     monkeypatch.setattr(config, "ROUTER_MODEL", "openrouter/typesafe/jev-router")
     monkeypatch.setattr(config, "CORE_MODEL", "anthropic/claude-sonnet-4-6")
-    calls = []
+    monkeypatch.setattr(config, "API_BASE", None)
 
     def fake_completion(**kwargs):
-        calls.append(kwargs["model"])
         if kwargs["model"] == config.ROUTER_MODEL:
             raise RuntimeError("503")
         return _reply(SimpleNamespace(prompt_tokens=1, completion_tokens=1, cost=0.1))
@@ -333,8 +389,11 @@ def test_stopped_meter_refuses_the_call_before_sending_it(service, monkeypatch):
 def test_unmetered_call_does_no_billing_work(monkeypatch):
     monkeypatch.setattr(config, "BILLING_API_BASE", BASE)
     monkeypatch.setattr(billing, "_post", lambda *a: pytest.fail("posted"))
+    monkeypatch.setattr("paulus.llm.urllib.request.urlopen",
+                        lambda *a, **k: pytest.fail("looked up OpenRouter"))
     _litellm(monkeypatch, _reply(SimpleNamespace(prompt_tokens=1, completion_tokens=1, cost=1)))
     _ask()                                 # e.g. memory consolidation
+    billing.flush(5)
 
 
 def _chunk(text=None, finish=None, usage=None, choices=True):
@@ -345,20 +404,22 @@ def _chunk(text=None, finish=None, usage=None, choices=True):
         if choices else [])
 
 
-def test_stream_asks_for_usage_and_bills_the_final_chunk(service, monkeypatch):
-    usage = SimpleNamespace(prompt_tokens=900, completion_tokens=40, cost=0.003)
+def test_stream_bills_its_generation_by_the_streamed_id(service, generation, monkeypatch):
+    usage = SimpleNamespace(prompt_tokens=900, completion_tokens=40)
     calls = _litellm(monkeypatch, [_chunk("hel"), _chunk("lo", finish="stop"),
                                    _chunk(usage=usage, choices=False)])
     pieces = []
     with billing.metered("u1"):
         resp = llm.stream("sys", [{"role": "user", "content": "hi"}],
-                          on_delta=pieces.append, model="openrouter/openai/gpt-4o")
+                          on_delta=pieces.append, model=OPENROUTER)
 
     assert calls[0]["stream_options"] == {"include_usage": True}
     assert resp.content[0].text == "hello" and pieces == ["hel", "lo"]
-    rec = service.records[0]
+    rec = _billed(service)[0]
     assert (rec["cost_usd"], rec["prompt_tokens"], rec["request_id"]) == (
-        0.003, 900, "gen-stream")
+        0.012722425, 900, "gen-stream")
+    assert generation.requests[0][0].endswith("?id=gen-stream")
+
 
 
 def test_unmetered_stream_sends_no_stream_options(monkeypatch):

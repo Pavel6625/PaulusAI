@@ -23,13 +23,16 @@ agent.py is unaware of the provider — it always sees Anthropic-shaped
 response objects. All format conversion lives here.
 
 Inside a metered turn (billing.metered), every call's token use and cost is
-handed to billing.record — the cost OpenRouter reports in ``usage.cost`` when
-there is one, else LiteLLM's price-map estimate — and a call is refused with
-billing.BalanceExhausted once the turn's meter has been stopped.
+handed to billing — for a call through OpenRouter, the cost OpenRouter itself
+records for that generation (its /generation data, read in the background);
+otherwise the cost in the response, else LiteLLM's price-map estimate — and a
+call is refused with billing.BalanceExhausted once the turn's meter has been
+stopped.
 """
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -397,31 +400,66 @@ def _provider_cost(usage, hidden_params=None):
     return cost
 
 
-def _openrouter_generation_cost(request_id):
-    """Fetch OpenRouter's authoritative total_cost for a completed generation.
+_OPENROUTER_HOST = "openrouter.ai"
+# Delays (seconds) between attempts to read a generation record: OpenRouter
+# only has it a moment after the reply finishes, and 404s until then.
+_GENERATION_RETRY_DELAYS = (0.5, 1, 2, 3, 5, 8)
 
-    LiteLLM versions/providers may preserve token usage but drop OpenRouter's
-    ``usage.cost`` from the normalized response. The generation API is the
-    reliable fallback; it requires the OpenRouter API key and a ``gen-`` id.
-    A missing key, incomplete generation record, or network error returns None
-    so billing can still report token counts and mark the call unpriced.
-    """
-    api_key = config.OPENROUTER_API_KEY
-    if not api_key or not request_id or not request_id.startswith("gen-"):
-        return None
-    query = urllib.parse.urlencode({"id": request_id})
-    req = urllib.request.Request(
-        f"https://openrouter.ai/api/v1/generation?{query}",
-        headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=3) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        print(f"[llm] OpenRouter cost lookup failed for {request_id}: {exc}",
-              file=sys.stderr)
-        return None
-    return _as_cost(_field(_field(data, "data"), "total_cost"))
+
+def _openrouter_key(model):
+    """The OpenRouter API key *model* is called with, or None when the call
+    doesn't go to OpenRouter. Covers ``openrouter/...`` models and a core model
+    pointed at OpenRouter through DP_API_BASE (the key is then DP_API_KEY)."""
+    if model.startswith("openrouter/"):
+        return config.OPENROUTER_API_KEY or None
+    creds = config.model_credentials(model)
+    if _OPENROUTER_HOST in (creds.get("api_base") or ""):
+        return creds.get("api_key") or config.OPENROUTER_API_KEY or None
+    return None
+
+
+def _uses_openrouter(model):
+    if model.startswith("openrouter/"):
+        return True
+    return _OPENROUTER_HOST in (config.model_credentials(model).get("api_base") or "")
+
+
+def _openrouter_generation_cost(request_id, api_key):
+    """OpenRouter's own USD charge for generation *request_id* — what its
+    Generation Data shows as ``usage`` (``total_cost`` is the same figure).
+
+    Retries while the record isn't there yet (404) or the request fails, for
+    up to ~20s. Raises when it can't get a cost, so the caller can audit why."""
+    if not api_key:
+        raise ValueError("no OpenRouter API key to read the generation's cost")
+    if not request_id or not str(request_id).startswith("gen-"):
+        raise ValueError(f"not an OpenRouter generation id: {request_id!r}")
+    url = (f"{config.OPENROUTER_API_BASE}/v1/generation?"
+           f"{urllib.parse.urlencode({'id': request_id})}")
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    last = None
+    for delay in (0, *_GENERATION_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as response:
+                data = _field(json.loads(response.read().decode("utf-8")), "data")
+        except urllib.error.HTTPError as exc:
+            last = f"HTTP {exc.code}"
+            if exc.code in (401, 403):
+                break                    # a bad key won't fix itself
+            continue
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last = str(exc)
+            continue
+        cost = _as_cost(_field(data, "usage"))
+        if cost is None:
+            cost = _as_cost(_field(data, "total_cost"))
+        if cost is not None:
+            return cost
+        last = "generation record has no cost"
+    raise RuntimeError(f"OpenRouter generation cost unavailable ({last})")
 
 
 def _estimate_cost(model, prompt_tokens, completion_tokens):
@@ -438,17 +476,24 @@ def _estimate_cost(model, prompt_tokens, completion_tokens):
 
 def _report_usage(usage, model, request_id=None, hidden_params=None):
     """Hand one call's tokens and cost to billing. A no-op outside a metered
-    turn, so unbilled callers pay nothing for the bookkeeping."""
+    turn, so unbilled callers pay nothing for the bookkeeping.
+
+    An OpenRouter call is priced from OpenRouter's generation record — the
+    same figure its dashboard shows — looked up in the background so the reply
+    isn't delayed. Any other call uses the cost in its response, else
+    LiteLLM's price-map estimate."""
     if not billing.metering():
         return
     prompt = int(_field(usage, "prompt_tokens") or 0)
     completion = int(_field(usage, "completion_tokens") or 0)
+    if _uses_openrouter(model):
+        api_key = _openrouter_key(model)
+        billing.record_deferred(
+            lambda: (_openrouter_generation_cost(request_id, api_key), "provider"),
+            prompt_tokens=prompt, completion_tokens=completion, model=model,
+            request_id=request_id)
+        return
     cost, source = _provider_cost(usage, hidden_params), "provider"
-    if model.startswith("openrouter/") and (cost is None or cost == 0) \
-            and (prompt or completion):
-        generation_cost = _openrouter_generation_cost(request_id)
-        if generation_cost is not None:
-            cost, source = generation_cost, "provider"
     if cost is None:
         cost, source = _estimate_cost(model, prompt, completion), "estimate"
     if cost is None:

@@ -23,6 +23,13 @@ record call fails, the meter is stopped: the call that was just made is kept
 BalanceExhausted instead of spending more. A turn can therefore overrun the
 balance by at most the calls in flight; the service settles that (e.g. to 0).
 
+OpenRouter calls are priced from OpenRouter's own generation record, which
+takes a moment to appear after the reply, so they are recorded in the
+background (record_deferred) rather than holding the reply back. Their
+balance check lands a little later — the overrun above can grow by the calls
+made meanwhile. flush() waits for those records (the gateway calls it on
+shutdown).
+
 Fails CLOSED throughout, so a billing outage never turns into free, unmetered
 usage. Entirely optional: leave ``DP_BILLING_API_BASE`` unset and every entry
 point is a no-op, so single-owner / CLI setups (``user_id=None``) are
@@ -32,6 +39,7 @@ import contextlib
 import contextvars
 import json
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -187,11 +195,18 @@ class Meter:
     completion_tokens: int = 0
     cost_sources: dict = field(default_factory=dict)
     block_message: str | None = None     # set once the meter is stopped
+    pending: int = 0                     # deferred records not yet sent
+    closed: bool = False                 # the metered block has exited
+    summarized: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 _meter: contextvars.ContextVar[Meter | None] = contextvars.ContextVar(
     "paulus_billing_meter", default=None)
+
+# Background threads still sending a deferred record (see flush()).
+_inflight: set[threading.Thread] = set()
+_inflight_lock = threading.Lock()
 
 
 @contextlib.contextmanager
@@ -209,12 +224,23 @@ def metered(user_id, kind="turn"):
         yield meter
     finally:
         _meter.reset(token)
-        if meter.calls:
-            security.audit("billing_usage",
-                           f"{meter.user_id} {kind} calls={meter.calls} "
-                           f"tokens={meter.prompt_tokens}+{meter.completion_tokens} "
-                           f"cost_usd={meter.cost_usd:.6f} "
-                           f"sources={json.dumps(meter.cost_sources, sort_keys=True)}")
+        with meter._lock:
+            meter.closed = True
+        _summarize(meter)
+
+
+def _summarize(meter):
+    """Audit the turn's totals once: when its block has exited AND its last
+    deferred record has landed, so the summary includes every call's cost."""
+    with meter._lock:
+        if not meter.closed or meter.pending or meter.summarized or not meter.calls:
+            return
+        meter.summarized = True
+        line = (f"{meter.user_id} {meter.kind} calls={meter.calls} "
+                f"tokens={meter.prompt_tokens}+{meter.completion_tokens} "
+                f"cost_usd={meter.cost_usd:.6f} "
+                f"sources={json.dumps(meter.cost_sources, sort_keys=True)}")
+    security.audit("billing_usage", line)
 
 
 def metering() -> bool:
@@ -251,6 +277,67 @@ def record(*, cost_usd, cost_source, prompt_tokens, completion_tokens,
     meter = _meter.get()
     if meter is None:
         return
+    _send(meter, cost_usd=cost_usd, cost_source=cost_source,
+          prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+          model=model, request_id=request_id)
+
+
+def record_deferred(resolve, *, prompt_tokens, completion_tokens, model,
+                    request_id=None) -> None:
+    """Like record(), but the cost is looked up off the calling thread: the
+    reply isn't held back while ``resolve()`` (which may wait on a provider,
+    e.g. OpenRouter's generation record) runs. ``resolve()`` returns
+    ``(cost_usd, cost_source)``; whatever it raises is audited and the call
+    recorded as unpriced, never lost. A no-op outside a metered turn."""
+    meter = _meter.get()
+    if meter is None:
+        return
+    with meter._lock:
+        meter.pending += 1
+
+    def run():
+        try:
+            try:
+                cost_usd, cost_source = resolve()
+            except Exception as exc:
+                security.audit("billing_cost_error", f"{meter.user_id} {model} "
+                               f"{request_id}: {exc}")
+                cost_usd, cost_source = 0.0, "none"
+            _send(meter, cost_usd=cost_usd, cost_source=cost_source,
+                  prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                  model=model, request_id=request_id)
+        finally:
+            with meter._lock:
+                meter.pending -= 1
+            _summarize(meter)
+            with _inflight_lock:
+                _inflight.discard(threading.current_thread())
+
+    thread = threading.Thread(target=run, name="paulus-billing", daemon=True)
+    with _inflight_lock:
+        _inflight.add(thread)
+    thread.start()
+
+
+def flush(timeout=None) -> None:
+    """Wait for deferred records still being sent (gateway shutdown, tests).
+    *timeout* bounds the whole wait, in seconds; None waits for all."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        with _inflight_lock:
+            threads = list(_inflight)
+        if not threads:
+            return
+        for thread in threads:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return
+            thread.join(remaining)
+
+
+def _send(meter, *, cost_usd, cost_source, prompt_tokens, completion_tokens,
+          model, request_id):
+    """Count one call on *meter* and POST its record (see record())."""
     with meter._lock:
         meter.calls += 1
         meter.cost_usd += cost_usd

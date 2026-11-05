@@ -482,6 +482,10 @@ class GatewayRunner:
             except Exception:
                 pass
 
+        # Usage still being priced (OpenRouter's generation data lags the
+        # reply) must reach the billing service before the process exits.
+        await asyncio.get_running_loop().run_in_executor(None, billing.flush, 30)
+
     async def _idle_loop(self) -> None:
         """Periodically reach out to users who have gone quiet. Idleness is
         tracked per user; each gets at most MAX_IDLE_MSG_SESSION unprompted

@@ -128,22 +128,30 @@ def start(user_id, title, instructions, model=None, review=None):
 
 
 def _run(task, model, review):
-    from . import agent, memory, tools
+    from . import agent, billing, memory, tools
     security.BACKGROUND.set(True)        # this thread's context: no console prompts
     timer = threading.Timer(config.TASK_MAX_MINUTES * 60, _time_out, args=(task,))
     timer.daemon = True
     timer.start()
     specs = tools.agent_specs(tasks=False, user_id=task.user_id)
+    pay_link = ""
     try:
         system = agent._build_system(task.user_id, specs) + BRIEF
         messages = agent._history_to_messages(task.user_id)
         agent._append_user(messages, f"[Background task #{task.id}: {task.title}]\n"
                                      f"{task.instructions}")
-        result = agent._run_tool_loop(
-            system, messages, task.user_id, model=model, tools_used=task.tools_used,
-            review=review, specs=specs, max_steps=config.TASK_MAX_STEPS,
-            cancel=task.cancel, origin=f"background task #{task.id} ({task.title})")
+        # A fresh thread doesn't inherit the starting turn's meter, so the task
+        # meters itself: every token it spends is billed, and it stops at its
+        # next model call once the balance runs out.
+        with billing.metered(task.user_id, kind="task"):
+            result = agent._run_tool_loop(
+                system, messages, task.user_id, model=model, tools_used=task.tools_used,
+                review=review, specs=specs, max_steps=config.TASK_MAX_STEPS,
+                cancel=task.cancel, origin=f"background task #{task.id} ({task.title})")
         status, body = "done", result.strip() or "(no report)"
+    except billing.BalanceExhausted as exc:
+        status, body = "stopped", str(exc)
+        pay_link = exc.block_message[len(body):]   # the embedded link, if any
     except agent.Cancelled:
         if task.timed_out:
             status = "timed out"
@@ -158,7 +166,8 @@ def _run(task, model, review):
 
     task.status, task.finished = status, time.time()
     security.audit("task_" + status.replace(" ", "_"), f"{task.user_id} #{task.id}")
-    icon = {"done": "✅", "failed": "⚠️", "cancelled": "🛑", "timed out": "⏲️"}[status]
+    icon = {"done": "✅", "failed": "⚠️", "cancelled": "🛑", "timed out": "⏲️",
+            "stopped": "💳"}[status]
     message = f"{icon} Background task #{task.id} {status}: {task.title}\n\n{body}"
     try:
         # Logged as the agent's words, so the next turn knows the outcome.
@@ -166,7 +175,8 @@ def _run(task, model, review):
     except Exception as exc:
         security.audit("task_log_error", f"#{task.id}: {exc}")
     try:
-        _notify(task.user_id, message)
+        # The pay link rides along for the gateway to render as a button.
+        _notify(task.user_id, message + pay_link)
     except Exception as exc:
         security.audit("task_notify_error", f"#{task.id}: {exc}")
 

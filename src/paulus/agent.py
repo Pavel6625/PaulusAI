@@ -313,6 +313,19 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     if not allowed:
         return block_message
 
+    # Every LLM call below (subagents and the auto-mode reviewer included) is
+    # metered per token against the user. If their balance runs out mid-turn,
+    # the next call raises and the turn ends with the top-up message.
+    with billing.metered(user_id):
+        try:
+            return _respond(owner_text, user_id, on_delta, images, documents,
+                            on_break)
+        except billing.BalanceExhausted as exc:
+            memory.log_episode("agent", str(exc), trust="trusted", user_id=user_id)
+            return exc.block_message
+
+
+def _respond(owner_text, user_id, on_delta, images, documents, on_break):
     review = _review_context(owner_text, user_id, images, documents)
     owner_text = _ingest_documents(owner_text, documents, user_id)
     memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
@@ -360,9 +373,10 @@ def proactive_check(user_id=None):
     message to deliver, or a silence sentinel the caller swallows. The seed
     prompt is never persisted; only a real outgoing message is logged.
 
-    Deliberately NOT pay-gated. A nudge is bot-initiated, not something the user
+    Deliberately NOT pay-gated or metered (no billing.metered block), so its
+    tokens are never reported. A nudge is bot-initiated, not something the user
     asked for, so it must never debit their balance — unlike respond(), which
-    gates because the user requested that turn. This means the idle loop can
+    gates and meters because the user requested that turn. This means the idle loop can
     still reach out to a user whose balance is exhausted; that is intended (a
     warm, unsolicited check-in isn't a paid reply), and if they answer, that
     reply goes through respond() and is gated normally.

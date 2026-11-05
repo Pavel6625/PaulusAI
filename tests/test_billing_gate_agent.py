@@ -55,3 +55,20 @@ def test_proactive_check_uses_the_utility_model(monkeypatch):
     agent.proactive_check(user_id="u1")
 
     assert seen["model"] == "cheap/model"
+
+
+def test_bg_command_is_pay_gated(monkeypatch):
+    """/bg is a request like any message, so a blocked user gets the block
+    message and no background task is started or logged."""
+    from paulus import tasks
+    monkeypatch.setattr(config, "TASKS", True)
+    monkeypatch.setattr(billing, "gate", lambda uid: (False, "You're out of balance."))
+
+    def _no_start(*a, **k):
+        raise AssertionError("a blocked /bg must not start a task")
+    monkeypatch.setattr(tasks, "start", _no_start)
+
+    reply = tasks.start_from_owner("summarise my inbox", user_id="u1")
+
+    assert reply == "You're out of balance."
+    assert memory.recent_episodes(user_id="u1") == []

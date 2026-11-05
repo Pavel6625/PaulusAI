@@ -21,6 +21,11 @@ hands the choice to an OpenRouter router (see _router_options).
 
 agent.py is unaware of the provider — it always sees Anthropic-shaped
 response objects. All format conversion lives here.
+
+Inside a metered turn (billing.metered), every call's token use and cost is
+handed to billing.record — the cost OpenRouter reports in ``usage.cost`` when
+there is one, else LiteLLM's price-map estimate — and a call is refused with
+billing.BalanceExhausted once the turn's meter has been stopped.
 """
 import json
 import re
@@ -29,7 +34,7 @@ from dataclasses import dataclass, field
 
 import litellm
 
-from . import config
+from . import billing, config
 
 litellm.suppress_debug_info = True
 
@@ -314,18 +319,100 @@ def _completion(model, **kwargs):
     on CORE_MODEL: routing is an optimisation and must never be the reason a
     turn fails. LiteLLM sends a streaming request eagerly, so this covers
     streams too; a stream that breaks after it started is not retried, since
-    part of the reply has already been shown."""
+    part of the reply has already been shown.
+
+    Returns ``(response, model)`` — the model that actually served the call,
+    which billing needs to price it. Raises billing.BalanceExhausted, before
+    sending anything, when the current metered turn may spend no more."""
+    billing.ensure_can_spend()
     try:
         return litellm.completion(model=model, **kwargs,
                                   **config.model_credentials(model),
-                                  **_router_options(model))
+                                  **_router_options(model)), model
     except Exception as e:
         if model != config.ROUTER_MODEL or model == config.CORE_MODEL:
             raise
         print(f"[llm] router {model} failed, falling back to "
               f"{config.CORE_MODEL}: {e}", file=sys.stderr)
         return litellm.completion(model=config.CORE_MODEL, **kwargs,
-                                  **config.model_credentials(config.CORE_MODEL))
+                                  **config.model_credentials(config.CORE_MODEL)), \
+            config.CORE_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Usage & cost (for billing)
+# ---------------------------------------------------------------------------
+
+# Where LiteLLM's OpenRouter provider stashes the body's usage.cost.
+_HIDDEN_COST_KEY = "llm_provider-x-litellm-response-cost"
+
+
+def _field(obj, name):
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def _as_cost(value):
+    """A cost as a float, accepting a bare number or a ``{"total_cost": n}``
+    breakdown; None for anything else (bools included)."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        return _as_cost(value.get("total_cost"))
+    return None
+
+
+def _provider_cost(usage, hidden_params=None):
+    """The USD cost the provider itself reported for a call, or None.
+
+    OpenRouter returns it on every response as ``usage.cost`` (no request flag
+    needed; LiteLLM keeps it on Usage and, for non-streamed calls, also in
+    _hidden_params). With BYOK, ``cost`` is only OpenRouter's fee and the
+    provider's charge is ``cost_details.upstream_inference_cost``, so the two
+    are added."""
+    cost = _as_cost(_field(usage, "cost"))
+    if cost is None:
+        headers = (hidden_params or {}).get("additional_headers") or {}
+        cost = _as_cost(headers.get(_HIDDEN_COST_KEY))
+    if cost is not None and _field(usage, "is_byok"):
+        upstream = _as_cost(_field(_field(usage, "cost_details"),
+                                   "upstream_inference_cost"))
+        cost += upstream or 0.0
+    return cost
+
+
+def _estimate_cost(model, prompt_tokens, completion_tokens):
+    """LiteLLM's price-map cost for the token counts, or None if *model* isn't
+    in the map (e.g. a router alias, a local model)."""
+    try:
+        prompt_cost, completion_cost = litellm.cost_per_token(
+            model=model, prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens)
+    except Exception:
+        return None
+    return float(prompt_cost) + float(completion_cost)
+
+
+def _report_usage(usage, model, request_id=None, hidden_params=None):
+    """Hand one call's tokens and cost to billing. A no-op outside a metered
+    turn, so unbilled callers pay nothing for the bookkeeping."""
+    if not billing.metering():
+        return
+    prompt = int(_field(usage, "prompt_tokens") or 0)
+    completion = int(_field(usage, "completion_tokens") or 0)
+    cost, source = _provider_cost(usage, hidden_params), "provider"
+    if cost is None:
+        cost, source = _estimate_cost(model, prompt, completion), "estimate"
+    if cost is None:
+        cost, source = 0.0, "none"
+    billing.record(cost_usd=cost, cost_source=source, prompt_tokens=prompt,
+                   completion_tokens=completion, model=model,
+                   request_id=request_id)
 
 
 def complete(system, messages, tools=None, model=None):
@@ -335,12 +422,16 @@ def complete(system, messages, tools=None, model=None):
     credentials are resolved per-model (see config.model_credentials)."""
     model = model or config.CORE_MODEL
     oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
-    return _normalize(_completion(
+    response, used = _completion(
         model,
         max_tokens=config.MAX_TOKENS,
         messages=oai_messages,
         tools=_to_litellm_tools(tools) if tools else None,
-    ))
+    )
+    _report_usage(getattr(response, "usage", None), used,
+                  request_id=getattr(response, "id", None),
+                  hidden_params=getattr(response, "_hidden_params", None))
+    return _normalize(response)
 
 
 def stream(system, messages, tools=None, on_delta=None, model=None):
@@ -352,20 +443,31 @@ def stream(system, messages, tools=None, on_delta=None, model=None):
     *model* overrides the configured core model for this call only."""
     model = model or config.CORE_MODEL
     oai_messages = [{"role": "system", "content": system}] + _to_openai_messages(messages)
-    chunks = _completion(
+    metered = billing.metering()
+    # A stream only carries usage (and OpenRouter's cost) in a final chunk
+    # that LiteLLM hands back when asked to; only ask when someone will bill it.
+    extra = {"stream_options": {"include_usage": True}} if metered else {}
+    chunks, used = _completion(
         model,
         max_tokens=config.MAX_TOKENS,
         messages=oai_messages,
         tools=_to_litellm_tools(tools) if tools else None,
         stream=True,
+        **extra,
     )
 
     text_parts: list[str] = []
     tool_calls: list[dict] = []        # [{id, name, args}] in arrival order
     by_index: dict = {}                # call index -> its slot in tool_calls
     finish = None
+    usage = None
+    request_id = None
 
     for chunk in chunks:
+        usage = getattr(chunk, "usage", None) or usage
+        request_id = request_id or getattr(chunk, "id", None)
+        if not chunk.choices:          # the usage-only chunk
+            continue
         choice = chunk.choices[0]
         if choice.finish_reason:
             finish = choice.finish_reason
@@ -396,6 +498,9 @@ def stream(system, messages, tools=None, on_delta=None, model=None):
                     slot["name"] = fn.name
                 if fn.arguments:
                     slot["args"] += fn.arguments
+
+    if metered:
+        _report_usage(usage, used, request_id=request_id)
 
     # See _normalize: a provider may stream tool-call deltas while reporting a
     # "stop" finish_reason, so trust the accumulated tool calls themselves.

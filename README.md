@@ -138,6 +138,7 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `DP_MCP_CONNECT_TIMEOUT`| `30`                           | Seconds to wait for each MCP server to start                   |
 | `DP_MCP_CALL_TIMEOUT`   | `60`                           | Seconds per MCP tool call (a server's `timeout` overrides it)  |
 | `DP_MCP_MAX_CHARS`      | `12000`                        | Longest MCP tool result passed to the model                    |
+| `DP_MCP_ON_DEMAND`      | `1`                            | Send MCP schemas only once a turn enables a toolset (`0` = all up front) |
 | `TELEGRAM_BOT_TOKEN`    | —                              | Required for `paulus-gateway`                                  |
 | `TELEGRAM_ALLOWED_USERS`| (all)                          | Numeric Telegram user IDs allowed to **chat**; empty = everyone |
 | `TELEGRAM_TRUSTED_USERS`| (= allowed)                    | IDs allowed to **approve** high-impact actions; empty = nobody  |
@@ -344,7 +345,17 @@ A server has a `command` (+ `args`, `env`, `cwd`) to run over stdio, or a
 `url` (+ `headers`) for Streamable HTTP (`"type": "sse"` for legacy SSE
 servers). Its tools appear to the model as `mcp__<server>__<tool>`. Servers
 connect at startup; one that fails is reported and skipped. `/mcp` shows the
-status of each one. PaulusAI-specific keys:
+status of each one.
+
+Tool schemas are long, and resending every server's on every model call is
+costly. So by default (`DP_MCP_ON_DEMAND=1`) the model starts each turn with
+only `list_toolsets` and `enable_toolset`. It switches on a server, e.g.
+`enable_toolset("github")`, only when the request needs it, and that server's
+tools are offered from its next step until the end of the turn. A plain chat
+turn sends no MCP schemas at all. Enabling a toolset doesn't approve anything:
+each call is still gated as below.
+
+PaulusAI-specific keys:
 
 | Key            | Meaning                                                                 |
 |----------------|-------------------------------------------------------------------------|
@@ -352,6 +363,7 @@ status of each one. PaulusAI-specific keys:
 | `users`        | Gateway user IDs offered this server (`"*"` = everyone). See below     |
 | `timeout`      | Seconds per tool call                                                   |
 | `disabled`     | `true` to skip the server                                               |
+| `description`  | One line on what the server is for, shown by `list_toolsets`            |
 | `auth`         | `"oauth"` for HTTP servers that sign in with OAuth (see below)          |
 | `redirect_uri` | OAuth redirect URI (default `http://localhost:33418/callback`)         |
 

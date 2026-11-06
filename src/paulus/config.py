@@ -290,6 +290,12 @@ MCP_CONFIG = os.environ.get("DP_MCP_CONFIG", "").strip() or str(DATA_DIR / "mcp.
 MCP_CONNECT_TIMEOUT = float(os.environ.get("DP_MCP_CONNECT_TIMEOUT", "30"))
 MCP_CALL_TIMEOUT = float(os.environ.get("DP_MCP_CALL_TIMEOUT", "60"))   # per-server "timeout" overrides
 MCP_MAX_CHARS = int(os.environ.get("DP_MCP_MAX_CHARS", "12000"))        # per tool result
+# On-demand toolsets: rather than resending every MCP schema on every model
+# call, the agent is offered `list_toolsets` / `enable_toolset` and switches a
+# server's tools on only when a turn needs them (for that turn alone). Off =
+# every permitted MCP tool is offered up front, as before.
+MCP_ON_DEMAND = (os.environ.get("DP_MCP_ON_DEMAND", "1").strip().lower()
+                 not in ("", "0", "off", "false", "no"))
 
 # --- Gateway (Hermes) -------------------------------------------------------
 # TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_USERS are read by the adapter itself.

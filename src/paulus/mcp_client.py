@@ -16,6 +16,11 @@ A server with ``"auth": "oauth"`` signs in once with ``paulus-mcp-login``
 
 Each server's tools join the agent's own as ``mcp__<server>__<tool>``.
 
+By default (DP_MCP_ON_DEMAND) they aren't sent up front: the agent sees
+``list_toolsets`` / ``enable_toolset`` and switches a server on only for the
+turn that needs it, so ordinary turns carry no MCP schemas. An optional
+``"description"`` on a server is what ``list_toolsets`` shows for it.
+
 Trust model:
   - Every MCP tool is high-impact (owner approval) unless the server's
     ``auto_approve`` list names it: exact names or fnmatch patterns, "*" for
@@ -375,11 +380,40 @@ def _offered_to(srv, user_id):
     return runner is not None and runner.can_request_approval(user_id)
 
 
-def specs(user_id=None):
-    """The specs of every connected MCP tool *user_id* may use."""
+def specs(user_id=None, servers=None):
+    """The specs of every connected MCP tool *user_id* may use; only those of
+    the named *servers* when given (on-demand toolsets)."""
     return [spec for srv in list(_servers.values())
             if srv.client is not None and _offered_to(srv, user_id)
+            and (servers is None or srv.name in servers)
             for _, spec in srv.tools.values()]
+
+
+_TOOLSET_PREVIEW = 12              # tool names shown per server in list_toolsets
+
+
+def toolsets(user_id=None):
+    """The connected servers *user_id* may use, as [(name, summary)], in
+    config order. The summary is the server's ``description`` setting, or a
+    preview of its tool names."""
+    out = []
+    for srv in list(_servers.values()):
+        if srv.client is None or not _offered_to(srv, user_id):
+            continue
+        remote = [r for r, _ in srv.tools.values()]
+        desc = str(srv.conf.get("description") or "").strip()
+        preview = ", ".join(remote[:_TOOLSET_PREVIEW])
+        if len(remote) > _TOOLSET_PREVIEW:
+            preview += f", … (+{len(remote) - _TOOLSET_PREVIEW} more)"
+        summary = f"{len(remote)} tool(s)" + (f": {preview}" if preview else "")
+        out.append((srv.name, f"{desc} [{summary}]" if desc else summary))
+    return out
+
+
+def server_of(name):
+    """The server an exposed MCP tool name belongs to, or None."""
+    srv, _ = _find(name)
+    return srv.name if srv is not None else None
 
 
 def gated(name):

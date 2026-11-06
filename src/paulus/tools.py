@@ -226,6 +226,32 @@ TASK_STATUS_SPEC = {
 }
 ORCHESTRATION_TOOLS = {"delegate", "start_task", "task_status"}
 
+# On-demand MCP toolsets (config.MCP_ON_DEMAND). Enabling changes the tool list
+# of the running loop, so agent.py dispatches these too. Enabling a toolset
+# only makes its tools callable: each call still goes through the gate.
+LIST_TOOLSETS_SPEC = {
+    "name": "list_toolsets",
+    "description": "List the external toolsets (MCP servers, e.g. GitHub, Notion, mail) "
+                   "you can switch on with `enable_toolset`, with what each provides.",
+    "input_schema": {"type": "object", "properties": {}},
+}
+ENABLE_TOOLSET_SPEC = {
+    "name": "enable_toolset",
+    "description": "Switch on one external toolset (an MCP server) for the rest of this "
+                   "turn; its tools become callable from your next step. Enable one only "
+                   "when the request actually needs it. Its high-impact tools still need "
+                   "the owner's approval.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string",
+                     "description": "The toolset's name, as `list_toolsets` gives it."},
+        },
+        "required": ["name"],
+    },
+}
+TOOLSET_TOOLS = {"list_toolsets", "enable_toolset"}
+
 
 def pick(names):
     """The specs of the named tools, in TOOL_SPECS order."""
@@ -233,17 +259,60 @@ def pick(names):
 
 
 def agent_specs(tasks=True, user_id=None):
-    """The main agent's tools: the base set, the MCP tools *user_id* may use,
-    and whichever orchestration tools are enabled. A background task passes
-    ``tasks=False``: it may delegate, but not start further tasks."""
-    specs = list(TOOL_SPECS) + mcp_client.specs(user_id)
+    """The main agent's tools: the base set, whichever orchestration tools are
+    enabled, and the MCP tools *user_id* may use. A background task passes
+    ``tasks=False``: it may delegate, but not start further tasks.
+
+    With on-demand toolsets (the default), MCP tools aren't included: only
+    `list_toolsets` / `enable_toolset`, and only when there's something to
+    enable. The loop appends a toolset's specs once it's enabled. MCP specs
+    come last either way, so the fixed part of the list stays a stable prefix
+    (prompt caching)."""
+    specs = list(TOOL_SPECS)
     if config.SUBAGENTS:
         specs.append(DELEGATE_SPEC)
     if config.TASKS:
         specs.append(TASK_STATUS_SPEC)
         if tasks:
             specs.append(START_TASK_SPEC)
+    if not config.MCP_ON_DEMAND:
+        specs += mcp_client.specs(user_id)
+    elif mcp_client.toolsets(user_id):
+        specs += [LIST_TOOLSETS_SPEC, ENABLE_TOOLSET_SPEC]
     return specs
+
+
+def list_toolsets(user_id=None, enabled=()):
+    """The `list_toolsets` result: one line per toolset *user_id* may enable."""
+    sets = mcp_client.toolsets(user_id)
+    if not sets:
+        return "No external toolsets are available."
+    lines = [f"- {name}{' (enabled)' if name in enabled else ''}: {summary}"
+             for name, summary in sets]
+    return ("Toolsets you can switch on with enable_toolset:\n" + "\n".join(lines))
+
+
+def enable_toolset(tool_input, user_id=None, enabled=()):
+    """The `enable_toolset` result. Returns (result, is_error, server name or
+    None, new specs); the caller adds the specs to the loop's tool list."""
+    name = str((tool_input or {}).get("name") or "").strip() \
+        if isinstance(tool_input, dict) else ""
+    available = [n for n, _ in mcp_client.toolsets(user_id)]
+    if name not in available:
+        # Forgive case slips ("GitHub"), never a different server.
+        folded = [n for n in available if n.lower() == name.lower()]
+        if len(folded) != 1:
+            return (f"No toolset named '{name}'. Available: "
+                    f"{', '.join(available) or 'none'}."), True, None, []
+        name = folded[0]
+    if name in enabled:
+        return f"Toolset '{name}' is already enabled.", False, None, []
+    new = mcp_client.specs(user_id, servers={name})
+    security.audit("toolset_enable", f"{user_id} {name}: {len(new)} tool(s)")
+    names = ", ".join(s["name"] for s in new) or "(none)"
+    return (f"Enabled toolset '{name}' for this turn: {len(new)} tool(s), callable "
+            f"from your next step: {names}. High-impact ones still need the owner's "
+            f"approval."), False, name, new
 
 
 def execute(name, tool_input, user_id=None):

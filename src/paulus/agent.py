@@ -4,7 +4,7 @@ between the model's decision and any real-world effect.
 """
 import os
 
-from . import affect, automode, billing, config, llm, memory, security, skills, tools
+from . import affect, automode, billing, config, llm, mcp_client, memory, security, skills, tools
 
 SYSTEM_TEMPLATE = """You are a persistent digital companion for a single owner.
 You have long-term memory, learned skills, and a current mood. Be warm, concise,
@@ -52,6 +52,11 @@ _ORCHESTRATION_HINTS = {
         "  underway; its result reaches them as its own message.\n"),
     "task_status": "- `task_status` reports on background tasks when asked.\n",
 }
+_TOOLSET_HINT = (
+    "- External toolsets ({names}) are off until needed. When a request needs\n"
+    "  one, call `enable_toolset` with its name (`list_toolsets` says what each\n"
+    "  offers); its tools are usable from your next step, for this turn only.\n"
+    "  Don't enable a toolset the request doesn't need.\n")
 
 
 def _build_system(user_id=None, specs=None):
@@ -64,6 +69,9 @@ def _build_system(user_id=None, specs=None):
     offered = {s["name"] for s in specs or ()}
     orchestration = "".join(hint for name, hint in _ORCHESTRATION_HINTS.items()
                             if name in offered)
+    if "enable_toolset" in offered:
+        names = ", ".join(n for n, _ in mcp_client.toolsets(user_id))
+        orchestration += _TOOLSET_HINT.format(names=names or "(none)")
     return SYSTEM_TEMPLATE.format(mood=affect.describe(), recalled=recalled,
                                   skill_list=skill_list, orchestration=orchestration)
 
@@ -140,6 +148,29 @@ def _execute(name, tool_input, user_id, model, review, cancel):
         return f"Tool error: {e}", True
 
 
+def _toolset(name, tool_input, user_id, enabled):
+    """Run `list_toolsets` / `enable_toolset` against this loop's *enabled*
+    set. Returns (result, is_error, added) where *added* is (server, specs)
+    for a newly enabled toolset, else None."""
+    try:
+        if name == "list_toolsets":
+            return tools.list_toolsets(user_id, enabled), False, None
+        result, is_error, server, new = tools.enable_toolset(tool_input, user_id, enabled)
+        return result, is_error, (server, new) if server else None
+    except Exception as e:
+        return f"Tool error: {e}", True, None
+
+
+def _unavailable(name, offered, user_id):
+    """Why a call to a tool this loop didn't offer was refused."""
+    if "enable_toolset" in offered and name.startswith(mcp_client.PREFIX):
+        server = mcp_client.server_of(name)
+        if server in {n for n, _ in mcp_client.toolsets(user_id)}:
+            return (f"Tool '{name}' isn't enabled. Call enable_toolset with "
+                    f"name '{server}' first, then call it on your next step.")
+    return f"Tool '{name}' isn't available here."
+
+
 def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
                    tools_used=None, review=None, specs=None, max_steps=None,
                    cancel=None, origin=None, feel=True, on_break=None):
@@ -151,7 +182,9 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
 
     *specs* is the tool list offered (default: the base TOOL_SPECS). A call to
     any other tool is refused, so a subagent can't reach a tool it wasn't given
-    just by naming it. *max_steps* caps the tool rounds: past it, pending calls
+    just by naming it. If it includes `enable_toolset`, an enabled MCP toolset's
+    specs are appended to it from the next step; the enabled set lives only as
+    long as this loop, so the next turn starts lean again. *max_steps* caps the tool rounds: past it, pending calls
     are answered unrun and the model is asked for its report. *cancel* (a
     threading.Event) stops the loop between steps by raising Cancelled.
     *origin* names the actor on approval prompts, and ``feel=False`` leaves the
@@ -177,8 +210,9 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
     how it was cleared. It also carries the owner's grants for the task.
     ``None`` means the owner didn't ask for this turn, so nothing in it is
     auto-approved or granted."""
-    specs = tools.TOOL_SPECS if specs is None else specs
+    specs = list(tools.TOOL_SPECS if specs is None else specs)
     offered = {s["name"] for s in specs}
+    enabled = set()                      # toolsets switched on in this loop
     steps = 0
     while True:
         _check(cancel)
@@ -211,7 +245,7 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
             _check(cancel)
             if b.name not in offered:
                 tool_results.append(_tool_result(
-                    b.id, f"Tool '{b.name}' isn't available here.", is_error=True))
+                    b.id, _unavailable(b.name, offered, user_id), is_error=True))
                 continue
 
             # --- SAFETY GATE -------------------------------------------------
@@ -226,7 +260,15 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
                     tool_results.append(_tool_result(b.id, _DECLINED_NOTE))
                     continue
 
-            result, is_error = _execute(b.name, b.input, user_id, model, review, cancel)
+            if b.name in tools.TOOLSET_TOOLS:
+                result, is_error, added = _toolset(b.name, b.input, user_id, enabled)
+                if added is not None:
+                    enabled.add(added[0])
+                    specs = specs + [s for s in added[1] if s["name"] not in offered]
+                    offered = {s["name"] for s in specs}
+            else:
+                result, is_error = _execute(b.name, b.input, user_id, model,
+                                            review, cancel)
             if review is not None:
                 review.actions.append((b.name, b.input, cleared))
             if tools_used is not None:

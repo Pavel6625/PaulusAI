@@ -141,6 +141,7 @@ def test_declined_mcp_call_never_reaches_the_server(monkeypatch):
     monkeypatch.setattr(llm, "complete", lambda *a, **k: next(replies))
     monkeypatch.setattr(config, "UNATTENDED_POLICY", "deny")
     monkeypatch.setattr(security, "_interactive", lambda: False)
+    monkeypatch.setattr(config, "MCP_ON_DEMAND", False)
 
     agent._run_tool_loop("sys", [{"role": "user", "content": "go"}],
                          specs=tools.agent_specs(),
@@ -158,6 +159,7 @@ def test_auto_approved_mcp_call_runs_without_asking(monkeypatch):
         llm._Response(content=[llm._TextBlock(text="done")])])
     monkeypatch.setattr(llm, "complete", lambda *a, **k: next(replies))
     monkeypatch.setattr(security, "clearance", lambda *a, **k: pytest.fail("asked"))
+    monkeypatch.setattr(config, "MCP_ON_DEMAND", False)
 
     agent._run_tool_loop("sys", [{"role": "user", "content": "go"}],
                          specs=tools.agent_specs())
@@ -178,6 +180,7 @@ class _Runner:
 def test_default_offers_cli_and_trusted_approvers_only(monkeypatch):
     from paulus.gateway import runner
     monkeypatch.setattr(runner, "get_runner", lambda: _Runner({"1"}))
+    monkeypatch.setattr(config, "MCP_ON_DEMAND", False)
     _connect()
     names = lambda uid: [s["name"] for s in tools.agent_specs(user_id=uid)]  # noqa: E731
     assert "mcp__demo__add" in names(None)
@@ -202,6 +205,152 @@ def test_disconnected_server_offers_nothing():
     srv.client = None
     assert mcp_client.specs() == []
     assert mcp_client.call("mcp__demo__add", {})[1] is True
+
+
+# --- on-demand toolsets ------------------------------------------------------
+
+def _use(name, tool_input=None, call_id="t1"):
+    return llm._Response(stop_reason="tool_use", content=[llm._ToolUseBlock(
+        id=call_id, name=name, input=tool_input or {})])
+
+
+def _done(text="done"):
+    return llm._Response(content=[llm._TextBlock(text=text)])
+
+
+def _scripted(monkeypatch, replies):
+    """Feed the loop *replies*; returns the tool names offered on each call."""
+    replies, offered = iter(replies), []
+
+    def model(system, messages, tools=None, model=None):
+        offered.append([s["name"] for s in tools])
+        return next(replies)
+
+    monkeypatch.setattr(llm, "complete", model)
+    return offered
+
+
+def _results(messages):
+    return [b for m in messages if m["role"] == "user" and isinstance(m["content"], list)
+            for b in m["content"] if b.get("type") == "tool_result"]
+
+
+def test_a_plain_turn_sends_no_mcp_schemas():
+    _connect("github", tools_=("list_repos", "create_issue"))
+    names = [s["name"] for s in tools.agent_specs()]
+    assert not any(n.startswith(mcp_client.PREFIX) for n in names)
+    assert names[-2:] == ["list_toolsets", "enable_toolset"]
+
+
+def test_no_toolsets_means_no_meta_tools():
+    names = {s["name"] for s in tools.agent_specs()}
+    assert not names & tools.TOOLSET_TOOLS
+
+
+def test_meta_tools_only_for_users_who_may_use_a_server(monkeypatch):
+    from paulus.gateway import runner
+    monkeypatch.setattr(runner, "get_runner", lambda: _Runner({"1"}))
+    _connect()
+    assert {s["name"] for s in tools.agent_specs(user_id="1")} >= tools.TOOLSET_TOOLS
+    assert not {s["name"] for s in tools.agent_specs(user_id="2")} & tools.TOOLSET_TOOLS
+    _result, is_error, server, new = tools.enable_toolset({"name": "demo"}, user_id="2")
+    assert is_error and server is None and new == []
+
+
+def test_enabling_a_toolset_offers_its_tools_from_the_next_step(monkeypatch):
+    srv = _connect("github", tools_=("list_repos",), auto_approve=["list_*"])
+    _connect("notion", tools_=("search",))
+    offered = _scripted(monkeypatch, [
+        _use("enable_toolset", {"name": "GitHub"}),
+        _use("mcp__github__list_repos"),
+        _done()])
+    messages = [{"role": "user", "content": "check my PRs"}]
+
+    agent._run_tool_loop("sys", messages, specs=tools.agent_specs())
+
+    assert not any(n.startswith(mcp_client.PREFIX) for n in offered[0])
+    assert "mcp__github__list_repos" in offered[1]
+    assert "mcp__notion__search" not in offered[1]           # only what was enabled
+    assert offered[1][:len(offered[0])] == offered[0]         # appended: stable prefix
+    assert srv.client.calls == [("list_repos", {})]
+    assert "toolset_enable" in config.AUDIT_LOG.read_text(encoding="utf-8")
+
+
+def test_enabling_a_toolset_does_not_bypass_the_gate(monkeypatch):
+    srv = _connect("github", tools_=("create_issue",))
+    _scripted(monkeypatch, [
+        _use("enable_toolset", {"name": "github"}),
+        _use("mcp__github__create_issue", {"title": "x"}),
+        _done()])
+    monkeypatch.setattr(config, "UNATTENDED_POLICY", "deny")
+    monkeypatch.setattr(security, "_interactive", lambda: False)
+    messages = [{"role": "user", "content": "file it"}]
+
+    agent._run_tool_loop("sys", messages, specs=tools.agent_specs(),
+                         review=automode.ReviewContext(request="file it"))
+
+    assert srv.client.calls == []
+    assert _results(messages)[1]["content"] == agent._DECLINED_NOTE
+
+
+def test_a_tool_from_a_toolset_not_enabled_is_refused_with_a_hint(monkeypatch):
+    srv = _connect("github", tools_=("list_repos",), auto_approve=["*"])
+    _scripted(monkeypatch, [_use("mcp__github__list_repos"), _done()])
+    messages = [{"role": "user", "content": "go"}]
+
+    agent._run_tool_loop("sys", messages, specs=tools.agent_specs())
+
+    assert srv.client.calls == []
+    result = _results(messages)[0]
+    assert result["is_error"] and "enable_toolset" in result["content"]
+    assert "'github'" in result["content"]
+
+
+def test_enabled_toolsets_last_only_one_turn(monkeypatch):
+    _connect("github", tools_=("list_repos",))
+    offered = _scripted(monkeypatch, [
+        _use("enable_toolset", {"name": "github"}), _done(), _done()])
+    specs = tools.agent_specs()
+
+    agent._run_tool_loop("sys", [{"role": "user", "content": "a"}], specs=specs)
+    agent._run_tool_loop("sys", [{"role": "user", "content": "b"}], specs=specs)
+
+    assert "mcp__github__list_repos" in offered[1]
+    assert "mcp__github__list_repos" not in offered[2]
+    assert not any(s["name"].startswith(mcp_client.PREFIX) for s in specs)  # not mutated
+
+
+def test_enable_toolset_rejects_unknown_names_and_repeats():
+    _connect("github")
+    result, is_error, server, _ = tools.enable_toolset({"name": "jira"})
+    assert is_error and server is None and "github" in result
+    result, is_error, server, new = tools.enable_toolset({"name": "github"},
+                                                         enabled={"github"})
+    assert not is_error and server is None and new == [] and "already" in result
+
+
+def test_list_toolsets_describes_each_server():
+    _connect("github", tools_=("list_repos", "create_issue"),
+             description="Repos, issues and pull requests.")
+    _connect("notion", tools_=("search",))
+    text = tools.list_toolsets(enabled={"notion"})
+    assert "- github: Repos, issues and pull requests. [2 tool(s): list_repos, " \
+           "create_issue]" in text
+    assert "- notion (enabled): 1 tool(s): search" in text
+
+
+def test_system_prompt_names_the_toolsets():
+    _connect("github")
+    specs = tools.agent_specs()
+    assert "External toolsets (github)" in agent._build_system(specs=specs)
+    assert "External toolsets" not in agent._build_system(specs=tools.pick({"recall"}))
+
+
+def test_subagents_get_no_toolsets():
+    from paulus import subagents
+    _connect("github")
+    for profile in subagents.PROFILES.values():
+        assert not {s["name"] for s in tools.pick(profile["tools"])} & tools.TOOLSET_TOOLS
 
 
 # --- calls -------------------------------------------------------------------

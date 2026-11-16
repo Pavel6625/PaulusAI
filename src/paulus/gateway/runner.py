@@ -84,6 +84,8 @@ class GatewayRunner:
         # memory stores lock themselves.
         self._agent_lock = asyncio.Lock()
         self._idle_task: asyncio.Task | None = None
+        self._timer_task: asyncio.Task | None = None
+        self._timer_stop = asyncio.Event()
         # The gateway event loop, captured once it is running, so the agent's
         # worker thread can marshal interactive-approval prompts back onto it.
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -466,6 +468,12 @@ class GatewayRunner:
         await self._loop.run_in_executor(
             None, lambda: tasks.report_interrupted(all_users=True))
 
+        if self._timer_task is None:
+            from .. import timers
+            await self._loop.run_in_executor(None, timers.recover)
+            self._timer_stop.clear()
+            self._timer_task = asyncio.create_task(self._timer_loop())
+
         if config.IDLE_CHECK_INTERVAL > 0 and self._idle_task is None:
             self._idle_task = asyncio.create_task(self._idle_loop())
             security.audit("idle_loop_start", f"every {config.IDLE_CHECK_INTERVAL}s")
@@ -474,6 +482,10 @@ class GatewayRunner:
 
     async def stop_all(self) -> None:
         from .. import tasks
+        self._timer_stop.set()
+        if self._timer_task is not None:
+            await self._timer_task
+            self._timer_task = None
         tasks.cancel_all()
         if self._idle_task is not None:
             self._idle_task.cancel()
@@ -492,6 +504,19 @@ class GatewayRunner:
         # Usage still being priced (OpenRouter's generation data lags the
         # reply) must reach the billing service before the process exits.
         await asyncio.get_running_loop().run_in_executor(None, billing.flush, 30)
+
+    async def _timer_loop(self) -> None:
+        from .. import timers
+        while not self._timer_stop.is_set():
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, timers.fire_due, self.notify_user)
+            except Exception as exc:
+                security.audit("timer_loop_error", str(exc))
+            try:
+                await asyncio.wait_for(self._timer_stop.wait(), config.TIMER_CHECK_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
 
     async def _idle_loop(self) -> None:
         """Periodically reach out to users who have gone quiet. Idleness is

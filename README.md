@@ -134,6 +134,8 @@ Key settings (see [.env.example](.env.example) for the full list):
 | `DP_TASK_MAX_STEPS`     | `40`                           | Tool rounds a background task gets before it must report       |
 | `DP_TASK_MAX_MINUTES`   | `30`                           | Wall-clock limit per background task                           |
 | `DP_MAX_TASKS_PER_USER` | `3`                            | Background tasks one user may have running at once             |
+| `DP_TIMER_CHECK`        | `15`                           | Seconds between gateway timer polls (minimum 1)               |
+| `DP_MAX_TIMERS_PER_USER`| `50`                           | Active durable timers per owner (minimum 1)                   |
 | `DP_MCP_CONFIG`         | `$DP_DATA_DIR/mcp.json`        | [MCP servers](#mcp-servers) to connect; absent = no MCP tools  |
 | `DP_MCP_CONNECT_TIMEOUT`| `30`                           | Seconds to wait for each MCP server to start                   |
 | `DP_MCP_CALL_TIMEOUT`   | `60`                           | Seconds per MCP tool call (a server's `timeout` overrides it)  |
@@ -323,6 +325,43 @@ wrote), and their approval prompts say who is asking (`From: background task
   belongs to the turn that started it, so it isn't gated again. Either way,
   every token a task spends is billed, and a task whose user runs out of
   balance stops at its next model call (`💳 ... stopped`, with a top-up link).
+
+### Durable timers
+
+In a gateway conversation, ask for a reminder or a scheduled job. The agent uses
+`create_timer`, `list_timers`, and `cancel_timer`, scoped to your user ID.
+Creating or cancelling a timer goes through the high-impact approval gate.
+Timers are not offered to idle nudges, subagents, or background tasks, so scheduled
+work cannot recursively create more schedules. The terminal does not service timers.
+
+- **Reminder:** delivers the stored text without a model call or token charge.
+- **Agent run:** starts a normal bounded background task. Balance is checked at
+  firing time and tokens are metered as usual. Each run gets a fresh review context
+  anchored to your original request, never persisted approval grants. Its actions
+  still go through the existing safety gate. `DP_TASKS=0` prevents these runs.
+- **One-shot:** pass `at` as an ISO timestamp with an offset, e.g.
+  `2030-01-15T09:00:00+03:00`.
+- **Recurring:** pass `cron`, e.g. `0 9 * * 1-5`, and an IANA `timezone`, e.g.
+  `Europe/Moscow`. Default timezone is UTC. Five-field cron is supported (minute,
+  hour, day of month, month, weekday); standard cron day-of-month/weekday OR
+  semantics apply. Timezone/DST handling is provided by croniter. Schedules without
+  a match within eight years are rejected.
+
+Schedules, payloads, next due times and last outcomes live in
+`memory/timers.sqlite3` under the data directory. The gateway polls every
+`DP_TIMER_CHECK` seconds, independently of idle nudges. Explicit schedules fire
+**even during quiet hours** and reach your most recent known chat. After downtime,
+missed cron occurrences are coalesced into one catch-up run, then the next future
+occurrence is scheduled; a missed one-shot runs once.
+
+An occurrence is claimed durably **before** dispatch. A restart during delivery
+or task launch leaves an uncertain outcome: that occurrence is not automatically
+replayed. One-shots show `interrupted`; recurring timers keep the interruption in
+their last outcome and continue at the next scheduled occurrence. Delivery failures,
+insufficient balance, or task-capacity limits are recorded without retrying that
+occurrence. Use `list_timers` to inspect outcomes. Cancelling a timer prevents future
+occurrences but cannot stop one already firing; use `/cancel N` for a background
+task it already launched. Run only one gateway process per data directory.
 
 ### MCP servers
 

@@ -283,6 +283,10 @@ TASK_MAX_STEPS = int(os.environ.get("DP_TASK_MAX_STEPS", "40"))
 TASK_MAX_MINUTES = float(os.environ.get("DP_TASK_MAX_MINUTES", "30"))
 MAX_TASKS_PER_USER = int(os.environ.get("DP_MAX_TASKS_PER_USER", "3"))
 
+# Durable schedules are serviced by the gateway independently of idle nudges.
+TIMER_CHECK_INTERVAL = max(1, int(os.environ.get("DP_TIMER_CHECK", "15")))
+MAX_TIMERS_PER_USER = max(1, int(os.environ.get("DP_MAX_TIMERS_PER_USER", "50")))
+
 # --- MCP servers (mcp_client.py) ----------------------------------------------
 # External Model Context Protocol servers whose tools the agent may use. The
 # file is optional: absent = no MCP tools. Needs the `mcp` extra.

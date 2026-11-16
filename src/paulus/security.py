@@ -26,6 +26,13 @@ HIGH_IMPACT_TOOLS = {"write_local_file", "send_message", "send_document", "run_c
 # rest of the task. Truthy, so code that only asks "approved?" still works.
 GRANT = "grant"
 
+
+class DeferredInteraction(Exception):
+    """Internal control-flow signal: this run is durably waiting for an owner."""
+
+    def __init__(self, request_id):
+        self.request_id = request_id
+
 # Set while a background task runs (tasks.py). The terminal belongs to the
 # conversation then, so a console prompt can't be shown; see _ask.
 BACKGROUND = contextvars.ContextVar("paulus_background", default=False)

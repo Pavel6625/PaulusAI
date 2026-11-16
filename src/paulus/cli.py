@@ -25,6 +25,7 @@ def main():
     mcp_client.init()   # connect configured MCP servers (none = no MCP tools)
     print("PaulusAI. Type a message, or /quit to exit.")
     print(f"permission mode: {config.PERMISSION_MODE}  (/auto to toggle)\n")
+    tasks.report_interrupted()
     while True:
         try:
             text = input("you> ").strip()

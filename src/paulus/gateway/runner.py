@@ -249,13 +249,14 @@ class GatewayRunner:
             return skills.describe()
         return f"Unknown command: /{command}"
 
-    def notify_user(self, user_id, text: str) -> None:
+    def notify_user(self, user_id, text: str) -> bool:
         """Deliver *text* to *user_id*'s most recent chat. Called from a
-        background task's thread when it finishes; blocks until sent."""
+        background task's thread when it finishes; blocks until sent. Returns
+        whether delivery succeeded (also used for startup recovery notices)."""
         source, error = self._resolve_destination("", user_id)
         if error is not None or self._loop is None:
             security.audit("notify_skip", f"{user_id}: {error or 'loop not running'}")
-            return
+            return False
         adapter = self._adapters[source.platform]
         # A task stopped for balance carries its top-up link (billing.metered).
         text, pay_url = billing.split_pay_link(text)
@@ -264,9 +265,11 @@ class GatewayRunner:
         try:
             asyncio.run_coroutine_threadsafe(send, self._loop).result(timeout=60)
             adapter._on_success()
+            return True
         except Exception as exc:
             security.audit("notify_error", f"{user_id}: {exc}")
             adapter._on_failure()
+            return False
 
     def _resolve_target(self, to: str) -> tuple[str | None, str, str | None]:
         """Resolve a 'to' spec into (platform_name, chat_id, error).
@@ -458,6 +461,10 @@ class GatewayRunner:
                 security.audit("gateway_start", name)
             except Exception as exc:
                 security.audit("gateway_start_error", f"{name}: {exc}")
+
+        from .. import tasks
+        await self._loop.run_in_executor(
+            None, lambda: tasks.report_interrupted(all_users=True))
 
         if config.IDLE_CHECK_INTERVAL > 0 and self._idle_task is None:
             self._idle_task = asyncio.create_task(self._idle_loop())

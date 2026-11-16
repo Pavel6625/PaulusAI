@@ -308,8 +308,17 @@ wrote), and their approval prompts say who is asking (`From: background task
   belongs to the conversation. An action it needs approved is denied unless
   auto mode or an [Allow for this task](#allow-for-this-task) grant from the
   turn that started it covers it. On Telegram, prompts reach the chat as usual.
-- **Tasks live in memory.** A restart drops running ones. Each start and finish
-  is in `audit.log` (`task_start`, `task_done`, ...).
+- **Task records survive restarts** in `memory/tasks.sqlite3` under the data
+  directory: IDs, owner, instructions, status, timestamps, and completed results
+  are retained. On startup, previously running tasks become **interrupted**,
+  appear in `/tasks`, and are reported to their owner once the chat adapter is
+  ready (or in the terminal for terminal tasks). Failed interruption notices are
+  retried on the next startup; delivery is best-effort and can duplicate if the
+  process stops just after sending. Tasks are **not automatically resumed**:
+  some external actions may already have completed, so check before retrying.
+  The latest 20 finished tasks per owner are kept, along with any undelivered
+  interruption notices. Each start and finish is also in `audit.log`
+  (`task_start`, `task_done`, ...).
 - **Billing:** `/bg` is pay-gated like a message. A task started by the agent
   belongs to the turn that started it, so it isn't gated again. Either way,
   every token a task spends is billed, and a task whose user runs out of

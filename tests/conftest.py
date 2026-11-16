@@ -19,9 +19,11 @@ os.environ["DP_ROUTER_MODEL"] = ""
 
 
 @pytest.fixture(autouse=True)
-def clean_data_dir():
+def clean_data_dir(monkeypatch):
     """Give every test empty memory/workspace dirs for isolation."""
-    from paulus import config
+    from paulus import config, tasks
+    monkeypatch.setattr(tasks, "_initialized", False)
+    monkeypatch.setattr(tasks, "_tasks", {})
     for d in (config.MEMORY_DIR, config.WORKSPACE_DIR):
         if d.exists():
             shutil.rmtree(d)

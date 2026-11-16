@@ -1,6 +1,10 @@
 """Subagents (subagents.py), background tasks (tasks.py), and the tool-loop
 knobs they're built on (agent._run_tool_loop)."""
 import asyncio
+import json
+import os
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -258,6 +262,9 @@ def test_task_failure_is_reported(monkeypatch, inbox):
     tasks.start("u1", "x", "y", review=_ctx())
     message = inbox()[1]
     assert "failed" in message and "provider down" in message
+    _restart_tasks(monkeypatch)
+    assert "[failed] x" in tasks.status("u1")
+    assert "provider down" in next(iter(tasks._tasks.values())).result
 
 
 def test_cancel_stops_a_task_at_its_next_step(monkeypatch, inbox):
@@ -279,6 +286,8 @@ def test_cancel_stops_a_task_at_its_next_step(monkeypatch, inbox):
 
     assert "cancelled" in inbox()[1]
     assert task.status == "cancelled"
+    _restart_tasks(monkeypatch)
+    assert "[cancelled] slow" in tasks.status("u1")
 
 
 def test_tasks_per_user_are_capped(monkeypatch, inbox):
@@ -319,6 +328,128 @@ def test_bg_starts_a_task_from_the_owners_words(monkeypatch, inbox):
     assert reply.startswith("Started background task #")
     assert reviewed[0].request == "summarise my inbox"   # the owner's own words
     assert "done it" in inbox()[1]
+
+
+def _restart_tasks(monkeypatch):
+    monkeypatch.setattr(tasks, "_tasks", {})
+    monkeypatch.setattr(tasks, "_initialized", False)
+
+
+def _leave_running(monkeypatch, user_id="u1"):
+    # Persist the start without creating an actual worker in this process.
+    with monkeypatch.context() as patch:
+        patch.setattr(threading.Thread, "start", lambda self: None)
+        task, error = tasks.start(user_id, "unfinished", "check before retrying", review=_ctx())
+    assert error is None
+    return task
+
+
+def test_restart_restores_finished_result_and_does_not_reuse_ids(monkeypatch, inbox):
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: _text("saved result"))
+    first, _ = tasks.start("u1", "finished", "do it", review=_ctx())
+    inbox()
+    _restart_tasks(monkeypatch)
+
+    assert "[done] finished" in tasks.status("u1")
+    restored = tasks._tasks[first.id]
+    assert restored.result == "saved result"
+    assert restored.started == first.started and restored.finished == first.finished
+    assert restored.instructions == "do it"
+    second, _ = tasks.start("u1", "next", "do next", review=_ctx())
+    inbox()
+    assert second.id > first.id
+
+
+def test_restart_marks_running_interrupted_and_reports_only_once(monkeypatch):
+    first = _leave_running(monkeypatch)
+    _restart_tasks(monkeypatch)
+    notices = []
+    monkeypatch.setattr(tasks, "_notify", lambda uid, text: notices.append((uid, text)))
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: pytest.fail("replayed task"))
+
+    tasks.report_interrupted(all_users=True)
+    restored = tasks._tasks[first.id]
+    assert restored.status == "interrupted" and restored.finished >= first.started
+    assert restored.cancel is not first.cancel
+    assert notices[0][0] == "u1" and f"#{first.id} interrupted" in notices[0][1]
+    assert "may already have completed" in notices[0][1]
+    assert "[interrupted] unfinished" in tasks.status("u1")
+    assert tasks.status("u2") == "No background tasks."
+    assert "No background task" in tasks.cancel("u2", first.id)
+    assert "already interrupted" in tasks.cancel("u1", first.id)
+    _restart_tasks(monkeypatch)
+    tasks.report_interrupted(all_users=True)
+    assert len(notices) == 1
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_unsent_interruption_notice_is_retried_after_restart(monkeypatch, raises):
+    task = _leave_running(monkeypatch)
+    _restart_tasks(monkeypatch)
+
+    def unavailable(*args):
+        if raises:
+            raise RuntimeError("offline")
+        return False
+
+    monkeypatch.setattr(tasks, "_notify", unavailable)
+    tasks.report_interrupted(all_users=True)
+    assert not tasks._tasks[task.id].interruption_reported
+    _restart_tasks(monkeypatch)
+    delivered = []
+    monkeypatch.setattr(tasks, "_notify", lambda uid, text: delivered.append(uid) or True)
+    tasks.report_interrupted(all_users=True)
+    assert delivered == ["u1"]
+
+
+def test_terminal_recovery_does_not_report_gateway_users(monkeypatch):
+    terminal = _leave_running(monkeypatch, user_id=None)
+    gateway = _leave_running(monkeypatch, user_id="u1")
+    _restart_tasks(monkeypatch)
+    delivered = []
+    monkeypatch.setattr(tasks, "_notify", lambda uid, text: delivered.append(uid))
+    tasks.report_interrupted()
+    assert delivered == [None]
+    assert tasks._tasks[terminal.id].interruption_reported
+    assert not tasks._tasks[gateway.id].interruption_reported
+
+
+def test_task_retention_survives_restart_without_reusing_ids(monkeypatch, inbox):
+    monkeypatch.setattr(tasks, "_KEEP_FINISHED", 1)
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: _text("done"))
+    pending = _leave_running(monkeypatch)
+    _restart_tasks(monkeypatch)
+    tasks.status("u1")
+    first, _ = tasks.start("u1", "first", "a", review=_ctx())
+    inbox()
+    second, _ = tasks.start("u1", "second", "b", review=_ctx())
+    inbox()
+    _restart_tasks(monkeypatch)
+    listing = tasks.status("u1")
+    assert f"#{pending.id} [interrupted]" in listing
+    assert f"#{first.id} " not in listing and f"#{second.id} " in listing
+    third, _ = tasks.start("u1", "third", "c", review=_ctx())
+    inbox()
+    assert third.id > second.id
+
+
+def test_new_process_recovers_without_executing_task(monkeypatch):
+    task = _leave_running(monkeypatch)
+    code = """
+import json
+from paulus import tasks
+notices = []
+tasks.set_notifier(lambda uid, text: notices.append([uid, text]))
+tasks.report_interrupted(all_users=True)
+print(json.dumps({'listing': tasks.status('u1'), 'notices': notices}))
+"""
+    env = {**os.environ, "DP_DATA_DIR": str(config.DATA_DIR), "PYTHONIOENCODING": "utf-8"}
+    run = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                         text=True, encoding="utf-8", timeout=15, check=True)
+    recovered = json.loads(run.stdout)
+    assert f"#{task.id} [interrupted]" in recovered["listing"]
+    assert recovered["notices"][0][0] == "u1"
+    assert "has not been resumed" in recovered["notices"][0][1]
 
 
 # --- gateway ------------------------------------------------------------------
@@ -379,8 +510,31 @@ def test_grant_is_not_offered_by_adapters_without_it():
 
 def test_notify_user_sends_to_their_last_chat():
     runner, adapter = _gateway()
-    _off_loop(runner, lambda: runner.notify_user("u1", "task done"))
+    assert _off_loop(runner, lambda: runner.notify_user("u1", "task done")) is True
     assert adapter.sent == [("chat9", "task done")]
+
+
+def test_gateway_startup_reports_recovered_tasks_after_adapter_start(monkeypatch):
+    task = _leave_running(monkeypatch)
+    _restart_tasks(monkeypatch)
+    runner, adapter = _gateway()
+    adapter._state = AdapterState.STOPPED
+    monkeypatch.setattr(config, "IDLE_CHECK_INTERVAL", 0)
+
+    async def start():
+        adapter._state = AdapterState.RUNNING
+
+    monkeypatch.setattr(adapter, "start", start)
+    asyncio.run(runner.start_all())
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0][0] == "chat9"
+    assert f"#{task.id} interrupted" in adapter.sent[0][1]
+    assert tasks._tasks[task.id].interruption_reported
+
+
+def test_notify_user_returns_false_when_delivery_is_unavailable():
+    runner, _ = _gateway()
+    assert _off_loop(runner, lambda: runner.notify_user("unknown", "task done")) is False
 
 
 def test_notify_user_renders_a_pay_link_as_a_link_not_the_marker():

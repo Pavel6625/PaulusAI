@@ -15,19 +15,21 @@ A background task is the agent working on its own, so:
     clears it.
   - it has a step and a time budget, and the owner can /cancel it.
   - it may delegate to subagents, but can't start further tasks.
-  - tasks live in memory: a restart drops running ones. Every start and
-    finish is in the audit log, and each result is logged to the owner's
-    episodic memory, so the next turn knows how it went.
+  - task records survive restarts. Running tasks become interrupted and the
+    owner is notified; work is never automatically replayed. Each result is
+    also logged to the owner's episodic memory.
 """
-import itertools
+import json
+import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from . import config, security
 
-_ids = itertools.count(1)
-_tasks: dict = {}                # id -> Task, for this process's lifetime
+_tasks: dict = {}                # id -> Task, hydrated from the durable store
+_initialized = False
 _lock = threading.Lock()
 _KEEP_FINISHED = 20              # finished tasks remembered per user, for /tasks
 
@@ -46,12 +48,79 @@ class Task:
     user_id: object
     title: str
     instructions: str
-    status: str = "running"      # running | done | failed | cancelled | timed out
+    status: str = "running"      # running | done | failed | cancelled | timed out | stopped | interrupted
     started: float = field(default_factory=time.time)
     finished: float | None = None
     tools_used: list = field(default_factory=list)
+    result: str = ""
+    interruption_reported: bool = False
     cancel: threading.Event = field(default_factory=threading.Event)
     timed_out: bool = False
+
+
+@contextmanager
+def _store():
+    config.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(config.MEMORY_DIR / "tasks.sqlite3")
+    try:
+        with db:
+            db.execute("""CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL, title TEXT NOT NULL, instructions TEXT NOT NULL,
+                status TEXT NOT NULL, started REAL NOT NULL, finished REAL,
+                tools_used TEXT NOT NULL, result TEXT NOT NULL DEFAULT '',
+                interruption_reported INTEGER NOT NULL DEFAULT 0
+            )""")
+            yield db
+    finally:
+        db.close()
+
+
+def _initialize():
+    """Load records once per process (call under _lock). Never replay actions."""
+    global _initialized
+    if _initialized:
+        return
+    with _store() as db:
+        db.execute("""UPDATE tasks SET status = 'interrupted', finished = ?,
+                      result = ? WHERE status = 'running'""",
+                   (time.time(), "The process stopped before this task finished. "
+                    "It has not been resumed; some actions may already have completed."))
+        rows = db.execute("""SELECT id, user_id, title, instructions, status, started,
+                             finished, tools_used, result, interruption_reported
+                             FROM tasks""").fetchall()
+    restored = {}
+    for row in rows:
+        task_id, uid, title, instructions, status_, started, finished, used, result, reported = row
+        restored[task_id] = Task(
+            id=task_id, user_id=json.loads(uid), title=title, instructions=instructions,
+            status=status_, started=started, finished=finished, tools_used=json.loads(used),
+            result=result, interruption_reported=bool(reported))
+    _tasks.update(restored)
+    _initialized = True
+
+
+def report_interrupted(user_id=None, *, all_users=False):
+    """Report recovered tasks after the notifier is ready; retry unsent notices
+    on the next startup. Delivery is best-effort, not an exactly-once outbox."""
+    with _lock:
+        _initialize()
+        pending = [t for t in _tasks.values()
+                   if t.status == "interrupted" and not t.interruption_reported
+                   and (all_users or t.user_id == user_id)]
+    for task in pending:
+        message = f"⚠️ Background task #{task.id} interrupted: {task.title}\n\n{task.result}"
+        try:
+            if _notify(task.user_id, message) is False:
+                continue
+            with _lock:
+                with _store() as db:
+                    db.execute("UPDATE tasks SET interruption_reported = 1 WHERE id = ?",
+                               (task.id,))
+                task.interruption_reported = True
+            security.audit("task_interrupted", f"{task.user_id} #{task.id}")
+        except Exception as exc:
+            security.audit("task_notify_error", f"#{task.id}: {exc}")
 
 
 def _print(user_id, text):
@@ -62,8 +131,9 @@ _notify = _print
 
 
 def set_notifier(fn):
-    """Where finished tasks are announced: fn(user_id, text). The gateway sends
-    to the user's chat; the default prints (the terminal CLI)."""
+    """Where task outcomes are announced: fn(user_id, text). Return False if
+    delivery fails so interruption notices can be retried after a restart.
+    The gateway sends to the user's chat; the default prints (terminal CLI)."""
     global _notify
     _notify = fn
 
@@ -111,13 +181,20 @@ def start(user_id, title, instructions, model=None, review=None):
     if not config.TASKS:
         return None, "Background tasks are turned off (DP_TASKS=0)."
     with _lock:
+        _initialize()
         running = [t for t in _tasks.values()
                    if t.user_id == user_id and t.status == "running"]
         if len(running) >= config.MAX_TASKS_PER_USER:
             return None, (f"Already running {len(running)} background task(s), the "
                           f"limit; wait for one to finish or cancel one.")
-        task = Task(id=next(_ids), user_id=user_id, title=title,
-                    instructions=instructions)
+        started = time.time()
+        with _store() as db:
+            cursor = db.execute("""INSERT INTO tasks
+                (user_id, title, instructions, status, started, tools_used)
+                VALUES (?, ?, ?, 'running', ?, '[]')""",
+                                (json.dumps(user_id), title, instructions, started))
+            task = Task(id=cursor.lastrowid, user_id=user_id, title=title,
+                        instructions=instructions, started=started)
         _tasks[task.id] = task
         _forget_old(user_id)
     security.audit("task_start", f"{user_id} #{task.id} {title}")
@@ -164,7 +241,14 @@ def _run(task, model, review):
     finally:
         timer.cancel()
 
-    task.status, task.finished = status, time.time()
+    with _lock:
+        finished = time.time()
+        with _store() as db:
+            db.execute("""UPDATE tasks SET status = ?, finished = ?, tools_used = ?,
+                          result = ? WHERE id = ?""",
+                       (status, finished, json.dumps(task.tools_used), body, task.id))
+        task.status, task.finished, task.result = status, finished, body
+        _forget_old(task.user_id)
     security.audit("task_" + status.replace(" ", "_"), f"{task.user_id} #{task.id}")
     icon = {"done": "✅", "failed": "⚠️", "cancelled": "🛑", "timed out": "⏲️",
             "stopped": "💳"}[status]
@@ -193,12 +277,14 @@ def cancel(user_id, task_id):
         task_id = int(str(task_id).lstrip("#"))
     except ValueError:
         return "Usage: /cancel <task number>"
-    task = _tasks.get(task_id)
-    if task is None or task.user_id != user_id:
-        return f"No background task #{task_id}."
-    if task.status != "running":
-        return f"Task #{task_id} already {task.status}."
-    task.cancel.set()
+    with _lock:
+        _initialize()
+        task = _tasks.get(task_id)
+        if task is None or task.user_id != user_id:
+            return f"No background task #{task_id}."
+        if task.status != "running":
+            return f"Task #{task_id} already {task.status}."
+        task.cancel.set()
     security.audit("task_cancel", f"{user_id} #{task_id}")
     return f"Cancelling task #{task_id}; it stops at its next step."
 
@@ -214,6 +300,7 @@ def cancel_all():
 def status(user_id):
     """A listing of *user_id*'s tasks, newest first."""
     with _lock:
+        _initialize()
         mine = sorted((t for t in _tasks.values() if t.user_id == user_id),
                       key=lambda t: -t.id)
     if not mine:
@@ -234,5 +321,11 @@ def _forget_old(user_id):
     finished = sorted((t for t in _tasks.values()
                        if t.user_id == user_id and t.status != "running"),
                       key=lambda t: t.id)
-    for t in finished[:-_KEEP_FINISHED]:
-        _tasks.pop(t.id, None)
+    # Keep interruption notices until delivery, even when newer tasks finish.
+    old = [t for t in finished[:-_KEEP_FINISHED]
+           if t.status != "interrupted" or t.interruption_reported]
+    if old:
+        with _store() as db:
+            db.executemany("DELETE FROM tasks WHERE id = ?", [(t.id,) for t in old])
+        for t in old:
+            _tasks.pop(t.id, None)

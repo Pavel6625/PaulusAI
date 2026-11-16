@@ -227,6 +227,10 @@ class GatewayRunner:
                 loop = asyncio.get_running_loop()
                 return await loop.run_in_executor(
                     None, lambda: tasks.start_from_owner(args, user_id=user_id))
+        if command == "resume":
+            self._presence.touch(source)
+            return await asyncio.get_running_loop().run_in_executor(
+                None, lambda: tasks.resume(user_id, args.strip()))
         if command == "tasks":
             return tasks.status(user_id)
         if command == "cancel":

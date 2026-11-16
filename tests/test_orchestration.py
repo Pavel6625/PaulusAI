@@ -452,6 +452,173 @@ print(json.dumps({'listing': tasks.status('u1'), 'notices': notices}))
     assert "has not been resumed" in recovered["notices"][0][1]
 
 
+def test_resume_keeps_completed_results_and_reconciles_uncertain_call(monkeypatch, inbox):
+    replies = iter([_call("recall", {"query": "first"}),
+                    _call("run_command", {"command": "publish"}, "t2")])
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: next(replies))
+    monkeypatch.setattr(security, "clearance", lambda *a, **k: "owner")
+
+    def execute(name, *a, **k):
+        if name == "run_command":
+            raise RuntimeError("connection lost after dispatch")
+        return "saved finding", False
+
+    monkeypatch.setattr(tools, "execute", execute)
+    task, _ = tasks.start("u1", "job", "do it", review=_ctx())
+    inbox()
+    _restart_tasks(monkeypatch)
+    seen = []
+
+    def resumed(system, messages, **kwargs):
+        seen.extend(_results(messages))
+        return _text("reconciled")
+
+    monkeypatch.setattr(llm, "complete", resumed)
+    monkeypatch.setattr(tools, "execute", lambda *a, **k: pytest.fail("replayed"))
+    assert "Resumed" in tasks.resume("u1", task.id)
+    assert "reconciled" in inbox()[1]
+    assert any(r["content"] == "saved finding" for r in seen)
+    assert any("Outcome UNKNOWN" in r["content"] for r in seen)
+
+
+def test_resume_authorization_status_billing_and_fresh_grants(monkeypatch, inbox):
+    from paulus import billing
+    task = _leave_running(monkeypatch)
+    assert "cannot resume" in tasks.resume("u1", task.id)
+    _restart_tasks(monkeypatch)
+    assert "No background task" in tasks.resume("u2", task.id)
+    with monkeypatch.context() as patch:
+        patch.setattr(billing, "gate", lambda uid: (False, "top up"))
+        assert tasks.resume("u1", task.id) == "top up"
+    seen = []
+    original = agent._run_tool_loop
+
+    def loop(*args, **kwargs):
+        seen.append(kwargs["review"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(agent, "_run_tool_loop", loop)
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: _text("done"))
+    assert "Resumed" in tasks.resume("u1", task.id)
+    inbox()
+    assert seen[0].request == "look into it" and not seen[0].grants
+    assert "cannot resume" in tasks.resume("u1", task.id)
+
+
+def test_resume_repairs_partial_multi_tool_response_without_replay(monkeypatch, inbox):
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: llm._Response(
+        stop_reason="tool_use", content=[
+            llm._ToolUseBlock(id=str(i), name="recall", input={"query": str(i)})
+            for i in range(3)]))
+
+    def execute(name, inp, **kwargs):
+        if inp["query"] == "1":
+            raise RuntimeError("interrupted")
+        return "completed first", False
+
+    monkeypatch.setattr(tools, "execute", execute)
+    task, _ = tasks.start("u1", "multi", "work", review=_ctx())
+    inbox()
+    _restart_tasks(monkeypatch)
+    seen = []
+
+    def model(system, messages, **kwargs):
+        seen.extend(_results(messages))
+        return _text("done")
+
+    monkeypatch.setattr(llm, "complete", model)
+    tasks.resume("u1", task.id)
+    inbox()
+    assert [r["tool_use_id"] for r in seen] == ["0", "1", "2"]
+    assert seen[0]["content"] == "completed first"
+    assert "Outcome UNKNOWN" in seen[1]["content"]
+    assert "Not executed" in seen[2]["content"]
+
+
+def test_resume_restores_final_checkpoint_without_model_call(monkeypatch, inbox):
+    task = _leave_running(monkeypatch)
+    tasks._save_progress(task, {"version": 1, "phase": "final", "results": [],
+                               "messages": [{"role": "assistant", "content": [
+                                   {"type": "text", "text": "already finished"}]}]})
+    _restart_tasks(monkeypatch)
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: pytest.fail("repeated final turn"))
+    assert "Resumed" in tasks.resume("u1", task.id)
+    assert "already finished" in inbox()[1]
+
+
+def test_resume_rejects_legacy_and_corrupt_progress(monkeypatch):
+    task = _leave_running(monkeypatch)
+    _restart_tasks(monkeypatch)
+    tasks.status("u1")
+    with tasks._store() as db:
+        db.execute("UPDATE task_progress SET state = '{}' WHERE task_id = ?", (task.id,))
+    assert "unreadable" in tasks.resume("u1", task.id)
+    assert tasks._tasks[task.id].status == "interrupted"
+    with tasks._store() as db:
+        db.execute("DELETE FROM task_progress WHERE task_id = ?", (task.id,))
+    assert "No saved checkpoint" in tasks.resume("u1", task.id)
+
+
+def test_fresh_process_resumes_saved_tool_boundary(monkeypatch):
+    task = _leave_running(monkeypatch)
+    tasks._save_progress(task, {"version": 1, "phase": "executing", "current": "b",
+                               "results": [{"type": "tool_result", "tool_use_id": "a",
+                                            "content": "completed result", "is_error": False}],
+                               "messages": [{"role": "assistant", "content": [
+                                   {"type": "tool_use", "id": key, "name": "recall", "input": {}}
+                                   for key in ("a", "b", "c")]}]})
+    code = """
+import json
+import threading
+from paulus import billing, llm, tasks
+finished = threading.Event()
+seen = []
+def model(system, messages, **kwargs):
+    results = messages[1]['content']
+    assert results[0]['content'] == 'completed result'
+    assert 'Outcome UNKNOWN' in results[1]['content']
+    assert 'Not executed' in results[2]['content']
+    return llm._Response(content=[llm._TextBlock(text='recovered')])
+def notify(uid, text):
+    seen.append(text)
+    finished.set()
+llm.complete = model
+billing.gate = lambda uid: (True, '')
+tasks.set_notifier(notify)
+reply = tasks.resume('u1', TASK_ID)
+assert finished.wait(10), reply
+assert tasks._tasks[TASK_ID].status == 'done', seen
+print(json.dumps({'reply': reply, 'result': seen[0]}))
+""".replace("TASK_ID", str(task.id))
+    env = {**os.environ, "DP_DATA_DIR": str(config.DATA_DIR), "DP_BILLING_API_BASE": "",
+           "PYTHONIOENCODING": "utf-8"}
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                            text=True, encoding="utf-8", timeout=20, check=True)
+    assert "recovered" in json.loads(result.stdout)["result"]
+
+
+def test_duplicate_resume_cannot_launch_two_workers(monkeypatch):
+    task = _leave_running(monkeypatch)
+    _restart_tasks(monkeypatch)
+    launched = []
+    monkeypatch.setattr(threading.Thread, "start", lambda thread: launched.append(thread))
+    assert "Resumed" in tasks.resume("u1", task.id)
+    assert "cannot resume" in tasks.resume("u1", task.id)
+    assert len(launched) == 1
+
+
+def test_checkpoint_failure_prevents_tool_execution(monkeypatch):
+    monkeypatch.setattr(llm, "complete", lambda *a, **k: _call("recall", {}))
+    monkeypatch.setattr(tools, "execute", lambda *a, **k: pytest.fail("unrecorded action"))
+
+    def save(state):
+        if state["phase"] == "executing":
+            raise OSError("disk full")
+
+    with pytest.raises(OSError, match="disk full"):
+        agent._run_tool_loop("sys", [], checkpoint=save)
+
+
 # --- gateway ------------------------------------------------------------------
 
 def test_approval_prompt_names_the_actor_and_the_grant():
@@ -552,6 +719,7 @@ def test_task_commands_in_chat(monkeypatch):
     src = SessionSource("telegram", "chat9", "u1")
     assert asyncio.run(runner.handle_command(src, "tasks")) == "No background tasks."
     assert asyncio.run(runner.handle_command(src, "cancel", "#9")) == "No background task #9."
+    assert asyncio.run(runner.handle_command(src, "resume", "#9")) == "No background task #9."
 
 
 def test_telegram_allow_for_task_button(monkeypatch):

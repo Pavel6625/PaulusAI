@@ -151,7 +151,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app.add_handler(CommandHandler("reset", self._on_reset))
         # The terminal CLI's in-chat commands, mirrored over Telegram. Routed
         # to the runner so the behaviour stays identical across surfaces.
-        for cmd in ("sleep", "mood", "memory", "skills", "bg", "tasks", "cancel"):
+        for cmd in ("sleep", "mood", "memory", "skills", "bg", "tasks", "cancel", "resume"):
             self._app.add_handler(CommandHandler(cmd, self._on_command))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
         await self._app.initialize()

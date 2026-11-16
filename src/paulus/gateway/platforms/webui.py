@@ -37,7 +37,7 @@ _HISTORY_LIMIT = 100
 # Base64 inflates by a third; leave room for an image near the size cap.
 _WS_MAX_MSG = 16 * 1024 * 1024
 _IMAGE_MAX_BYTES = 10 * 1024 * 1024
-_COMMANDS = ("sleep", "mood", "memory", "skills", "bg", "tasks", "cancel")
+_COMMANDS = ("sleep", "mood", "memory", "skills", "bg", "tasks", "cancel", "resume")
 # Event types that are worth keeping for a tab that wasn't connected. Deltas and
 # typing are transient; a committed segment or final carries the whole text.
 _DURABLE = frozenset({"message", "segment", "final", "document"})

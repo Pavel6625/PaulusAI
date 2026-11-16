@@ -62,6 +62,7 @@ class Task:
 def _store():
     config.MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(config.MEMORY_DIR / "tasks.sqlite3")
+    db.execute("PRAGMA foreign_keys = ON")
     try:
         with db:
             db.execute("""CREATE TABLE IF NOT EXISTS tasks (
@@ -70,6 +71,10 @@ def _store():
                 status TEXT NOT NULL, started REAL NOT NULL, finished REAL,
                 tools_used TEXT NOT NULL, result TEXT NOT NULL DEFAULT '',
                 interruption_reported INTEGER NOT NULL DEFAULT 0
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS task_progress (
+                task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                owner_request TEXT NOT NULL, state TEXT NOT NULL
             )""")
             yield db
     finally:
@@ -85,7 +90,8 @@ def _initialize():
         db.execute("""UPDATE tasks SET status = 'interrupted', finished = ?,
                       result = ? WHERE status = 'running'""",
                    (time.time(), "The process stopped before this task finished. "
-                    "It has not been resumed; some actions may already have completed."))
+                    "It has not been resumed; some actions may already have completed. "
+                    "Use /resume <task number> to continue from saved progress, if available."))
         rows = db.execute("""SELECT id, user_id, title, instructions, status, started,
                              finished, tools_used, result, interruption_reported
                              FROM tasks""").fetchall()
@@ -195,6 +201,10 @@ def start(user_id, title, instructions, model=None, review=None):
                                 (json.dumps(user_id), title, instructions, started))
             task = Task(id=cursor.lastrowid, user_id=user_id, title=title,
                         instructions=instructions, started=started)
+            db.execute("INSERT INTO task_progress VALUES (?, ?, ?)",
+                       (task.id, review.request if review is not None else "",
+                        json.dumps({"version": 1, "messages": [], "phase": "new",
+                                    "results": [], "current": None, "enabled": []})))
         _tasks[task.id] = task
         _forget_old(user_id)
     security.audit("task_start", f"{user_id} #{task.id} {title}")
@@ -204,7 +214,118 @@ def start(user_id, title, instructions, model=None, review=None):
     return task, None
 
 
-def _run(task, model, review):
+def _save_progress(task, state):
+    with _lock:
+        with _store() as db:
+            saved = db.execute("UPDATE task_progress SET state = ? WHERE task_id = ?",
+                               (json.dumps(state), task.id)).rowcount
+            if saved != 1:
+                raise RuntimeError("Task checkpoint is missing; refusing unrecorded execution.")
+            db.execute("UPDATE tasks SET tools_used = ? WHERE id = ?",
+                       (json.dumps(task.tools_used), task.id))
+
+
+def _validate_progress(state):
+    if not isinstance(state, dict) or state.get("version") != 1:
+        raise ValueError("Unsupported checkpoint version")
+    messages = state.get("messages")
+    phase = state.get("phase")
+    if not isinstance(messages, list) or phase not in {"new", "model", "tools", "executing", "final"}:
+        raise ValueError("Invalid checkpoint")
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
+            raise ValueError("Invalid checkpoint message")
+        if not isinstance(message.get("content"), (str, list)):
+            raise ValueError("Invalid checkpoint content")
+    if phase in {"tools", "executing", "final"}:
+        if not messages or messages[-1]["role"] != "assistant" or not isinstance(messages[-1]["content"], list):
+            raise ValueError("Missing assistant turn")
+        blocks = messages[-1]["content"]
+        calls = {b["id"] for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"}
+        results = state.get("results", [])
+        if not isinstance(results, list) or any(
+            not isinstance(r, dict) or r.get("tool_use_id") not in calls for r in results
+        ):
+            raise ValueError("Invalid checkpoint results")
+        if phase == "executing" and state.get("current") not in calls:
+            raise ValueError("Missing executing tool")
+
+
+def _resume_messages(state):
+    from . import agent
+    messages = state["messages"]
+    if state["phase"] in ("tools", "executing"):
+        results = list(state.get("results", []))
+        answered = {r["tool_use_id"] for r in results}
+        for block in messages[-1]["content"]:
+            if block.get("type") != "tool_use" or block["id"] in answered:
+                continue
+            uncertain = block["id"] == state.get("current")
+            note = ("Outcome UNKNOWN: this tool may have executed before interruption. "
+                    "Reconcile its effects using read-only checks or ask the owner before "
+                    "any retry; do not assume failure." if uncertain else
+                    "Not executed: task interrupted before this call. Reassess the next step.")
+            results.append(agent._tool_result(block["id"], note, is_error=True))
+        messages.append({"role": "user", "content": results})
+    agent._append_user(messages, "[Owner explicitly resumed this task.] Continue from the saved "
+                       "results, not from scratch. No earlier approval grants remain. "
+                       "Never blindly repeat an action whose outcome is unknown.")
+    return messages
+
+
+def resume(user_id, task_id):
+    """Explicit owner command; atomic claim prevents concurrent duplicate resumes."""
+    from . import agent, billing
+    if not config.TASKS:
+        return "Background tasks are turned off (DP_TASKS=0)."
+    try:
+        task_id = int(str(task_id).lstrip("#"))
+    except ValueError:
+        return "Usage: /resume <task number>"
+    with _lock:
+        _initialize()
+        task = _tasks.get(task_id)
+        if task is None or task.user_id != user_id:
+            return f"No background task #{task_id}."
+        if task.status not in {"interrupted", "failed", "cancelled", "timed out", "stopped"}:
+            return f"Task #{task_id} cannot resume while {task.status}."
+        with _store() as db:
+            row = db.execute("SELECT owner_request, state FROM task_progress WHERE task_id = ?",
+                             (task_id,)).fetchone()
+        if row is None:
+            return "No saved checkpoint for this task; start a new request with /bg."
+        if sum(t.user_id == user_id and t.status == "running" for t in _tasks.values()) >= config.MAX_TASKS_PER_USER:
+            return "Background task limit reached; wait or cancel a task first."
+        allowed, block = billing.gate(user_id)
+        if not allowed:
+            return block
+        try:
+            state = json.loads(row[1])
+            _validate_progress(state)
+        except (ValueError, KeyError, TypeError):
+            return "Checkpoint unreadable; start a new request with /bg."
+        review = agent._review_context(row[0], user_id) if row[0] else None
+        with _store() as db:
+            db.execute("UPDATE tasks SET status = 'running', finished = NULL, "
+                       "interruption_reported = 0 WHERE id = ?", (task_id,))
+        task.status, task.finished = "running", None
+        task.cancel, task.timed_out = threading.Event(), False
+    security.audit("task_resume", f"{user_id} #{task_id}")
+    try:
+        threading.Thread(target=_run, args=(task, config.TASK_MODEL or config.chat_model(), review),
+                         kwargs={"resuming": True}, name=f"paulus-task-{task.id}", daemon=True).start()
+    except Exception as exc:
+        with _lock:
+            with _store() as db:
+                db.execute("UPDATE tasks SET status = 'interrupted', finished = ? WHERE id = ?",
+                           (time.time(), task_id))
+            task.status, task.finished = "interrupted", time.time()
+        security.audit("task_resume_error", f"{user_id} #{task_id}: {exc}")
+        return f"Could not start task #{task_id}; its saved progress is unchanged. Try /resume again."
+    return f"Resumed background task #{task_id} from its saved progress."
+
+
+def _run(task, model, review, resuming=False):
     from . import agent, billing, memory, tools
     security.BACKGROUND.set(True)        # this thread's context: no console prompts
     timer = threading.Timer(config.TASK_MAX_MINUTES * 60, _time_out, args=(task,))
@@ -214,17 +335,30 @@ def _run(task, model, review):
     pay_link = ""
     try:
         system = agent._build_system(task.user_id, specs) + BRIEF
-        messages = agent._history_to_messages(task.user_id)
-        agent._append_user(messages, f"[Background task #{task.id}: {task.title}]\n"
-                                     f"{task.instructions}")
+        with _store() as db:
+            saved = db.execute("SELECT state FROM task_progress WHERE task_id = ?",
+                               (task.id,)).fetchone()
+        state = json.loads(saved[0]) if saved else None
+        if resuming and state:
+            _validate_progress(state)
+        if resuming and state and state["messages"]:
+            messages = _resume_messages(state) if state["phase"] != "final" else state["messages"]
+        else:
+            messages = agent._history_to_messages(task.user_id)
+            agent._append_user(messages, f"[Background task #{task.id}: {task.title}]\n"
+                                         f"{task.instructions}")
         # A fresh thread doesn't inherit the starting turn's meter, so the task
         # meters itself: every token it spends is billed, and it stops at its
         # next model call once the balance runs out.
         with billing.metered(task.user_id, kind="task"):
-            result = agent._run_tool_loop(
-                system, messages, task.user_id, model=model, tools_used=task.tools_used,
-                review=review, specs=specs, max_steps=config.TASK_MAX_STEPS,
-                cancel=task.cancel, origin=f"background task #{task.id} ({task.title})")
+            if resuming and state and state["phase"] == "final":
+                result = "".join(b["text"] for b in messages[-1]["content"] if b.get("type") == "text")
+            else:
+                result = agent._run_tool_loop(
+                    system, messages, task.user_id, model=model, tools_used=task.tools_used,
+                    review=review, specs=specs, max_steps=config.TASK_MAX_STEPS,
+                    cancel=task.cancel, origin=f"background task #{task.id} ({task.title})",
+                    checkpoint=lambda state: _save_progress(task, state))
         status, body = "done", result.strip() or "(no report)"
     except billing.BalanceExhausted as exc:
         status, body = "stopped", str(exc)

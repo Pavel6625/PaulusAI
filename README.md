@@ -191,6 +191,7 @@ In-chat commands:
 | `/bg X`   | Run `X` as a [background task](#subagents-and-background-tasks) |
 | `/tasks`  | List background tasks and their progress                       |
 | `/cancel N` | Cancel background task `N`                                   |
+| `/resume N` | Resume an interrupted or stopped task from saved progress     |
 | `/mcp`    | List [MCP servers](#mcp-servers), their tools and which need approval |
 | `/quit`   | Consolidate and exit                                          |
 
@@ -325,6 +326,34 @@ wrote), and their approval prompts say who is asking (`From: background task
   belongs to the turn that started it, so it isn't gated again. Either way,
   every token a task spends is billed, and a task whose user runs out of
   balance stops at its next model call (`💳 ... stopped`, with a top-up link).
+
+#### Resuming task progress
+
+Use `/resume N` in the terminal, Telegram, or Web UI to explicitly continue an
+interrupted, failed, cancelled, timed-out, or balance-stopped task. Nothing resumes
+automatically. Tasks created before checkpoint support have no saved continuation;
+start a new `/bg` request for those.
+
+Progress is stored in the `task_progress` table alongside the task in
+`memory/tasks.sqlite3`, keeping retention and updates transactional. It includes
+the original owner request, conversation, completed tool results, pending calls,
+and the current execution boundary. This may contain sensitive tool outputs;
+protect the data directory just like episodic memory. No live threads, futures,
+OAuth tokens, or approval grants are serialized as continuation state.
+
+On resume, the task keeps its ID and completed results. Calls that had not started
+are marked unexecuted for reassessment; a call interrupted during execution is
+marked **outcome unknown**. The agent is instructed to reconcile its effects with
+read-only checks or owner input rather than blindly repeat it. This is not an
+exactly-once guarantee for external side effects. Subagent internals are not
+checkpointed; an interrupted delegation must likewise be reconciled.
+
+Resuming checks ownership, balance and the running-task cap, gets a fresh time and
+step budget, and uses the current configured model and available tools. Previously
+enabled MCP toolsets must be enabled again; old permissions never carry over.
+Every new action still goes through the normal safety gate. Checkpoint writes occur
+before action dispatch; a failed write stops the task instead of running an
+unrecorded action. Progress is deleted with the task's retained record.
 
 ### Durable timers
 

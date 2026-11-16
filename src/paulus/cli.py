@@ -13,6 +13,7 @@ Commands:
   /bg X     run X as a background task; its result is printed when done
   /tasks    list background tasks
   /cancel N cancel background task N
+  /resume N resume a stopped task from its saved progress
   /mcp      list connected MCP servers and their tools
   /quit     consolidate and exit
 """
@@ -56,6 +57,9 @@ def main():
             continue
         if text == "/bg" or text.startswith("/bg "):
             print(tasks.start_from_owner(text[len("/bg"):]))
+            continue
+        if text == "/resume" or text.startswith("/resume "):
+            print(tasks.resume(None, text[len("/resume"):].strip()))
             continue
         if text == "/tasks":
             print(tasks.status(None))

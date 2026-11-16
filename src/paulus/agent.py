@@ -181,7 +181,8 @@ def _unavailable(name, offered, user_id):
 
 def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
                    tools_used=None, review=None, specs=None, max_steps=None,
-                   cancel=None, origin=None, feel=True, on_break=None):
+                   cancel=None, origin=None, feel=True, on_break=None,
+                   checkpoint=None):
     """Drive the model<->tool exchange, with the safety gate between the
     model's decision and any real-world effect. Returns the final text.
 
@@ -217,12 +218,22 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
     passed to the gate and extended with each action that runs, labelled with
     how it was cleared. It also carries the owner's grants for the task.
     ``None`` means the owner didn't ask for this turn, so nothing in it is
-    auto-approved or granted."""
+    auto-approved or granted. *checkpoint*, when provided, durably records the
+    transcript, partial tool results and execution boundary before any action.
+    A failed save aborts the loop rather than running an unrecorded action."""
     specs = list(tools.TOOL_SPECS if specs is None else specs)
     offered = {s["name"] for s in specs}
     enabled = set()                      # toolsets switched on in this loop
     steps = 0
+
+    def save(phase, results=None, current=None):
+        if checkpoint is not None:
+            checkpoint({"version": 1, "messages": messages, "phase": phase,
+                        "results": list(results or []), "current": current,
+                        "enabled": sorted(enabled)})
+
     while True:
+        save("model")
         _check(cancel)
         if on_delta is not None:
             resp = llm.stream(system, messages, tools=specs,
@@ -233,7 +244,9 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
         text = "".join(b.text for b in resp.content if b.type == "text")
 
         if resp.stop_reason != "tool_use":
+            save("final")
             return text
+        save("tools")
 
         steps += 1
         over = max_steps is not None and steps > max_steps
@@ -250,6 +263,7 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
             if over:
                 tool_results.append(_tool_result(b.id, _BUDGET_NOTE, is_error=True))
                 continue
+            save("tools", tool_results)
             _check(cancel)
             if b.name not in offered:
                 tool_results.append(_tool_result(
@@ -268,6 +282,8 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
                     tool_results.append(_tool_result(b.id, _DECLINED_NOTE))
                     continue
 
+            _check(cancel)
+            save("executing", tool_results, b.id)
             if b.name in tools.TOOLSET_TOOLS:
                 result, is_error, added = _toolset(b.name, b.input, user_id, enabled)
                 if added is not None:
@@ -287,6 +303,7 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
                 if b.name in ("remember", "save_skill") and not is_error:
                     affect.feel("new_learning")
             tool_results.append(_tool_result(b.id, result, is_error))
+            save("tools", tool_results)
 
         messages.append({"role": "user", "content": tool_results})
 

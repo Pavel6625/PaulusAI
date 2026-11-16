@@ -224,7 +224,43 @@ TASK_STATUS_SPEC = {
     "description": "List the owner's background tasks with their status and progress.",
     "input_schema": {"type": "object", "properties": {}},
 }
-ORCHESTRATION_TOOLS = {"delegate", "start_task", "task_status"}
+TIMER_SPECS = [
+    {
+        "name": "create_timer",
+        "description": "Schedule a fixed reminder or a billed background agent run for the owner. "
+                       "Requires a running gateway and approval. Provide a future ISO timestamp "
+                       "with UTC offset in at, OR a five-field cron expression and IANA timezone "
+                       "(default UTC). Missed cron occurrences coalesce into one run on startup. "
+                       "Agent runs get fresh safety review, never old grants. Explicit schedules "
+                       "fire even during quiet hours. Do not invent the owner's timezone.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "payload": {"type": "string", "description": "Reminder text or complete agent instructions."},
+                "kind": {"type": "string", "enum": ["reminder", "agent"]},
+                "at": {"type": "string", "description": "One-shot ISO timestamp including offset or Z."},
+                "cron": {"type": "string", "description": "minute hour day month weekday"},
+                "timezone": {"type": "string", "description": "IANA zone, e.g. Europe/Moscow; default UTC."},
+            },
+            "required": ["title", "payload", "kind"],
+        },
+    },
+    {
+        "name": "list_timers",
+        "description": "List the owner's persisted timers, next due times and last outcomes.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cancel_timer",
+        "description": "Cancel an owner's scheduled timer. Cannot stop an occurrence already firing; "
+                       "cancel its background task separately if needed.",
+        "input_schema": {"type": "object", "properties": {"timer_id": {"type": "integer"}},
+                         "required": ["timer_id"]},
+    },
+]
+TIMER_TOOLS = {s["name"] for s in TIMER_SPECS}
+ORCHESTRATION_TOOLS = {"delegate", "start_task", "task_status"} | TIMER_TOOLS
 
 # On-demand MCP toolsets (config.MCP_ON_DEMAND). Enabling changes the tool list
 # of the running loop, so agent.py dispatches these too. Enabling a toolset
@@ -275,6 +311,8 @@ def agent_specs(tasks=True, user_id=None):
         specs.append(TASK_STATUS_SPEC)
         if tasks:
             specs.append(START_TASK_SPEC)
+    if tasks and user_id is not None:
+        specs += TIMER_SPECS
     if not config.MCP_ON_DEMAND:
         specs += mcp_client.specs(user_id)
     elif mcp_client.toolsets(user_id):

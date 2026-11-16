@@ -4,6 +4,8 @@
 
 litellm>=1.40,<2
 python-dotenv>=1.0,<2
+croniter>=2,<7
+tzdata>=2024.1; sys_platform == 'win32'
 chromadb>=0.5,<2
 python-telegram-bot>=21.0,<23
 telegramify-markdown>=1.0,<2

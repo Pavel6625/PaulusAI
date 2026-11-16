@@ -20,7 +20,7 @@ from . import config, grants
 # These ALWAYS require owner confirmation. A yes covers one action, unless the
 # owner explicitly widens it to "similar actions for this task" (grants.py).
 HIGH_IMPACT_TOOLS = {"write_local_file", "send_message", "send_document", "run_command",
-                     "send_email_agentmail"}
+                     "send_email_agentmail", "create_timer", "cancel_timer"}
 
 # The owner's answer that approves this action AND grants similar ones for the
 # rest of the task. Truthy, so code that only asks "approved?" still works.

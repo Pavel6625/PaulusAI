@@ -133,8 +133,16 @@ def _execute(name, tool_input, user_id, model, review, cancel):
     tools.execute."""
     if name not in tools.ORCHESTRATION_TOOLS:
         return tools.execute(name, tool_input, user_id=user_id)
-    from . import subagents, tasks  # lazy: both import this module
+    from . import subagents, tasks, timers  # lazy: orchestration imports this module
     try:
+        if name in tools.TIMER_TOOLS:
+            if review is None:
+                return "Only owner-requested turns can manage timers.", True
+            if name == "create_timer":
+                return timers.create(tool_input, user_id, review.request)
+            if name == "cancel_timer":
+                return timers.cancel(tool_input.get("timer_id"), user_id)
+            return timers.listing(user_id), False
         if name == "delegate":
             return subagents.delegate(tool_input, user_id=user_id, model=model,
                                       review=review, cancel=cancel)

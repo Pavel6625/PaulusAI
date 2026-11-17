@@ -178,6 +178,55 @@ def test_background_never_prompts_at_the_console(monkeypatch):
         security.BACKGROUND.reset(token)
 
 
+def test_deferred_approval_hook_replaces_prompt_and_must_raise(gateway):
+    runner = gateway(True)
+    seen = []
+
+    def defer(**request):
+        seen.append(request)
+        raise security.DeferredInteraction("d-1")
+
+    with pytest.raises(security.DeferredInteraction):
+        security.clearance("run_command", {"command": "pytest"}, "u", _ctx(),
+                           origin="worker", on_approval=defer)
+    assert seen == [{"tool_name": "run_command", "tool_input": {"command": "pytest"},
+                     "user_id": "u", "concern": None, "origin": "worker", "grantable": True}]
+    assert runner.asked == []
+    assert security.clearance("run_command", {"command": "ls"}, "u", _ctx(),
+                              on_approval=lambda **request: True) is None
+
+
+def test_deferred_approval_hook_follows_grants_and_auto_review(gateway, monkeypatch):
+    runner = gateway(True)
+    monkeypatch.setattr(config, "PERMISSION_MODE", "auto")
+    monkeypatch.setattr(automode, "review",
+                        lambda *a: automode.Verdict(allow=True, reason="safe"))
+    def fail(**request):
+        pytest.fail("prompted")
+
+    assert security.clearance("run_command", {"command": "ls"}, "u", _ctx(),
+                              on_approval=fail) == "auto"
+
+    ctx = _ctx()
+    ctx.grants.add("run_command:pytest")
+    assert security.clearance("run_command", {"command": "pytest -q"}, "u", ctx,
+                              on_approval=fail) == "grant"
+
+    monkeypatch.setattr(automode, "review",
+                        lambda *a: automode.Verdict(allow=False, reason="check this"))
+    seen = []
+
+    def defer(**request):
+        seen.append(request)
+        raise security.DeferredInteraction("d-2")
+
+    with pytest.raises(security.DeferredInteraction):
+        security.clearance("run_command", {"command": "ls"}, "u", _ctx(),
+                           on_approval=defer)
+    assert seen[0]["concern"] == "check this"
+    assert runner.asked == []
+
+
 # --- what the reviewer sees ----------------------------------------------------
 
 def test_render_labels_how_each_earlier_action_was_cleared():

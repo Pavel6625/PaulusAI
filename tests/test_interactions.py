@@ -93,6 +93,25 @@ def test_processing_before_execution_is_recovered_to_answered():
     assert interactions.claim(request, now=107) is None
 
 
+def test_foreground_continuation_claim_is_atomic_and_recovers_once():
+    request = new(run_id="turn:1", task_id=None)
+    assert interactions.answer(request, "u1", SOURCE, "approve", now=101)
+    assert interactions.claim(request, now=102)
+    assert interactions.begin_execution(request, now=103)
+    state = {"phase": "model", "messages": [{"role": "user", "content": "saved result"}]}
+    assert interactions.finish(request, RESULT, continuation=state, now=104)
+    assert [r["id"] for r in interactions.ready_continuations()] == [request]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        claimed = list(pool.map(lambda _: interactions.claim_continuation(request, now=105), range(8)))
+    assert sum(r is not None for r in claimed) == 1
+    assert interactions.get(request)["tool_result"] == RESULT
+    assert interactions.recover(now=106) == []
+    assert interactions.claim_continuation(request, now=107)["checkpoint"] == state
+    assert interactions.complete_continuation(request, now=108)
+    interactions.recover(now=109)
+    assert not interactions.claim_continuation(request, now=110)
+
+
 def test_denial_and_clarification_are_correlated_and_cannot_execute():
     denied = new()
     assert not interactions.answer(denied, "u1", SOURCE, "all", now=101)

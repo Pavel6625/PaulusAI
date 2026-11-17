@@ -191,7 +191,8 @@ In-chat commands:
 | `/bg X`   | Run `X` as a [background task](#subagents-and-background-tasks) |
 | `/tasks`  | List background tasks and their progress                       |
 | `/cancel N` | Cancel background task `N`                                   |
-| `/resume N` | Resume an interrupted or stopped task from saved progress     |
+| `/resume ID` | Resume a stopped task or retry a deferred interaction when prompted |
+| `/answer ID text` | Gateway only: answer a pending question in its original chat/thread |
 | `/mcp`    | List [MCP servers](#mcp-servers), their tools and which need approval |
 | `/quit`   | Consolidate and exit                                          |
 
@@ -319,6 +320,9 @@ wrote), and their approval prompts say who is asking (`From: background task
   retried on the next startup; delivery is best-effort and can duplicate if the
   process stops just after sending. Tasks are **not automatically resumed**:
   some external actions may already have completed, so check before retrying.
+  A task waiting on a deferred question or approval remains suspended; its
+  already-recorded answer can be continued after restart. Prompts expire after
+  12 hours. Approval applies only to the single displayed action, not a task grant.
   The latest 20 finished tasks per owner are kept, along with any undelivered
   interruption notices. Each start and finish is also in `audit.log`
   (`task_start`, `task_done`, ...).
@@ -330,8 +334,8 @@ wrote), and their approval prompts say who is asking (`From: background task
 #### Resuming task progress
 
 Use `/resume N` in the terminal, Telegram, or Web UI to explicitly continue an
-interrupted, failed, cancelled, timed-out, or balance-stopped task. Nothing resumes
-automatically. Tasks created before checkpoint support have no saved continuation;
+interrupted, failed, cancelled, timed-out, or balance-stopped task. Ordinary
+interrupted tasks do not resume automatically. Tasks created before checkpoint support have no saved continuation;
 start a new `/bg` request for those.
 
 Progress is stored in the `task_progress` table alongside the task in
@@ -354,6 +358,36 @@ enabled MCP toolsets must be enabled again; old permissions never carry over.
 Every new action still goes through the normal safety gate. Checkpoint writes occur
 before action dispatch; a failed write stops the task instead of running an
 unrecorded action. Progress is deleted with the task's retained record.
+
+#### Deferred approvals and clarification
+
+In gateway conversations, `request_input` lets the agent pause for a clarification
+instead of guessing. Answer with `/answer ID your response` in the **original
+chat and thread**. Ordinary messages remain normal conversation and never silently
+answer a pending question. The same mechanism works for background tasks; waiting
+releases the worker and conversation lock rather than blocking other messages.
+
+High-impact actions that need an interactive decision use persistent Approve/Deny
+prompts. Only the intended owner, still trusted by the adapter, can decide. Deferred
+approval covers exactly the saved action and arguments, not an "Allow for this
+task" grant. Existing auto-review and grant checks still run before requesting a
+new decision. Idle checks and restricted subagents do not get `request_input`.
+Terminal approval behavior is unchanged.
+
+Requests expire after **12 hours**. Questions resume with an explicit missing-answer
+result; expired approvals are denied. Pending requests are re-presented on gateway
+startup. Answered requests and saved foreground continuations can recover without
+repeating approved actions. Unexecuted sibling calls are reported to the model for
+reassessment, not replayed. Cancelling a suspended background task invalidates its
+pending request; stale or duplicate replies cannot dispatch it again.
+
+Interaction checkpoints, decisions and results are stored in the data directory's
+`memory/tasks.sqlite3`; protect it like other memory. A crash after action dispatch
+but before its result is durably recorded leaves an **unknown outcome**, requiring
+reconciliation rather than automatic replay. Delivery is not exactly once: a crash
+immediately after sending a final reply may cause that reply to appear twice.
+Run only one gateway process per data directory. Old experimental records already
+marked applied cannot safely be auto-migrated into resumable foreground runs.
 
 ### Durable timers
 

@@ -5,8 +5,10 @@ import asyncio
 import concurrent.futures
 import itertools
 import time
+import uuid
+from dataclasses import asdict
 
-from .. import billing, config, grants, security
+from .. import billing, config, grants, interactions, security
 from .base import SILENCE_TOKENS, AdapterState, BasePlatformAdapter, SessionSource
 from .presence import PresenceStore
 from .session_store import SessionStore
@@ -139,13 +141,23 @@ class GatewayRunner:
             user_id = str(source.user_id)
             on_delta = sink.feed if sink else None
             on_break = sink.end_segment if sink else None
+            def respond():
+                from .. import tasks
+                token = tasks.INTERACTION_SOURCE.set(asdict(source))
+                try:
+                    options = {}
+                    if self._loop is not None:
+                        options["on_interaction"] = self._interaction_callback(
+                            source, f"turn:{uuid.uuid4().hex}", tagged)
+                    return _agent.respond(tagged, user_id=user_id, on_delta=on_delta,
+                                          images=images, documents=documents,
+                                          on_break=on_break, **options)
+                finally:
+                    tasks.INTERACTION_SOURCE.reset(token)
             try:
-                reply = await loop.run_in_executor(
-                    None,
-                    lambda: _agent.respond(tagged, user_id=user_id, on_delta=on_delta,
-                                           images=images, documents=documents,
-                                           on_break=on_break),
-                )
+                reply = await loop.run_in_executor(None, respond)
+            except security.DeferredInteraction as exc:
+                reply = f"Waiting for your response to {exc.request_id}."
             except Exception as exc:        # model/tool failure mid-turn
                 error = exc
 
@@ -219,18 +231,55 @@ class GatewayRunner:
         from .. import affect, memory, skills, tasks
         user_id = str(source.user_id)
 
+        if command == "answer":
+            parts = args.strip().split(None, 1)
+            if len(parts) != 2:
+                return "Usage: /answer <id> <text>"
+            request_id, answer = parts
+            record = interactions.get(request_id)
+            if record is None or record["kind"] != "input" or not interactions.answer(
+                    request_id, user_id, asdict(source), answer):
+                return "That question is unavailable or has already been answered."
+            asyncio.create_task(self._resume_interaction(record["id"], source))
+            return f"Answer received for {request_id}; resuming."
+
         if command == "bg":
             # Starting a task is quick (routing + a thread), but it reads and
             # writes memory, so it takes the same path as a turn.
             self._presence.touch(source)
             async with self._agent_lock:
                 loop = asyncio.get_running_loop()
-                return await loop.run_in_executor(
-                    None, lambda: tasks.start_from_owner(args, user_id=user_id))
+                def start_task():
+                    token = tasks.INTERACTION_SOURCE.set(asdict(source))
+                    try:
+                        return tasks.start_from_owner(args, user_id=user_id)
+                    finally:
+                        tasks.INTERACTION_SOURCE.reset(token)
+                return await loop.run_in_executor(None, start_task)
         if command == "resume":
             self._presence.touch(source)
+            request_id = args.strip()
+            interaction_id = request_id[2:] if request_id.startswith("d-") else request_id
+            record = interactions.get(interaction_id)
+            if record is not None:
+                if record["user_id"] != user_id or any(
+                    record["source"].get(k) != asdict(source).get(k)
+                    for k in ("platform", "chat_id", "user_id", "thread_id")
+                ):
+                    return "That interaction is unavailable."
+                if record["status"] in {"answered", "expired"}:
+                    if record["kind"] == "approval" and record["decision"] == "approve":
+                        adapter = self._adapters.get(source.platform)
+                        if adapter is None or not adapter.can_approve(user_id):
+                            return "That interaction is unavailable."
+                    asyncio.create_task(self._resume_interaction(interaction_id, source))
+                    return f"Resuming interaction {interaction_id}."
+                if interactions.continuation_ready(interaction_id):
+                    asyncio.create_task(self._resume_interaction(interaction_id, source, continuation=True))
+                    return f"Resuming interaction {interaction_id}."
+                return "That interaction is not ready to resume."
             return await asyncio.get_running_loop().run_in_executor(
-                None, lambda: tasks.resume(user_id, args.strip()))
+                None, lambda: tasks.resume(user_id, request_id))
         if command == "tasks":
             return tasks.status(user_id)
         if command == "cancel":
@@ -367,6 +416,297 @@ class GatewayRunner:
     # Interactive approval of high-impact actions
     # ------------------------------------------------------------------
 
+    def _interaction_callback(self, source, run_id, owner_request, task_id=None, model=None,
+                              continuation_id=None):
+        def suspend(payload):
+            checkpoint = dict(payload["checkpoint"])
+            checkpoint["owner_request"] = owner_request
+            checkpoint["model"] = model or config.chat_model()
+            checkpoint["concern"] = payload.get("concern")
+            checkpoint["origin"] = payload.get("origin")
+            request_id = interactions.create(
+                run_id=run_id, user_id=str(source.user_id), source=asdict(source),
+                task_id=task_id, suspend_task=task_id is not None,
+                kind=payload["kind"], tool_call_id=payload["tool_call_id"],
+                tool_name=payload["tool_name"], tool_input=payload["tool_input"],
+                checkpoint=checkpoint, continuation_id=continuation_id)
+            if task_id is None:
+                self._present_interaction(request_id, source, payload)
+            raise security.DeferredInteraction(request_id)
+        return suspend
+
+    def _present_interaction(self, request_id, source, payload):
+        adapter = self._adapters.get(source.platform)
+        if self._loop is None or adapter is None or adapter.state != AdapterState.RUNNING:
+            return
+        if payload["kind"] == "approval":
+            checkpoint = payload.get("checkpoint", {})
+            prompt = _approval_prompt(payload["tool_name"], payload["tool_input"],
+                                      payload.get("concern") or checkpoint.get("concern"),
+                                      payload.get("origin") or checkpoint.get("origin"))
+            if not getattr(adapter, "supports_approvals", False) or not adapter.can_approve(source.user_id):
+                send = adapter.send(source, f"{prompt}\nInteraction: {request_id}. "
+                                    "This channel cannot approve; the action remains unexecuted.")
+            else:
+                send = adapter.request_approval(source, "d-" + request_id, prompt)
+        else:
+            args = payload["tool_input"]
+            choices = args.get("choices", [])
+            detail = "\nChoices: " + ", ".join(choices) if choices else ""
+            send = adapter.send(source, f"Question: {args['question']}{detail}\n"
+                                        f"Reply with /answer {request_id} <text>")
+        future = asyncio.run_coroutine_threadsafe(send, self._loop)
+        def report(f):
+            try:
+                f.result()
+            except Exception as exc:
+                security.audit("interaction_send_error", f"{request_id}: {exc}")
+        future.add_done_callback(report)
+
+    def resolve_deferred_approval(self, approval_id, approved, source):
+        if not isinstance(approved, bool) or not approval_id.startswith("d-"):
+            return False
+        adapter = self._adapters.get(source.platform)
+        if (self._loop is None or adapter is None or adapter.state != AdapterState.RUNNING
+                or not adapter.can_approve(source.user_id)):
+            return False
+        request_id = approval_id[2:]
+        record = interactions.get(request_id)
+        if record is None or record["kind"] != "approval":
+            return False
+        if not interactions.answer(request_id, str(source.user_id), asdict(source),
+                                   "approve" if approved else "deny"):
+            return False
+        self._loop.create_task(self._resume_interaction(request_id, source))
+        return True
+
+    async def _resume_interaction(self, request_id, source, *, continuation=False):
+        from .. import tasks
+        record = None
+        owned = {"continuation": False}
+        if not continuation:
+            record = await asyncio.get_running_loop().run_in_executor(None, interactions.claim, request_id)
+            if record is None:
+                return
+            if record["task_id"] is not None:
+                completed = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: tasks.resume_interaction(record, self))
+                if not completed:
+                    released = await asyncio.get_running_loop().run_in_executor(
+                        None, interactions.release_claim, request_id)
+                    adapter = self._adapters.get(source.platform)
+                    if released and adapter and adapter.state == AdapterState.RUNNING:
+                        await adapter.send(source, f"When ready, use /resume {request_id} "
+                                                   "to retry this interaction.")
+                return
+        completed = False
+        async with self._agent_lock:
+            try:
+                def resume():
+                    if record is not None:
+                        return self._continue_interaction(record, source, owned=owned)
+                    with billing.metered(str(source.user_id)):
+                        return self._run_foreground_continuation(request_id, source, owned)
+                reply = await asyncio.get_running_loop().run_in_executor(None, resume)
+                completed = reply is not None
+            except security.DeferredInteraction as exc:
+                reply = f"Waiting for your response to {exc.request_id}."
+            except billing.BalanceExhausted as exc:
+                # A pre-execution billing block is safe to retry; an executing
+                # action remains unknown and cannot be claimed again.
+                released = False
+                if record is not None:
+                    released = await asyncio.get_running_loop().run_in_executor(
+                        None, interactions.release_claim, request_id)
+                released_continuation = False
+                if owned["continuation"]:
+                    released_continuation = await asyncio.get_running_loop().run_in_executor(
+                        None, interactions.release_continuation, request_id)
+                if not released_continuation:
+                    released_continuation = interactions.continuation_ready(request_id)
+                visible, pay_url = billing.split_pay_link(exc.block_message)
+                if released or released_continuation:
+                    visible += f"\n\nAfter resolving billing, use /resume {request_id}."
+                reply = visible + (billing._PAY_LINK_MARKER + pay_url if pay_url else "")
+            except Exception as exc:
+                security.audit("interaction_resume_error", f"{request_id}: {exc}")
+                released = False
+                if record is not None:
+                    released = await asyncio.get_running_loop().run_in_executor(
+                        None, interactions.release_claim, request_id)
+                if owned["continuation"]:
+                    released = await asyncio.get_running_loop().run_in_executor(
+                        None, interactions.release_continuation, request_id) or released
+                saved = interactions.get(request_id)
+                if saved and saved["status"] == "executing":
+                    reply = ("The action outcome is UNKNOWN; it may have completed and will not "
+                             "be replayed. Reconcile its effects before retrying.")
+                else:
+                    reply = "Could not resume this interaction; its saved state requires attention."
+                    if released:
+                        reply += f" After resolving the problem, use /resume {request_id}."
+        if reply is None:
+            return
+        adapter = self._adapters.get(source.platform)
+        delivered = False
+        if adapter and adapter.state == AdapterState.RUNNING:
+            text, pay_url = billing.split_pay_link(reply)
+            try:
+                if pay_url:
+                    await adapter.send_with_link(source, text, billing.TOPUP_BUTTON_LABEL, pay_url)
+                else:
+                    await adapter.send(source, text)
+                delivered = True
+            except Exception as exc:
+                security.audit("interaction_send_error", f"{request_id}: {exc}")
+        if completed and owned["continuation"]:
+            transition = interactions.complete_continuation if delivered else interactions.release_continuation
+            await asyncio.get_running_loop().run_in_executor(None, transition, request_id)
+
+    def _continue_interaction(self, record, source, task=None, owned=None):
+        if task is not None:
+            try:
+                return self._apply_interaction(record, source, task)
+            except billing.BalanceExhausted as exc:
+                # The task manager reports the interruption separately; pass
+                # the embedded payment link through the gateway unchanged.
+                if self._loop is not None:
+                    adapter = self._adapters.get(source.platform)
+                    if adapter and adapter.state == AdapterState.RUNNING:
+                        visible, pay_url = billing.split_pay_link(exc.block_message)
+                        send = (adapter.send_with_link(source, visible, billing.TOPUP_BUTTON_LABEL, pay_url)
+                                if pay_url else adapter.send(source, visible))
+                        asyncio.run_coroutine_threadsafe(send, self._loop)
+                raise
+        with billing.metered(record["user_id"]):
+            return self._apply_interaction(record, source, task, owned=owned)
+
+    def _apply_interaction(self, record, source, task=None, owned=None):
+        """Apply one claimed result; unrun sibling calls are reported, not replayed.
+
+        Resume through the normal loop with fresh tools/review. An interrupted
+        executing action remains unknown; no retry of it is attempted here.
+        """
+        from .. import agent, tasks, tools
+        state = record["checkpoint"]
+        tasks._validate_progress(state)
+        blocks = state["messages"][-1]["content"]
+        matches = [b for b in blocks if b.get("type") == "tool_use"
+                   and b.get("id") == record["tool_call_id"]]
+        if (len(matches) != 1 or matches[0].get("name") != record["tool_name"]
+                or matches[0].get("input") != record["tool_input"]
+                or any(r.get("tool_use_id") == record["tool_call_id"]
+                       for r in state.get("results", []))):
+            raise ValueError("Invalid interaction checkpoint")
+        user_id = record["user_id"]
+        allowed, block_message = billing.gate(user_id)
+        if not allowed:
+            raise billing.BalanceExhausted(block_message)
+        agent._check(task.cancel if task else None)
+        review = agent._review_context(state.get("owner_request", ""), user_id)
+        if record["kind"] == "input":
+            result = agent._tool_result(record["tool_call_id"], record["decision"] or
+                                        "No answer received: the question expired.",
+                                        is_error=record["decision"] is None)
+        elif record["decision"] != "approve":
+            result = agent._tool_result(record["tool_call_id"], agent._DECLINED_NOTE)
+        else:
+            specs = tools.agent_specs(tasks=task is None, user_id=user_id)
+            from .. import mcp_client
+            if state.get("enabled"):
+                specs += mcp_client.specs(user_id, servers=set(state["enabled"]))
+            offered = {s["name"] for s in specs}
+            adapter = self._adapters.get(source.platform)
+            if (record["tool_name"] not in offered
+                    or not security.is_high_impact(record["tool_name"])
+                    or adapter is None or not adapter.can_approve(user_id)):
+                raise ValueError("Approved tool or owner approval policy is no longer available")
+            if security.clearance(record["tool_name"], record["tool_input"], user_id=user_id,
+                                  context=review, grant="owner") != "owner":
+                raise ValueError("Approval gate rejected action")
+            boundary = dict(state, phase="executing", current=record["tool_call_id"])
+            if not interactions.begin_execution(record["id"],
+                                                 task_checkpoint=boundary if task else None):
+                raise RuntimeError("Could not claim execution")
+            try:
+                value, is_error = agent._execute(
+                    record["tool_name"], record["tool_input"], user_id,
+                    state.get("model") or config.chat_model(), review, task.cancel if task else None)
+                # Tool dispatchers can catch BalanceExhausted and return an
+                # error string after partial effects. Treat that as unknown.
+                if is_error:
+                    billing.ensure_can_spend()
+            except billing.BalanceExhausted as exc:
+                # The tool was entered: even a billing failure cannot prove it
+                # had no external effects. Keep the executing boundary unknown.
+                warning = ("The action outcome is UNKNOWN; it may have completed and will not "
+                           "be replayed. Reconcile its effects before retrying.")
+                visible, pay_url = billing.split_pay_link(exc.block_message)
+                raise billing.BalanceExhausted(
+                    f"{warning}\n\n{visible}" +
+                    (billing._PAY_LINK_MARKER + pay_url if pay_url else "")) from exc
+            review.actions.append((record["tool_name"], record["tool_input"], "owner"))
+            result = agent._tool_result(record["tool_call_id"], value, is_error)
+        state["results"].append(result)
+        messages = tasks._resume_messages(state)
+        next_state = {"version": 1, "messages": messages, "phase": "model",
+                      "results": [], "current": None, "enabled": [],
+                      "owner_request": state.get("owner_request", ""),
+                      "model": state.get("model")}
+        if not interactions.finish(record["id"], result, continuation=next_state,
+                                   task_checkpoint=next_state if task is not None else None):
+            raise RuntimeError("Could not persist interaction result")
+        # Some orchestration tools report billing exhaustion as a tool error;
+        # retain the result before stopping this same meter for the next step.
+        billing.ensure_can_spend()
+        if task is not None:
+            return messages
+        return self._run_foreground_continuation(record["id"], source, owned)
+
+    def _run_foreground_continuation(self, request_id, source, owned=None):
+        from .. import agent, memory, tasks, tools
+        record = interactions.claim_continuation(request_id)
+        if record is None:
+            return None
+        if owned is not None:
+            owned["continuation"] = True
+        state = record["checkpoint"]
+        tasks._validate_progress(state)
+        user_id = record["user_id"]
+        allowed, block_message = billing.gate(user_id)
+        if not allowed:
+            raise billing.BalanceExhausted(block_message)
+        if state["phase"] == "final":
+            return "".join(b["text"] for b in state["messages"][-1]["content"]
+                           if b.get("type") == "text")
+        if state["phase"] not in {"model", "tools", "executing"}:
+            raise ValueError("Invalid foreground continuation phase")
+        messages = (tasks._resume_messages(state) if state["phase"] in {"tools", "executing"}
+                    else state["messages"])
+        review = agent._review_context(state.get("owner_request", ""), user_id)
+        specs = tools.agent_specs(user_id=user_id)
+        system = agent._build_system(user_id, specs)
+        token = tasks.INTERACTION_SOURCE.set(asdict(source))
+
+        def checkpoint(snapshot):
+            snapshot["owner_request"] = state.get("owner_request", "")
+            snapshot["model"] = state.get("model")
+            if not interactions.save_continuation(request_id, snapshot):
+                raise RuntimeError("Foreground continuation is no longer claimed")
+
+        try:
+            reply = agent._run_tool_loop(
+                system, messages, user_id=user_id,
+                model=state.get("model") or config.chat_model(), review=review, specs=specs,
+                checkpoint=checkpoint,
+                on_interaction=self._interaction_callback(
+                    source, record["run_id"], state.get("owner_request", ""),
+                    model=state.get("model"), continuation_id=request_id))
+            memory.log_episode("agent", reply, trust="trusted", user_id=user_id)
+            return reply
+        finally:
+            tasks.INTERACTION_SOURCE.reset(token)
+
     def request_approval(self, user_id: str, tool_name: str, tool_input,
                          concern: str | None = None, origin: str | None = None,
                          grantable: bool = False) -> bool | str | None:
@@ -455,6 +795,10 @@ class GatewayRunner:
 
     async def start_all(self) -> None:
         self._loop = asyncio.get_running_loop()
+        # Only startup may recover execution boundaries; never replay an action.
+        unknown = await self._loop.run_in_executor(None, interactions.recover)
+        if unknown:
+            security.audit("interaction_unknown", ", ".join(unknown))
         security.audit(
             "gateway_boot",
             f"data_dir={config.DATA_DIR} idle_check={config.IDLE_CHECK_INTERVAL}s "
@@ -471,6 +815,7 @@ class GatewayRunner:
         from .. import tasks
         await self._loop.run_in_executor(
             None, lambda: tasks.report_interrupted(all_users=True))
+        await self._restore_interactions()
 
         if self._timer_task is None:
             from .. import timers
@@ -509,10 +854,47 @@ class GatewayRunner:
         # reply) must reach the billing service before the process exits.
         await asyncio.get_running_loop().run_in_executor(None, billing.flush, 30)
 
+    async def _restore_interactions(self):
+        await asyncio.get_running_loop().run_in_executor(None, interactions.expire)
+        continuations = await asyncio.get_running_loop().run_in_executor(
+            None, interactions.ready_continuations)
+        for record in continuations:
+            self._loop.create_task(self._resume_interaction(
+                record["id"], SessionSource(**record["source"]), continuation=True))
+        records = await asyncio.get_running_loop().run_in_executor(None, interactions.unsettled)
+        for record in records:
+            source = SessionSource(**record["source"])
+            if record["status"] == "pending":
+                self._present_interaction(record["id"], source, record)
+            elif record["status"] in {"answered", "expired"}:
+                # A durable owner decision is safe to claim again only before
+                # the executing boundary; recover() never rewinds that boundary.
+                self._loop.create_task(self._resume_interaction(record["id"], source))
+            else:
+                adapter = self._adapters.get(source.platform)
+                if adapter and adapter.state == AdapterState.RUNNING:
+                    await adapter.send(source, f"Interaction {record['id']}: outcome UNKNOWN. "
+                                       "The action may have completed; it will not be replayed. "
+                                       "Reconcile its effects before starting another action.")
+
+    async def _expire_interactions(self):
+        ids = await asyncio.get_running_loop().run_in_executor(None, interactions.expire)
+        for request_id in ids:
+            record = interactions.get(request_id)
+            source = SessionSource(**record["source"])
+            adapter = self._adapters.get(source.platform)
+            if adapter and record["kind"] == "approval":
+                try:
+                    await adapter.expire_approval(source, "d-" + request_id)
+                except Exception as exc:
+                    security.audit("interaction_expire_error", str(exc))
+            self._loop.create_task(self._resume_interaction(request_id, source))
+
     async def _timer_loop(self) -> None:
         from .. import timers
         while not self._timer_stop.is_set():
             try:
+                await self._expire_interactions()
                 await asyncio.get_running_loop().run_in_executor(
                     None, timers.fire_due, self.notify_user)
             except Exception as exc:

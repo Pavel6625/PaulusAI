@@ -86,7 +86,8 @@ def confirm(tool_name, tool_input, user_id=None, context=None, origin=None):
     return clearance(tool_name, tool_input, user_id, context, origin) is not None
 
 
-def clearance(tool_name, tool_input, user_id=None, context=None, origin=None):
+def clearance(tool_name, tool_input, user_id=None, context=None, origin=None,
+              on_approval=None, grant=None):
     """Human-in-the-loop gate. Returns how the action was cleared, or None
     when it wasn't: "grant" (the owner allowed similar actions earlier in this
     task), "auto" (auto mode's reviewer), "owner" (the owner answered the
@@ -108,7 +109,22 @@ def clearance(tool_name, tool_input, user_id=None, context=None, origin=None):
     It also carries the task's grants: whatever the owner allowed "for this
     task" runs without review or prompt. *origin* names who is acting (a
     subagent, a background task) on the prompt.
+
+    *grant='owner'* is reserved for the gateway's already authenticated, durably
+    claimed one-shot decision. It grants no scope and must only be passed for
+    that exact serialized action. It does not bypass tool dispatch or sandbox
+    checks. No other grant value is accepted.
+
+    *on_approval*, when supplied, replaces only the actual prompt after grants
+    and auto-review have had their say. It must durably persist the request and
+    raise DeferredInteraction; returning is treated as denial. Other callers
+    retain the original synchronous approval behavior.
     """
+    if grant is not None:
+        if grant != "owner":
+            return None
+        audit("approval_owner", f"{tool_name} {tool_input}")
+        return "owner"
     if context is not None and grants.covers(context.grants, tool_name, tool_input):
         audit("grant_approve", f"{tool_name} {tool_input}")
         return "grant"
@@ -123,13 +139,18 @@ def clearance(tool_name, tool_input, user_id=None, context=None, origin=None):
             # A flagged action goes to the owner and nowhere else: if they've
             # become unreachable, DP_UNATTENDED_POLICY=approve must not wave
             # through what the reviewer just flagged.
-            decision = _ask(tool_name, tool_input, user_id, concern=verdict.reason,
-                            origin=origin, grantable=grantable)
+            decision = (_ask(tool_name, tool_input, user_id, concern=verdict.reason,
+                             origin=origin, grantable=grantable, on_approval=on_approval)
+                        if on_approval is not None else
+                        _ask(tool_name, tool_input, user_id, concern=verdict.reason,
+                             origin=origin, grantable=grantable))
             if decision is None:
                 audit("auto_block_unanswered", f"{tool_name} {tool_input}")
             return _settle(decision, tool_name, tool_input, context)
 
-    decision = _ask(tool_name, tool_input, user_id, origin=origin, grantable=grantable)
+    decision = (_ask(tool_name, tool_input, user_id, origin=origin, grantable=grantable,
+                     on_approval=on_approval) if on_approval is not None else
+                _ask(tool_name, tool_input, user_id, origin=origin, grantable=grantable))
     if decision is None:
         return "unattended" if _unattended(tool_name, tool_input) else None
     return _settle(decision, tool_name, tool_input, context)
@@ -177,11 +198,16 @@ def _auto_review(tool_name, tool_input, context):
     return verdict
 
 
-def _ask(tool_name, tool_input, user_id, concern=None, origin=None, grantable=False):
+def _ask(tool_name, tool_input, user_id, concern=None, origin=None, grantable=False,
+         on_approval=None):
     """Prompt whoever can answer: True, False or GRANT, or None if nobody can.
 
     A background task never prompts at the console: the REPL is reading the
     same stdin for the conversation. Chat prompts are fine from any thread."""
+    if on_approval is not None:
+        on_approval(tool_name=tool_name, tool_input=tool_input, user_id=user_id,
+                    concern=concern, origin=origin, grantable=grantable)
+        return False
     if user_id is not None:
         decision = _gateway_confirm(tool_name, tool_input, user_id, concern,
                                     origin, grantable)

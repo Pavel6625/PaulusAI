@@ -4,9 +4,8 @@ A decision is tied to a user and a conversation. An action may be dispatched
 only after it has been durably marked executing; a crash at that boundary
 leaves an unknown outcome, never an automatic replay.
 
-This module is storage only: the agent loop and gateway do not yet use it.
-Integrators must authenticate the source, apply the adapter approval policy,
-write the pending checkpoint before presenting the request, and persist the
+The gateway authenticates the source and applies the adapter approval policy.
+Integrators must write the pending checkpoint before presenting the request and persist the
 continuation after applying the result. `recover` is only safe on single-process
 startup, after all old workers have stopped.
 """
@@ -40,6 +39,10 @@ def _store():
             db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS deferred_active_run
                 ON deferred_interactions(run_id)
                 WHERE status IN ('pending', 'answered', 'expired', 'processing', 'executing', 'unknown')""")
+            db.execute("""CREATE TABLE IF NOT EXISTS foreground_continuations (
+                interaction_id TEXT PRIMARY KEY REFERENCES deferred_interactions(id),
+                status TEXT NOT NULL, checkpoint TEXT NOT NULL, updated REAL NOT NULL
+            )""")
             yield db
     finally:
         db.close()
@@ -56,7 +59,8 @@ def _object(row):
 
 
 def create(*, run_id, user_id, source, kind, tool_call_id, tool_name, tool_input,
-           checkpoint, task_id=None, expires_in=_DEFAULT_EXPIRY, now=None):
+           checkpoint, task_id=None, expires_in=_DEFAULT_EXPIRY, now=None, suspend_task=False,
+           continuation_id=None):
     """Atomically persist a pending request and its complete continuation.
 
     The caller must not dispatch or prompt before this succeeds. The run ID is
@@ -80,6 +84,13 @@ def create(*, run_id, user_id, source, kind, tool_call_id, tool_name, tool_input
     stamp = time.time() if now is None else float(now)
     request_id = secrets.token_urlsafe(12)
     with _store() as db:
+        if suspend_task:
+            if task_id is None:
+                raise ValueError("A task ID is required to suspend a task")
+            updated = db.execute("UPDATE tasks SET status = 'suspended' WHERE id = ? AND status = 'running'",
+                                 (task_id,)).rowcount
+            if updated != 1:
+                raise RuntimeError("Task is not running; cannot suspend it")
         db.execute("""INSERT INTO deferred_interactions
             (id, run_id, task_id, user_id, source, kind, tool_call_id, tool_name,
              tool_input, checkpoint, created, expires, status, updated)
@@ -87,7 +98,22 @@ def create(*, run_id, user_id, source, kind, tool_call_id, tool_name, tool_input
                    (request_id, run_id, task_id, user_id, json.dumps(source), kind,
                     tool_call_id, tool_name, json.dumps(tool_input), json.dumps(checkpoint),
                     stamp, stamp + expires_in, stamp))
+        if continuation_id is not None:
+            handed_off = db.execute("""UPDATE foreground_continuations SET status = 'completed', updated = ?
+                WHERE interaction_id = ? AND status = 'running' AND EXISTS
+                (SELECT 1 FROM deferred_interactions WHERE id = ? AND run_id = ? AND task_id IS NULL)""",
+                (stamp, continuation_id, continuation_id, run_id)).rowcount
+            if task_id is not None or handed_off != 1:
+                raise RuntimeError("Foreground continuation is not claimed for this run")
     return request_id
+
+
+def active_task(task_id):
+    """Whether task resumption is owned by a live interaction."""
+    with _store() as db:
+        return bool(db.execute("SELECT 1 FROM deferred_interactions WHERE task_id = ? AND status IN "
+                               "('pending', 'answered', 'expired', 'processing', 'executing', 'unknown')",
+                               (task_id,)).fetchone())
 
 
 def _matches_source(saved, supplied):
@@ -138,16 +164,32 @@ def claim(request_id, *, now=None):
         return obj
 
 
-def begin_execution(request_id, *, now=None):
+def release_claim(request_id, *, now=None):
+    """Release a claim only while no approved action has begun."""
+    stamp = time.time() if now is None else float(now)
+    with _store() as db:
+        return bool(db.execute("UPDATE deferred_interactions SET status = CASE WHEN decision IS NULL "
+                               "THEN 'expired' ELSE 'answered' END, updated = ? "
+                               "WHERE id = ? AND status = 'processing'", (stamp, request_id)).rowcount)
+
+
+def begin_execution(request_id, *, now=None, task_checkpoint=None):
     """Write the irreversible boundary before an approved tool is invoked."""
     stamp = time.time() if now is None else float(now)
     with _store() as db:
-        return bool(db.execute("""UPDATE deferred_interactions SET status = 'executing', updated = ?
+        claimed = bool(db.execute("""UPDATE deferred_interactions SET status = 'executing', updated = ?
             WHERE id = ? AND status = 'processing' AND kind = 'approval' AND decision = 'approve'""",
-                               (stamp, request_id)).rowcount)
+                                  (stamp, request_id)).rowcount)
+        if claimed and task_checkpoint is not None:
+            task_id = db.execute("SELECT task_id FROM deferred_interactions WHERE id = ?",
+                                 (request_id,)).fetchone()[0]
+            if db.execute("UPDATE task_progress SET state = ? WHERE task_id = ?",
+                          (json.dumps(task_checkpoint), task_id)).rowcount != 1:
+                raise RuntimeError("Task checkpoint missing")
+        return claimed
 
 
-def finish(request_id, tool_result, *, now=None):
+def finish(request_id, tool_result, *, now=None, task_checkpoint=None, continuation=None):
     """Durably record a correlated result and settle in the same transaction.
 
     Keeping the result with the decision prevents a crash after an action from
@@ -157,11 +199,73 @@ def finish(request_id, tool_result, *, now=None):
         raise ValueError("A tool result is required")
     stamp = time.time() if now is None else float(now)
     with _store() as db:
-        return bool(db.execute("""UPDATE deferred_interactions SET status = 'applied',
+        applied = bool(db.execute("""UPDATE deferred_interactions SET status = 'applied',
             tool_result = ?, updated = ? WHERE id = ? AND tool_call_id = ? AND
             (status = 'executing' OR (status = 'processing' AND
             (kind = 'input' OR decision != 'approve' OR decision IS NULL)))""",
             (json.dumps(tool_result), stamp, request_id, tool_result.get("tool_use_id"))).rowcount)
+        if applied and continuation is not None:
+            encoded = json.dumps(continuation)
+            db.execute("UPDATE deferred_interactions SET checkpoint = ? WHERE id = ?",
+                       (encoded, request_id))
+            task_id = db.execute("SELECT task_id FROM deferred_interactions WHERE id = ?",
+                                 (request_id,)).fetchone()[0]
+            if task_id is None:
+                db.execute("INSERT INTO foreground_continuations VALUES (?, 'ready', ?, ?)",
+                           (request_id, encoded, stamp))
+        if applied and task_checkpoint is not None:
+            task_id = db.execute("SELECT task_id FROM deferred_interactions WHERE id = ?",
+                                 (request_id,)).fetchone()[0]
+            if task_id is None:
+                raise ValueError("Interaction has no task")
+            if db.execute("UPDATE task_progress SET state = ? WHERE task_id = ?",
+                          (json.dumps(task_checkpoint), task_id)).rowcount != 1:
+                raise RuntimeError("Task checkpoint missing")
+        return applied
+
+
+def claim_continuation(request_id, *, now=None):
+    """Claim a ready foreground continuation exactly once per recovery epoch."""
+    stamp = time.time() if now is None else float(now)
+    with _store() as db:
+        db.execute("BEGIN IMMEDIATE")
+        changed = db.execute("UPDATE foreground_continuations SET status = 'running', updated = ? "
+                             "WHERE interaction_id = ? AND status = 'ready'",
+                             (stamp, request_id)).rowcount
+        if not changed:
+            return None
+        row = db.execute("""SELECT d.*, c.checkpoint AS continuation_checkpoint
+            FROM deferred_interactions d JOIN foreground_continuations c ON c.interaction_id = d.id
+            WHERE d.id = ?""", (request_id,)).fetchone()
+        result = _object(row)
+        result["checkpoint"] = json.loads(result.pop("continuation_checkpoint"))
+        return result
+
+
+def save_continuation(request_id, checkpoint, *, now=None):
+    """Persist the running foreground loop's latest execution boundary."""
+    stamp = time.time() if now is None else float(now)
+    with _store() as db:
+        return bool(db.execute("UPDATE foreground_continuations SET checkpoint = ?, updated = ? "
+                               "WHERE interaction_id = ? AND status = 'running'",
+                               (json.dumps(checkpoint), stamp, request_id)).rowcount)
+
+
+def release_continuation(request_id, *, now=None):
+    """Release a claim when the worker has stopped and retry is safe."""
+    stamp = time.time() if now is None else float(now)
+    with _store() as db:
+        return bool(db.execute("UPDATE foreground_continuations SET status = 'ready', updated = ? "
+                               "WHERE interaction_id = ? AND status = 'running'",
+                               (stamp, request_id)).rowcount)
+
+
+def complete_continuation(request_id, *, now=None):
+    stamp = time.time() if now is None else float(now)
+    with _store() as db:
+        return bool(db.execute("UPDATE foreground_continuations SET status = 'completed', updated = ? "
+                               "WHERE interaction_id = ? AND status = 'running'",
+                               (stamp, request_id)).rowcount)
 
 
 def cancel(request_id, user_id, source, *, now=None):
@@ -208,6 +312,8 @@ def recover(*, now=None):
         db.execute("UPDATE deferred_interactions SET status = CASE WHEN decision IS NULL "
                    "THEN 'expired' ELSE 'answered' END, updated = ? WHERE status = 'processing'",
                    (stamp,))
+        db.execute("UPDATE foreground_continuations SET status = 'ready', updated = ? "
+                   "WHERE status = 'running'", (stamp,))
         return unknown
 
 
@@ -219,6 +325,30 @@ def pending(user_id, source):
         rows = db.execute("SELECT * FROM deferred_interactions WHERE user_id = ? AND status = 'pending' "
                           "ORDER BY created, id", (user_id,)).fetchall()
     return [obj for row in rows if _matches_source((obj := _object(row))["source"], source)]
+
+
+def unsettled():
+    """Internal startup/sweeper inventory; the caller must use each saved source."""
+    with _store() as db:
+        rows = db.execute("SELECT * FROM deferred_interactions WHERE status IN "
+                          "('pending', 'answered', 'expired', 'unknown') ORDER BY created").fetchall()
+    return [_object(row) for row in rows]
+
+
+def continuation_ready(request_id):
+    with _store() as db:
+        return bool(db.execute("SELECT 1 FROM foreground_continuations "
+                               "WHERE interaction_id = ? AND status = 'ready'",
+                               (request_id,)).fetchone())
+
+
+def ready_continuations():
+    """List durable foreground continuations ready for a one-time claim."""
+    with _store() as db:
+        rows = db.execute("""SELECT d.* FROM deferred_interactions d
+            JOIN foreground_continuations c ON c.interaction_id = d.id
+            WHERE c.status = 'ready' ORDER BY c.updated, d.id""").fetchall()
+    return [_object(row) for row in rows]
 
 
 def get(request_id):

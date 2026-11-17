@@ -188,6 +188,74 @@ def test_callback_verdict_edit_retries_without_resolving_twice(adapter, monkeypa
     assert query.edit_message_text.await_args_list == [call("Approve?\n\n— ✅ Approved.")] * 2
 
 
+def test_start_registers_answer_command(adapter, monkeypatch):
+    app = SimpleNamespace(add_handler=Mock(), initialize=AsyncMock(), start=AsyncMock(),
+                          updater=SimpleNamespace(start_polling=AsyncMock()))
+    builder = Mock()
+    builder.token.return_value = builder
+    builder.concurrent_updates.return_value = builder
+    builder.build.return_value = app
+    monkeypatch.setattr(tg.Application, "builder", Mock(return_value=builder))
+
+    asyncio.run(adapter.start())
+
+    handlers = [c.args[0] for c in app.add_handler.call_args_list]
+    assert any(isinstance(h, tg.CommandHandler) and "answer" in h.commands
+               and h.callback == adapter._on_command for h in handlers)
+
+
+@pytest.mark.parametrize("action,approved", [("dpok", True), ("dpno", False)])
+@pytest.mark.parametrize("settled", [True, False])
+def test_deferred_callback_routes_authenticated_topic_without_losing_prompt(
+        adapter, monkeypatch, action, approved, settled):
+    resolve = Mock(return_value=settled)
+    legacy = Mock()
+    monkeypatch.setattr(adapter._runner, "resolve_deferred_approval", resolve, raising=False)
+    monkeypatch.setattr(adapter._runner, "resolve_approval", legacy)
+    adapter._approval_msgs["d-1"] = ("42", 99)
+    query = SimpleNamespace(
+        data=f"{action}:d-1",
+        message=SimpleNamespace(text="Approve?", is_topic_message=True, message_thread_id=9),
+        answer=AsyncMock(), edit_message_text=AsyncMock(),
+    )
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7),
+                             effective_chat=SimpleNamespace(id=42))
+
+    asyncio.run(adapter._on_callback(update, None))
+
+    resolve.assert_called_once_with("d-1", approved, SOURCE)
+    legacy.assert_not_called()
+    if settled:
+        assert "d-1" not in adapter._approval_msgs
+        query.edit_message_text.assert_awaited_once()
+    else:
+        assert "d-1" in adapter._approval_msgs
+        query.edit_message_text.assert_not_awaited()
+
+
+def test_deferred_callback_rejects_grant_and_untrusted_user(adapter, monkeypatch):
+    resolve = Mock(return_value=True)
+    monkeypatch.setattr(adapter._runner, "resolve_deferred_approval", resolve, raising=False)
+    adapter._approval_msgs["d-1"] = ("42", 99)
+    query = SimpleNamespace(data="dpall:d-1", message=SimpleNamespace(text="Approve?"),
+                            answer=AsyncMock(), edit_message_text=AsyncMock())
+    update = SimpleNamespace(callback_query=query, effective_user=SimpleNamespace(id=7),
+                             effective_chat=SimpleNamespace(id=42))
+    asyncio.run(adapter._on_callback(update, None))
+    query.data = "dpok:d-1"
+    update.effective_user.id = 8
+    asyncio.run(adapter._on_callback(update, None))
+    resolve.assert_not_called()
+    assert "d-1" in adapter._approval_msgs
+    query.edit_message_text.assert_not_awaited()
+
+
+def test_deferred_prompt_cannot_offer_task_grant(adapter):
+    asyncio.run(adapter.request_approval(SOURCE, "d-1", "Approve?", grantable=True))
+    keyboard = adapter._app.bot.send_message.await_args.kwargs["reply_markup"].inline_keyboard
+    assert len(keyboard) == 1
+
+
 def test_stream_create_and_intermediate_edit_retry(adapter):
     bot = adapter._app.bot
     bot.send_message.side_effect = [tg.RetryAfter(1), MESSAGE]

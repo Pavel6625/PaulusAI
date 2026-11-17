@@ -2,6 +2,7 @@
 -> persist, with the tool-use loop handled manually so the safety gate sits
 between the model's decision and any real-world effect.
 """
+import copy
 import os
 
 from . import affect, automode, billing, config, llm, mcp_client, memory, security, skills, tools
@@ -182,7 +183,7 @@ def _unavailable(name, offered, user_id):
 def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
                    tools_used=None, review=None, specs=None, max_steps=None,
                    cancel=None, origin=None, feel=True, on_break=None,
-                   checkpoint=None):
+                   checkpoint=None, on_interaction=None):
     """Drive the model<->tool exchange, with the safety gate between the
     model's decision and any real-world effect. Returns the final text.
 
@@ -220,17 +221,47 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
     ``None`` means the owner didn't ask for this turn, so nothing in it is
     auto-approved or granted. *checkpoint*, when provided, durably records the
     transcript, partial tool results and execution boundary before any action.
-    A failed save aborts the loop rather than running an unrecorded action."""
+    A failed save aborts the loop rather than running an unrecorded action.
+
+    *on_interaction*, for owner-requested gateway turns/tasks only, is called
+    before a blocking approval or `request_input`. It receives one dict with
+    kind (approval/input), tool_call_id, tool_name, tool_input, checkpoint,
+    concern and origin. It must persist the pending request and continuation
+    with interactions.create before presenting it, then raise
+    security.DeferredInteraction(request_id). Returning is an error and never
+    authorizes execution. The checkpoint contains prior results from the same
+    assistant turn; the pending call has NOT run. No review context or grants
+    are serialized. The integrator must authenticate/claim the answer, gate
+    the exact approved action and persist its execution boundary/result, then
+    resume with a fresh review context. A question's answer is not approval.
+    Without this hook the existing synchronous approval path is unchanged,
+    and request_input is not offered. Subagents use their restricted specs and
+    must not receive this hook."""
     specs = list(tools.TOOL_SPECS if specs is None else specs)
+    deferred = on_interaction is not None and review is not None and user_id is not None
+    if not deferred:
+        specs = [s for s in specs if s["name"] != "request_input"]
     offered = {s["name"] for s in specs}
     enabled = set()                      # toolsets switched on in this loop
     steps = 0
 
+    def snapshot(phase, results=None, current=None):
+        return copy.deepcopy({"version": 1, "messages": messages, "phase": phase,
+                              "results": list(results or []), "current": current,
+                              "enabled": sorted(enabled)})
+
     def save(phase, results=None, current=None):
         if checkpoint is not None:
-            checkpoint({"version": 1, "messages": messages, "phase": phase,
-                        "results": list(results or []), "current": current,
-                        "enabled": sorted(enabled)})
+            checkpoint(snapshot(phase, results, current))
+
+    def suspend(kind, block, results, concern=None, origin=origin, **_):
+        state = snapshot("tools", results)
+        if checkpoint is not None:
+            checkpoint(copy.deepcopy(state))
+        on_interaction({"kind": kind, "tool_call_id": block.id,
+                        "tool_name": block.name, "tool_input": copy.deepcopy(block.input),
+                        "checkpoint": state, "concern": concern, "origin": origin})
+        raise RuntimeError("on_interaction must persist and raise DeferredInteraction")
 
     while True:
         save("model")
@@ -270,11 +301,31 @@ def _run_tool_loop(system, messages, user_id=None, on_delta=None, model=None,
                     b.id, _unavailable(b.name, offered, user_id), is_error=True))
                 continue
 
+            if b.name == "request_input":
+                args = b.input
+                if (not isinstance(args, dict)
+                        or not isinstance(args.get("question"), str)
+                        or not args["question"].strip()
+                        or set(args) - {"question", "choices"}
+                        or ("choices" in args and (
+                            not isinstance(args["choices"], list)
+                            or any(not isinstance(c, str) or not c.strip()
+                                   for c in args["choices"])))):
+                    tool_results.append(_tool_result(
+                        b.id, "request_input needs a nonempty question and optional text choices.",
+                        is_error=True))
+                    continue
+                suspend("input", b, tool_results)
+
             # --- SAFETY GATE -------------------------------------------------
             cleared = None
             if security.is_high_impact(b.name):
+                gate_options = {}
+                if deferred:
+                    gate_options["on_approval"] = lambda block=b, results=tool_results, **kw: suspend(
+                        "approval", block, results, **kw)
                 cleared = security.clearance(b.name, b.input, user_id=user_id,
-                                             context=review, origin=origin)
+                                             context=review, origin=origin, **gate_options)
                 if cleared is None:
                     security.audit("declined", f"{b.name} {b.input}")
                     if feel:
@@ -372,7 +423,9 @@ def _review_context(owner_text, user_id=None, images=None, documents=None):
 
 
 def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None,
-            on_break=None):
+            on_break=None, on_interaction=None):
+    """Answer the owner; optional on_interaction has _run_tool_loop's durable
+    suspension contract. DeferredInteraction propagates to the gateway caller."""
     # --- PAY GATE ---------------------------------------------------------
     # Checked before anything else: an exhausted balance halts the turn
     # before it ever reaches the LLM, or touches memory/the sandbox.
@@ -385,6 +438,9 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
     # the next call raises and the turn ends with the top-up message.
     with billing.metered(user_id):
         try:
+            if on_interaction is not None:
+                return _respond(owner_text, user_id, on_delta, images, documents,
+                                on_break, on_interaction=on_interaction)
             return _respond(owner_text, user_id, on_delta, images, documents,
                             on_break)
         except billing.BalanceExhausted as exc:
@@ -392,7 +448,8 @@ def respond(owner_text, user_id=None, on_delta=None, images=None, documents=None
             return exc.block_message
 
 
-def _respond(owner_text, user_id, on_delta, images, documents, on_break):
+def _respond(owner_text, user_id, on_delta, images, documents, on_break,
+             on_interaction=None):
     review = _review_context(owner_text, user_id, images, documents)
     owner_text = _ingest_documents(owner_text, documents, user_id)
     memory.log_episode("owner", owner_text, trust="trusted", user_id=user_id)
@@ -407,9 +464,10 @@ def _respond(owner_text, user_id, on_delta, images, documents, on_break):
     system = _build_system(user_id, specs)
     messages = _history_to_messages(user_id)
     _attach_images(messages, images)
+    interaction_options = {"on_interaction": on_interaction} if on_interaction is not None else {}
     final_text = _run_tool_loop(system, messages, user_id, on_delta=on_delta,
                                 model=config.chat_model(), review=review,
-                                specs=specs, on_break=on_break)
+                                specs=specs, on_break=on_break, **interaction_options)
 
     memory.log_episode("agent", final_text, trust="trusted", user_id=user_id)
     affect.decay()

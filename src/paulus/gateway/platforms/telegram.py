@@ -151,7 +151,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app.add_handler(CommandHandler("reset", self._on_reset))
         # The terminal CLI's in-chat commands, mirrored over Telegram. Routed
         # to the runner so the behaviour stays identical across surfaces.
-        for cmd in ("sleep", "mood", "memory", "skills", "bg", "tasks", "cancel", "resume"):
+        for cmd in ("sleep", "mood", "memory", "skills", "bg", "tasks", "cancel", "resume", "answer"):
             self._app.add_handler(CommandHandler(cmd, self._on_command))
         self._app.add_handler(CallbackQueryHandler(self._on_callback))
         await self._app.initialize()
@@ -351,7 +351,7 @@ class TelegramAdapter(BasePlatformAdapter):
             InlineKeyboardButton("✅ Approve", callback_data=f"dpok:{approval_id}"),
             InlineKeyboardButton("🚫 Deny", callback_data=f"dpno:{approval_id}"),
         ]]
-        if grantable:
+        if grantable and not approval_id.startswith("d-"):
             rows.append([InlineKeyboardButton(
                 "✅ Allow for this task", callback_data=f"dpall:{approval_id}")])
         keyboard = InlineKeyboardMarkup(rows)
@@ -395,10 +395,27 @@ class TelegramAdapter(BasePlatformAdapter):
             security.audit("approval_unauthorized",
                            f"{user.id if user else '?'} {approval_id}")
             return
-        await query.answer()
-
-        approved = {"dpok": True, "dpno": False, "dpall": security.GRANT}[action]
-        settled = self._runner.resolve_approval(approval_id, approved)
+        deferred = approval_id.startswith("d-")
+        if deferred:
+            # Deferred decisions are always one-shot, and the runner validates
+            # the authenticated user and the originating chat/topic.
+            chat = update.effective_chat
+            if action == "dpall" or chat is None or query.message is None:
+                await query.answer("Invalid approval response.", show_alert=True)
+                return
+            message = query.message
+            thread_id = (str(message.message_thread_id)
+                         if getattr(message, "is_topic_message", False) else None)
+            source = SessionSource("telegram", str(chat.id), str(user.id), thread_id)
+            await query.answer()
+            approved = action == "dpok"
+            settled = self._runner.resolve_deferred_approval(approval_id, approved, source)
+            if not settled:
+                return
+        else:
+            await query.answer()
+            approved = {"dpok": True, "dpno": False, "dpall": security.GRANT}[action]
+            settled = self._runner.resolve_approval(approval_id, approved)
         self._approval_msgs.pop(approval_id, None)
 
         if not settled:

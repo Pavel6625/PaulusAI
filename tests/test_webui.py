@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import time
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -347,6 +348,50 @@ def test_approval_roundtrip_and_only_owner_may_answer():
             await other.close()
 
     assert asyncio.run(go()) is False
+
+
+def test_answer_command_routes_to_runner(monkeypatch):
+    runner, adapter = _make()
+    handle = AsyncMock(return_value="answered")
+    monkeypatch.setattr(runner, "handle_command", handle)
+    source = SessionSource("web", "42", "42")
+    asyncio.run(adapter._handle_command(source, "/answer task-1 yes"))
+    handle.assert_awaited_once_with(source, "answer", "task-1 yes")
+
+
+@pytest.mark.parametrize("answer,approved", [("ok", True), ("no", False)])
+@pytest.mark.parametrize("settled", [True, False])
+def test_deferred_approval_routes_owner_and_preserves_rejected_prompt(
+        monkeypatch, answer, approved, settled):
+    runner, adapter = _make()
+    resolve = Mock(return_value=settled)
+    legacy = Mock()
+    monkeypatch.setattr(runner, "resolve_deferred_approval", resolve, raising=False)
+    monkeypatch.setattr(runner, "resolve_approval", legacy)
+    source = SessionSource("web", "42", "42")
+    asyncio.run(adapter.request_approval(source, "d-1", "Approve?", grantable=True))
+    assert adapter._open_approvals["d-1"][1]["grantable"] is False
+
+    adapter._on_approve("42", {"id": "d-1", "answer": answer})
+
+    resolve.assert_called_once_with("d-1", approved, source)
+    legacy.assert_not_called()
+    assert ("d-1" in adapter._open_approvals) is not settled
+
+
+def test_deferred_approval_rejects_untrusted_cross_user_and_grant(monkeypatch):
+    runner, adapter = _make()
+    adapter._trusted.add("7")
+    resolve = Mock(return_value=True)
+    monkeypatch.setattr(runner, "resolve_deferred_approval", resolve, raising=False)
+    source = SessionSource("web", "42", "42")
+    asyncio.run(adapter.request_approval(source, "d-1", "Approve?"))
+    adapter._on_approve("7", {"id": "d-1", "answer": "ok"})
+    adapter._on_approve("42", {"id": "d-1", "answer": "all"})
+    adapter._trusted.remove("42")
+    adapter._on_approve("42", {"id": "d-1", "answer": "ok"})
+    resolve.assert_not_called()
+    assert "d-1" in adapter._open_approvals
 
 
 def test_pending_approval_is_replayed_to_a_new_tab():

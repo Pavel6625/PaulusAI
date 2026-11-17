@@ -15,10 +15,13 @@ A background task is the agent working on its own, so:
     clears it.
   - it has a step and a time budget, and the owner can /cancel it.
   - it may delegate to subagents, but can't start further tasks.
+  - gateway-originated approvals and questions suspend durably, releasing the
+    worker. Answers resume the original task ID with fresh review/grants.
   - task records survive restarts. Running tasks become interrupted and the
     owner is notified; work is never automatically replayed. Each result is
     also logged to the owner's episodic memory.
 """
+import contextvars
 import json
 import sqlite3
 import threading
@@ -32,12 +35,15 @@ _tasks: dict = {}                # id -> Task, hydrated from the durable store
 _initialized = False
 _lock = threading.Lock()
 _KEEP_FINISHED = 20              # finished tasks remembered per user, for /tasks
+# The originating gateway conversation is inherited only when a task starts.
+INTERACTION_SOURCE = contextvars.ContextVar("paulus_task_source", default=None)
 
 BRIEF = """
 
 You are now working on a BACKGROUND TASK the owner asked for. They are not \
-waiting on this conversation and can't answer questions mid-task: make \
-reasonable assumptions and state them. When you're done, your final message \
+waiting on this conversation. If request_input is available, use it when \
+you need clarification: the task will pause until the owner answers. Otherwise \
+make reasonable assumptions and state them. When you're done, your final message \
 is sent to the owner as the task's result, so lead with the outcome and keep \
 it concise."""
 
@@ -48,7 +54,7 @@ class Task:
     user_id: object
     title: str
     instructions: str
-    status: str = "running"      # running | done | failed | cancelled | timed out | stopped | interrupted
+    status: str = "running"      # suspended tasks have no live worker or timer
     started: float = field(default_factory=time.time)
     finished: float | None = None
     tools_used: list = field(default_factory=list)
@@ -75,6 +81,10 @@ def _store():
             db.execute("""CREATE TABLE IF NOT EXISTS task_progress (
                 task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
                 owner_request TEXT NOT NULL, state TEXT NOT NULL
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS task_interaction_context (
+                task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+                source TEXT NOT NULL, model TEXT
             )""")
             yield db
     finally:
@@ -205,6 +215,10 @@ def start(user_id, title, instructions, model=None, review=None):
                        (task.id, review.request if review is not None else "",
                         json.dumps({"version": 1, "messages": [], "phase": "new",
                                     "results": [], "current": None, "enabled": []})))
+            source = INTERACTION_SOURCE.get()
+            if source is not None and review is not None:
+                db.execute("INSERT INTO task_interaction_context VALUES (?, ?, ?)",
+                           (task.id, json.dumps(source), config.TASK_MODEL or model))
         _tasks[task.id] = task
         _forget_old(user_id)
     security.audit("task_start", f"{user_id} #{task.id} {title}")
@@ -289,6 +303,10 @@ def resume(user_id, task_id):
             return f"No background task #{task_id}."
         if task.status not in {"interrupted", "failed", "cancelled", "timed out", "stopped"}:
             return f"Task #{task_id} cannot resume while {task.status}."
+        from . import interactions
+        if interactions.active_task(task_id):
+            return (f"Task #{task_id} has an unresolved interaction. Answer it or reconcile "
+                    "its unknown outcome before restarting the work.")
         with _store() as db:
             row = db.execute("SELECT owner_request, state FROM task_progress WHERE task_id = ?",
                              (task_id,)).fetchone()
@@ -325,16 +343,76 @@ def resume(user_id, task_id):
     return f"Resumed background task #{task_id} from its saved progress."
 
 
+def resume_interaction(record, runner):
+    """Resume a claimed decision on the original task, never create a new ID."""
+    from . import agent, billing
+    from .gateway.base import SessionSource
+    with _lock:
+        _initialize()
+        task = _tasks.get(record["task_id"])
+        if (task is None or str(task.user_id) != record["user_id"]
+                or task.status not in {"suspended", "interrupted"}):
+            return False
+        with _store() as db:
+            db.execute("UPDATE tasks SET status = 'running', finished = NULL WHERE id = ?",
+                       (task.id,))
+        task.status, task.finished = "running", None
+        task.cancel, task.timed_out = threading.Event(), False
+    source = SessionSource(**record["source"])
+    token = security.BACKGROUND.set(True)
+    try:
+        with billing.metered(task.user_id, kind="task"):
+            runner._continue_interaction(record, source, task=task)
+        review = agent._review_context(record["checkpoint"].get("owner_request", ""), task.user_id)
+        _run(task, config.TASK_MODEL or config.chat_model(), review, resuming=True)
+        return True
+    except Exception as exc:
+        from . import interactions
+        saved = interactions.get(record["id"])
+        unknown = saved and saved["status"] == "executing"
+        body = ("The action outcome is UNKNOWN; it will not be replayed. "
+                "Reconcile its effects before retrying." if unknown else
+                f"Interaction continuation interrupted: {exc}")
+        with _lock:
+            with _store() as db:
+                db.execute("UPDATE tasks SET status = 'interrupted', result = ? WHERE id = ?",
+                           (body, task.id))
+            task.status, task.result = "interrupted", body
+        security.audit("task_interaction_error", f"#{task.id}: {exc}")
+        runner.notify_user(task.user_id, f"⚠️ Background task #{task.id} interrupted: {body}")
+        return False
+    finally:
+        security.BACKGROUND.reset(token)
+
+
 def _run(task, model, review, resuming=False):
     from . import agent, billing, memory, tools
-    security.BACKGROUND.set(True)        # this thread's context: no console prompts
+    background_token = security.BACKGROUND.set(True)  # no console prompts
     timer = threading.Timer(config.TASK_MAX_MINUTES * 60, _time_out, args=(task,))
     timer.daemon = True
     timer.start()
     specs = tools.agent_specs(tasks=False, user_id=task.user_id)
     pay_link = ""
+    interaction_options = {}
+    runner = None
+    with _store() as db:
+        context = db.execute("SELECT source, model FROM task_interaction_context WHERE task_id = ?",
+                             (task.id,)).fetchone()
+    if context:
+        model = context[1] or model
+    if context and review is not None:
+        from .gateway.base import SessionSource
+        from .gateway.runner import get_runner
+        runner = get_runner()
+        source = SessionSource(**json.loads(context[0]))
+        if runner is not None and runner._loop is not None:
+            interaction_options["on_interaction"] = runner._interaction_callback(
+                source, f"task:{task.id}", review.request, task_id=task.id, model=model)
     try:
-        system = agent._build_system(task.user_id, specs) + BRIEF
+        brief = ("\nYou are working on a BACKGROUND TASK. Use request_input for necessary "
+                 "clarifications; the worker suspends until the owner answers. Your final "
+                 "report is sent to the owner." if interaction_options else BRIEF)
+        system = agent._build_system(task.user_id, specs) + brief
         with _store() as db:
             saved = db.execute("SELECT state FROM task_progress WHERE task_id = ?",
                                (task.id,)).fetchone()
@@ -358,8 +436,16 @@ def _run(task, model, review, resuming=False):
                     system, messages, task.user_id, model=model, tools_used=task.tools_used,
                     review=review, specs=specs, max_steps=config.TASK_MAX_STEPS,
                     cancel=task.cancel, origin=f"background task #{task.id} ({task.title})",
-                    checkpoint=lambda state: _save_progress(task, state))
+                    checkpoint=lambda state: _save_progress(task, state), **interaction_options)
         status, body = "done", result.strip() or "(no report)"
+    except security.DeferredInteraction as exc:
+        from . import interactions
+        record = interactions.get(exc.request_id)
+        with _lock:
+            task.status, task.finished = "suspended", None
+        if runner is not None:
+            runner._present_interaction(exc.request_id, source, record)
+        return
     except billing.BalanceExhausted as exc:
         status, body = "stopped", str(exc)
         pay_link = exc.block_message[len(body):]   # the embedded link, if any
@@ -374,6 +460,7 @@ def _run(task, model, review, resuming=False):
         status, body = "failed", f"It failed: {exc}"
     finally:
         timer.cancel()
+        security.BACKGROUND.reset(background_token)
 
     with _lock:
         finished = time.time()
@@ -416,6 +503,17 @@ def cancel(user_id, task_id):
         task = _tasks.get(task_id)
         if task is None or task.user_id != user_id:
             return f"No background task #{task_id}."
+        if task.status == "suspended":
+            with _store() as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("UPDATE deferred_interactions SET status = 'cancelled' "
+                           "WHERE task_id = ? AND status IN "
+                           "('pending', 'answered', 'expired', 'processing')", (task_id,))
+                db.execute("UPDATE tasks SET status = 'cancelled', finished = ? WHERE id = ?",
+                           (time.time(), task_id))
+            task.status, task.finished = "cancelled", time.time()
+            task.cancel.set()
+            return f"Cancelled background task #{task_id}."
         if task.status != "running":
             return f"Task #{task_id} already {task.status}."
         task.cancel.set()
@@ -453,7 +551,7 @@ def status(user_id):
 def _forget_old(user_id):
     """Keep only the latest finished tasks per user (call under _lock)."""
     finished = sorted((t for t in _tasks.values()
-                       if t.user_id == user_id and t.status != "running"),
+                       if t.user_id == user_id and t.status not in {"running", "suspended"}),
                       key=lambda t: t.id)
     # Keep interruption notices until delivery, even when newer tasks finish.
     old = [t for t in finished[:-_KEEP_FINISHED]

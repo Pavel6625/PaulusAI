@@ -294,10 +294,30 @@ def pick(names):
     return [s for s in TOOL_SPECS if s["name"] in names]
 
 
+REQUEST_INPUT_SPEC = {
+    "name": "request_input",
+    "description": "Pause this job to ask the owner a necessary clarification, then continue "
+                   "when they answer. Ask one clear question; optionally suggest choices. "
+                   "This does not approve any action.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "minLength": 1},
+            "choices": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        },
+        "required": ["question"],
+        "additionalProperties": False,
+    },
+}
+
+
 def agent_specs(tasks=True, user_id=None):
     """The main agent's tools: the base set, whichever orchestration tools are
     enabled, and the MCP tools *user_id* may use. A background task passes
     ``tasks=False``: it may delegate, but not start further tasks.
+    Gateway toolsets include request_input; the loop removes it unless an
+    owner review context and a durable interaction callback are both present.
+    It is never part of the base tools or subagent profiles.
 
     With on-demand toolsets (the default), MCP tools aren't included: only
     `list_toolsets` / `enable_toolset`, and only when there's something to
@@ -305,6 +325,8 @@ def agent_specs(tasks=True, user_id=None):
     come last either way, so the fixed part of the list stays a stable prefix
     (prompt caching)."""
     specs = list(TOOL_SPECS)
+    if user_id is not None:
+        specs.append(REQUEST_INPUT_SPEC)
     if config.SUBAGENTS:
         specs.append(DELEGATE_SPEC)
     if config.TASKS:
